@@ -99,6 +99,89 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         ),
         "warmup warp34_embedding_splice_f16"
     )?;
+    warmup_ffi!(
+        ffi::warp34_embedding_add_f16(
+            ex,
+            buf_c as *mut c_void,
+            buf_a as *const c_void,
+            reject_ids as *const i32,
+            1,
+            1,
+            64,
+        ),
+        "warmup warp34_embedding_add_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_rms_norm_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+            1e-6,
+        ),
+        "warmup warp34_rms_norm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_fused_add_rms_norm_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *mut c_void,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+            1e-6,
+        ),
+        "warmup warp34_fused_add_rms_norm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_fused_qk_rmsnorm_rope_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+            zero_i32 as *const i32,
+            core::ptr::null(),
+            buf_d as *mut c_void,
+            buf_c as *mut c_void,
+            1,
+            1,
+            2,
+            1,
+            128,
+            128,
+            24,
+            20,
+            20,
+            5_000_000.0,
+            1e-6,
+            0.0,
+        ),
+        "warmup warp34_fused_qk_rmsnorm_rope_f16"
+    )?;
+    for is_causal in [0i32, 1i32] {
+        warmup_ffi!(
+            ffi::warp34_mha_fa2_d128_f16(
+                &ex_vision,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                1,
+                1,
+                2,
+                1,
+                is_causal,
+            ),
+            "warmup warp34_mha_fa2_d128_f16"
+        )?;
+    }
     for (n_exp, top_k) in [(8i32, 2i32), (256, 8), (512, 2)] {
         warmup_ffi!(
             ffi::warp34_moe_topk_router_f16(

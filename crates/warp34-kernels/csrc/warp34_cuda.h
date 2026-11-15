@@ -920,6 +920,26 @@ int warp34_sampler_shard_fast_greedy_f16(
     const uint32_t* bitmask_u32, const warp34_sampler_sparse_entry* sparse_entries,
     float* out_local_vals, int32_t* out_local_ids, int num_rows,
     int local_vocab_size, int vocab_offset);
+int warp34_rms_norm_f16(const warp34_exec* ex, const void* x, const void* weight,
+                     void* out, const uint8_t* valid_token_mask,
+                     int num_tokens, int hidden_size, float eps);
+int warp34_fused_add_rms_norm_f16(const warp34_exec* ex, const void* x, void* residual,
+                               const void* weight, void* out,
+                               const uint8_t* valid_token_mask,
+                               int num_tokens, int hidden_size, float eps);
+int warp34_fused_qk_rmsnorm_rope_f16(
+    const warp34_exec* ex, const void* q_in, const void* k_in,
+    const void* q_norm_w, const void* k_norm_w, const int32_t* positions,
+    const uint8_t* valid_token_mask, void* q_out, void* k_out,
+    int num_tokens, int pos_plane_stride, int num_q_heads, int num_kv_heads,
+    int head_dim, int rotary_dim, int mrope_s0, int mrope_s1, int mrope_s2,
+    float rope_theta, float rms_eps, float weight_bias);
+int warp34_embedding_add_f16(
+    const warp34_exec* ex, void* dst_embeds, const void* src_visual_embeds,
+    const int32_t* token_indices, int num_visual_tokens, int dst_rows, int hidden_size);
+int warp34_mha_fa2_d128_f16(
+    const warp34_exec* ex, const void* q, const void* k, const void* v, void* out,
+    int b, int seqlen_q, int seqlen_k, int h, int h_k, int is_causal);
 
 #ifdef __cplusplus
 }

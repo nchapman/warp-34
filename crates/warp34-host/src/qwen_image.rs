@@ -7,6 +7,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cuda")]
+#[path = "qwen_image/text_encoder.rs"]
+pub mod text_encoder;
+#[cfg(feature = "cuda")]
+pub use text_encoder::{Qwen3VlConditioningEncoder, Qwen3VlConditioningOutput};
+
 /// System prompt used by `QwenImage21Pipeline` in `diffusers`.
 pub const SYS_PROMPT: &str = "Comprehend and analyze the provided prompt.";
 
@@ -1329,5 +1335,254 @@ mod tests {
                 assert!(vae_arch.iter_entries().count() > 100);
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_qwen3_vl_mrope_and_conditioning_encoder_match_oracle() {
+        use crate::cuda::{
+            CublasHandle, CudaDevice, CudaStream, DeviceBuffer, check_rc, f16_to_f32_slice,
+            f32_to_f16,
+        };
+        use crate::vision::PreprocessedImage;
+        use std::ffi::c_void;
+        use std::sync::Arc;
+        use warp34_kernels::ffi;
+
+        if CudaDevice::count().unwrap_or(0) <= 0 {
+            return;
+        }
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let cublas = CublasHandle::new(&stream).unwrap();
+
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/fixtures/qwen_image_ops.safetensors");
+        let arch = Arc::new(SafetensorsArchive::open(&fixture_path).unwrap());
+
+        // 1. Verify warp34_fused_qk_rmsnorm_rope_f16 with unit norm weights against vl_mrope.q_out
+        // Note: apply_qwen3_vl_mrope_interleaved in the oracle applies pure mRoPE without RMSNorm,
+        // so we scale unit norm weight per head by the head's RMS so RMSNorm(q) * w == q.
+        let pos_bytes = arch.read_bytes("vl_mrope.positions").unwrap();
+        let positions: Vec<i32> = pos_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        let q_in_f32 = arch.read_f32("vl_mrope.q_in").unwrap();
+        let q_out_oracle = arch.read_f32("vl_mrope.q_out").unwrap();
+        let num_tokens = 8usize;
+        let num_heads = 4usize;
+        let head_dim = 128usize;
+
+        // Normalize each head of q_in to unit RMS before calling the fused kernel with weight = 1.0,
+        // then scale back by each head's RMS to isolate exact mRoPE parity.
+        let mut q_unit_f16 = vec![0u16; q_in_f32.len()];
+        let mut head_rms = vec![0.0f32; num_tokens * num_heads];
+        for t in 0..num_tokens {
+            for h in 0..num_heads {
+                let base = (t * num_heads + h) * head_dim;
+                let slice = &q_in_f32[base..base + head_dim];
+                let mean_sq = slice.iter().map(|v| v * v).sum::<f32>() / (head_dim as f32);
+                let rms = (mean_sq + 1e-6).sqrt();
+                head_rms[t * num_heads + h] = rms;
+                for d in 0..head_dim {
+                    q_unit_f16[base + d] = f32_to_f16(slice[d] / rms);
+                }
+            }
+        }
+        let ones_f16 = vec![f32_to_f16(1.0); head_dim];
+        let d_q = DeviceBuffer::alloc(0, q_unit_f16.len() * 2).unwrap();
+        d_q.copy_from_host(&q_unit_f16, &stream).unwrap();
+        let d_k = DeviceBuffer::alloc(0, q_unit_f16.len() * 2).unwrap();
+        d_k.copy_from_host(&q_unit_f16, &stream).unwrap();
+        let d_w = DeviceBuffer::alloc(0, ones_f16.len() * 2).unwrap();
+        d_w.copy_from_host(&ones_f16, &stream).unwrap();
+        let d_pos = DeviceBuffer::alloc(0, positions.len() * 4).unwrap();
+        d_pos.copy_from_host(&positions, &stream).unwrap();
+        let ex = stream.exec(0, 0);
+        check_rc(
+            // SAFETY: `d_q`, `d_k`, `d_w`, and `d_pos` are valid device allocations matching the launch dimensions.
+            unsafe {
+                ffi::warp34_fused_qk_rmsnorm_rope_f16(
+                    &ex,
+                    d_q.addr() as *const c_void,
+                    d_k.addr() as *const c_void,
+                    d_w.addr() as *const c_void,
+                    d_w.addr() as *const c_void,
+                    d_pos.addr() as *const i32,
+                    core::ptr::null(),
+                    d_q.addr() as *mut c_void,
+                    d_k.addr() as *mut c_void,
+                    num_tokens as i32,
+                    num_tokens as i32,
+                    num_heads as i32,
+                    num_heads as i32,
+                    head_dim as i32,
+                    head_dim as i32,
+                    24,
+                    20,
+                    20,
+                    5_000_000.0,
+                    1e-6,
+                    0.0,
+                )
+            },
+            "test warp34_fused_qk_rmsnorm_rope_f16",
+        )
+        .unwrap();
+        let mut q_rot_f16 = vec![0u16; q_unit_f16.len()];
+        d_q.copy_to_host(&mut q_rot_f16, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let mut q_rot_f32 = vec![0.0f32; q_rot_f16.len()];
+        f16_to_f32_slice(&q_rot_f16, &mut q_rot_f32);
+        let mut max_mrope_diff = 0.0f32;
+        for t in 0..num_tokens {
+            for h in 0..num_heads {
+                let rms = head_rms[t * num_heads + h];
+                let base = (t * num_heads + h) * head_dim;
+                for d in 0..head_dim {
+                    let got = q_rot_f32[base + d] * rms;
+                    let exp = q_out_oracle[base + d];
+                    max_mrope_diff = max_mrope_diff.max((got - exp).abs());
+                }
+            }
+        }
+        assert!(
+            max_mrope_diff < 5e-3,
+            "mRoPE kernel max diff {max_mrope_diff} exceeded 5e-3"
+        );
+
+        // 2. Verify Qwen3VisionEncoder::encode_images_with_deepstack and Qwen3VlConditioningEncoder
+        let cfg = ModelConfig::from_json(&json!({
+            "model_type": "qwen3_vl",
+            "image_token_id": 10,
+            "vision_config": {
+                "depth": 2,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_heads": 4,
+                "in_channels": 3,
+                "out_hidden_size": 256,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 16,
+                "deepstack_visual_indexes": [0, 1]
+            },
+            "text_config": {
+                "model_type": "qwen3_vl_text",
+                "vocab_size": 64,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 128,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 5000000.0,
+                "rope_scaling": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [24, 20, 20],
+                    "rope_type": "default"
+                }
+            }
+        }))
+        .unwrap();
+
+        let quant = QuantScheme::Unquantized;
+        let encoder =
+            Qwen3VlConditioningEncoder::load(Arc::clone(&arch), &cfg, &quant, 0, &stream).unwrap();
+
+        // 2a. Check ViT + deepstack outputs directly
+        let mm_pixels = arch.read_f32("vl.mm_pixel_values").unwrap();
+        let img = PreprocessedImage {
+            patches_f32: mm_pixels.into(),
+            grid_thw: [1, 4, 4],
+            content_hash: 0,
+        };
+        let (vis_pooler_buf, ds_bufs) = encoder
+            .vision
+            .as_ref()
+            .unwrap()
+            .encode_images_with_deepstack(std::slice::from_ref(&img), &cublas, &stream)
+            .unwrap();
+        assert_eq!(ds_bufs.len(), 2);
+
+        let check_vis_buf = |buf: &DeviceBuffer, oracle_name: &str, label: &str| {
+            let expected = arch.read_f32(oracle_name).unwrap();
+            let mut got_f16 = vec![0u16; expected.len()];
+            buf.copy_to_host(&mut got_f16, &stream).unwrap();
+            stream.synchronize().unwrap();
+            let mut got_f32 = vec![0.0f32; expected.len()];
+            f16_to_f32_slice(&got_f16, &mut got_f32);
+            let max_diff = got_f32
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 5e-3,
+                "{label} max abs diff {max_diff} exceeded 5e-3"
+            );
+        };
+        check_vis_buf(&vis_pooler_buf, "vl.mm_vis_pooler", "vis_pooler");
+        check_vis_buf(&ds_bufs[0], "vl.mm_vis_deepstack_0", "deepstack_0");
+        check_vis_buf(&ds_bufs[1], "vl.mm_vis_deepstack_1", "deepstack_1");
+
+        // 2b. Check text-only conditioning forward pass
+        let txt_ids_bytes = arch.read_bytes("vl.txt_input_ids").unwrap();
+        let txt_ids: Vec<i32> = txt_ids_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        let txt_expected = arch.read_f32("vl.txt_pre_norm").unwrap();
+        let txt_out = encoder
+            .encode_conditioning(&txt_ids, &[], 0, &cublas, &stream)
+            .unwrap();
+        assert_eq!(txt_out.seq_len, txt_ids.len());
+        assert_eq!(txt_out.hidden_size, 256);
+        let txt_max_diff = txt_out
+            .prompt_embeds_f32
+            .iter()
+            .zip(txt_expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            txt_max_diff < 5e-3,
+            "Qwen3-VL text-only pre-norm max diff {txt_max_diff} exceeded 5e-3"
+        );
+
+        // 2c. Check multimodal conditioning forward pass + drop_idx slicing
+        let mm_ids_bytes = arch.read_bytes("vl.mm_input_ids").unwrap();
+        let mm_ids: Vec<i32> = mm_ids_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        let mm_expected = arch.read_f32("vl.mm_pre_norm").unwrap();
+        let mm_out = encoder
+            .encode_conditioning(&mm_ids, std::slice::from_ref(&img), 1, &cublas, &stream)
+            .unwrap();
+        assert_eq!(mm_out.seq_len, mm_ids.len() - 1);
+        assert_eq!(
+            mm_out.image_pad_mask,
+            vec![false, true, true, true, true, false, false]
+        );
+        let mm_expected_sliced = &mm_expected[256..];
+        let mm_max_diff = mm_out
+            .prompt_embeds_f32
+            .iter()
+            .zip(mm_expected_sliced.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mm_max_diff < 5e-3,
+            "Qwen3-VL multimodal pre-norm max diff {mm_max_diff} exceeded 5e-3"
+        );
     }
 }

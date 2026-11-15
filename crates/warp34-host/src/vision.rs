@@ -351,6 +351,58 @@ pub fn preprocess_rgb_image(
     }
 }
 
+/// Composites an `[H, W, 4]` RGBA `u8` image onto a solid white `(255, 255, 255)` background
+/// into `[H, W, 3]` RGB `u8`, matching Pillow's `white.paste(img, mask=img.getchannel("A"))`
+/// integer blend (`MULDIV255(255, 255 - a) + MULDIV255(c, a)`) used by `QwenImage21Pipeline`
+/// when preparing condition images for the `Qwen3-VL-8B` vision encoder.
+pub fn composite_rgba_over_white(rgba: &[u8], height: usize, width: usize) -> Vec<u8> {
+    assert_eq!(
+        rgba.len(),
+        height * width * 4,
+        "RGBA buffer size mismatch ({} vs {} * {} * 4)",
+        rgba.len(),
+        height,
+        width
+    );
+    let mut rgb = Vec::with_capacity(height * width * 3);
+    for px in rgba.as_chunks::<4>().0 {
+        let a = px[3] as u32;
+        let inv_a = 255 - a;
+        for &c in &px[..3] {
+            let t = (c as u32) * a + 128;
+            let mul = ((t >> 8) + t) >> 8;
+            rgb.push((inv_a + mul) as u8);
+        }
+    }
+    rgb
+}
+
+/// Composites an `[H, W, 4]` RGBA `u8` condition image over white and preprocesses it
+/// for `Qwen3VisionEncoder`.
+#[allow(clippy::too_many_arguments)]
+pub fn preprocess_rgba_image_for_vision(
+    rgba: &[u8],
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> PreprocessedImage {
+    let rgb = composite_rgba_over_white(rgba, height, width);
+    preprocess_rgb_image(
+        &rgb,
+        height,
+        width,
+        patch_size,
+        temporal_patch_size,
+        spatial_merge_size,
+        min_pixels,
+        max_pixels,
+    )
+}
+
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf = 0u32;
@@ -1000,6 +1052,17 @@ impl VisionWorkspace {
 }
 
 #[cfg(feature = "cuda")]
+struct VisionMergerGpu {
+    use_postshuffle_norm: bool,
+    norm_w: u64,
+    norm_b: u64,
+    fc1_w: LinearProj,
+    fc1_b: u64,
+    fc2_w: LinearProj,
+    fc2_b: u64,
+}
+
+#[cfg(feature = "cuda")]
 pub struct Qwen3VisionEncoder {
     pub cfg: VisionConfig,
     pub device_id: i32,
@@ -1008,12 +1071,8 @@ pub struct Qwen3VisionEncoder {
     patch_proj_b: u64,
     pos_embed_f32: Vec<f32>,
     blocks: Vec<VisionBlockGpu>,
-    merger_norm_w: u64,
-    merger_norm_b: u64,
-    merger_fc1_w: LinearProj,
-    merger_fc1_b: u64,
-    merger_fc2_w: LinearProj,
-    merger_fc2_b: u64,
+    merger: VisionMergerGpu,
+    deepstack_mergers: Vec<(usize, VisionMergerGpu)>,
     workspace: std::sync::Mutex<VisionWorkspace>,
 }
 
@@ -1026,12 +1085,6 @@ impl Qwen3VisionEncoder {
         device_id: i32,
         stream: &CudaStream,
     ) -> Result<Option<Self>> {
-        if !cfg.deepstack_visual_indexes.is_empty() {
-            return Err(CudaError::new(
-                -10,
-                "non-empty deepstack_visual_indexes not supported in Qwen3_5VisionEncoder",
-            ));
-        }
         let pfx = if archive
             .resolve_name("model.visual.patch_embed.proj.weight")
             .is_some()
@@ -1063,9 +1116,9 @@ impl Qwen3VisionEncoder {
         let est_bytes = if raw_visual_bytes > 0 {
             raw_visual_bytes
                 .saturating_add(64 * 1024 * 1024)
-                .clamp(64 * 1024 * 1024, 1280 * 1024 * 1024)
+                .clamp(64 * 1024 * 1024, 1536 * 1024 * 1024)
         } else {
-            1280 * 1024 * 1024
+            1536 * 1024 * 1024
         };
         let mut arena = DeviceArena::new(device_id, est_bytes)?;
 
@@ -1135,22 +1188,52 @@ impl Qwen3VisionEncoder {
             });
         }
 
-        let merger_norm_w = upload_f16(&mut arena, &format!("{pfx}.merger.norm.weight"))?;
-        let merger_norm_b = upload_f16(&mut arena, &format!("{pfx}.merger.norm.bias"))?;
-        let merger_fc1_w = load_linear(
-            &mut arena,
-            &format!("{pfx}.merger.linear_fc1"),
-            merger_hidden,
-            merger_hidden,
-        )?;
-        let merger_fc1_b = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc1.bias"))?;
-        let merger_fc2_w = load_linear(
-            &mut arena,
-            &format!("{pfx}.merger.linear_fc2"),
-            cfg.out_hidden_size,
-            merger_hidden,
-        )?;
-        let merger_fc2_b = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc2.bias"))?;
+        let merger = VisionMergerGpu {
+            use_postshuffle_norm: false,
+            norm_w: upload_f16(&mut arena, &format!("{pfx}.merger.norm.weight"))?,
+            norm_b: upload_f16(&mut arena, &format!("{pfx}.merger.norm.bias"))?,
+            fc1_w: load_linear(
+                &mut arena,
+                &format!("{pfx}.merger.linear_fc1"),
+                merger_hidden,
+                merger_hidden,
+            )?,
+            fc1_b: upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc1.bias"))?,
+            fc2_w: load_linear(
+                &mut arena,
+                &format!("{pfx}.merger.linear_fc2"),
+                cfg.out_hidden_size,
+                merger_hidden,
+            )?,
+            fc2_b: upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc2.bias"))?,
+        };
+
+        let mut deepstack_mergers = Vec::with_capacity(cfg.deepstack_visual_indexes.len());
+        for (ds_idx, &blk_idx) in cfg.deepstack_visual_indexes.iter().enumerate() {
+            let mp = format!("{pfx}.deepstack_merger_list.{ds_idx}");
+            deepstack_mergers.push((
+                blk_idx,
+                VisionMergerGpu {
+                    use_postshuffle_norm: true,
+                    norm_w: upload_f16(&mut arena, &format!("{mp}.norm.weight"))?,
+                    norm_b: upload_f16(&mut arena, &format!("{mp}.norm.bias"))?,
+                    fc1_w: load_linear(
+                        &mut arena,
+                        &format!("{mp}.linear_fc1"),
+                        merger_hidden,
+                        merger_hidden,
+                    )?,
+                    fc1_b: upload_f16(&mut arena, &format!("{mp}.linear_fc1.bias"))?,
+                    fc2_w: load_linear(
+                        &mut arena,
+                        &format!("{mp}.linear_fc2"),
+                        cfg.out_hidden_size,
+                        merger_hidden,
+                    )?,
+                    fc2_b: upload_f16(&mut arena, &format!("{mp}.linear_fc2.bias"))?,
+                },
+            ));
+        }
 
         stream.synchronize()?;
         let _ = &arena;
@@ -1162,12 +1245,8 @@ impl Qwen3VisionEncoder {
             patch_proj_b,
             pos_embed_f32,
             blocks,
-            merger_norm_w,
-            merger_norm_b,
-            merger_fc1_w,
-            merger_fc1_b,
-            merger_fc2_w,
-            merger_fc2_b,
+            merger,
+            deepstack_mergers,
             workspace: std::sync::Mutex::new(VisionWorkspace::default()),
         }))
     }
@@ -1227,6 +1306,18 @@ impl Qwen3VisionEncoder {
     }
 
     /// Runs the full `Qwen3_VisionTransformer` forward pass on `images` and returns
+    /// `(pooler_output, deepstack_features)`, where each buffer is
+    /// `[total_merged_tokens, out_hidden_size]` `FP16` (`u16`) on GPU.
+    pub fn encode_images_with_deepstack(
+        &self,
+        images: &[PreprocessedImage],
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+    ) -> Result<(DeviceBuffer, Vec<DeviceBuffer>)> {
+        self.encode_images_full_with_trace(images, cublas, stream, None)
+    }
+
+    /// Runs the full `Qwen3_VisionTransformer` forward pass on `images` and returns
     /// `[total_merged_tokens, out_hidden_size]` `FP16` (`u16`) embeddings on GPU.
     pub fn encode_images(
         &self,
@@ -1244,8 +1335,21 @@ impl Qwen3VisionEncoder {
         images: &[PreprocessedImage],
         cublas: &CublasHandle,
         stream: &CudaStream,
-        mut trace: Option<&mut VisionTrace>,
+        trace: Option<&mut VisionTrace>,
     ) -> Result<DeviceBuffer> {
+        let (out, _deepstack) =
+            self.encode_images_full_with_trace(images, cublas, stream, trace)?;
+        Ok(out)
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn encode_images_full_with_trace(
+        &self,
+        images: &[PreprocessedImage],
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        mut trace: Option<&mut VisionTrace>,
+    ) -> Result<(DeviceBuffer, Vec<DeviceBuffer>)> {
         macro_rules! sample {
             ($name:expr, $buf:expr, $rows:expr, $cols:expr) => {
                 if let Some(trace_out) = trace.as_deref_mut() {
@@ -1291,8 +1395,12 @@ impl Qwen3VisionEncoder {
             [&block.qkv_w, &block.proj_w, &block.fc1_w, &block.fc2_w]
                 .iter()
                 .any(|p| matches!(p, LinearProj::Hadamard { .. }))
-        }) || matches!(self.merger_fc1_w, LinearProj::Hadamard { .. })
-            || matches!(self.merger_fc2_w, LinearProj::Hadamard { .. });
+        }) || matches!(self.merger.fc1_w, LinearProj::Hadamard { .. })
+            || matches!(self.merger.fc2_w, LinearProj::Hadamard { .. })
+            || self.deepstack_mergers.iter().any(|(_, m)| {
+                matches!(m.fc1_w, LinearProj::Hadamard { .. })
+                    || matches!(m.fc2_w, LinearProj::Hadamard { .. })
+            });
         let transform_scratch = if has_transform {
             projection_scratch_bytes(total_patches, max_width)?
         } else {
@@ -1491,6 +1599,7 @@ impl Qwen3VisionEncoder {
         )?;
 
         let use_tanh = i32::from(self.cfg.hidden_act.contains("tanh"));
+        let mut deepstack_outputs = Vec::with_capacity(self.deepstack_mergers.len());
 
         // 2. Transformer blocks 0..depth
         for (index, blk) in self.blocks.iter().enumerate() {
@@ -1702,39 +1811,112 @@ impl Qwen3VisionEncoder {
                 total_patches,
                 hidden
             );
+            for (ds_slot, (ds_blk_idx, ds_merger)) in self.deepstack_mergers.iter().enumerate() {
+                if *ds_blk_idx == index {
+                    let d_ds_out = Self::run_merger(
+                        self.device_id,
+                        ds_merger,
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_x,
+                        d_norm,
+                        d_merger_mid,
+                        total_patches,
+                        total_merged,
+                        hidden,
+                        merger_hidden,
+                        out_hidden,
+                        allow_defer_bias,
+                    )?;
+                    sample!(
+                        format!("deepstack_merger.{ds_slot}.output"),
+                        d_ds_out,
+                        total_merged,
+                        out_hidden
+                    );
+                    deepstack_outputs.push(d_ds_out);
+                }
+            }
         }
 
         sample!("merger.input", *d_x, total_patches, hidden);
 
         // 3. PatchMerger: LayerNorm(hidden_size) -> view [total_merged, 4 * hidden_size] -> fc1 -> exact GELU -> fc2
+        let d_visual_out = Self::run_merger(
+            self.device_id,
+            &self.merger,
+            &ex,
+            cublas,
+            marlin_ws_addr,
+            marlin_ws_ints,
+            d_x,
+            d_norm,
+            d_merger_mid,
+            total_patches,
+            total_merged,
+            hidden,
+            merger_hidden,
+            out_hidden,
+            allow_defer_bias,
+        )?;
+
+        sample!("merger.output", d_visual_out, total_merged, out_hidden);
+        Ok((d_visual_out, deepstack_outputs))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_merger(
+        device_id: i32,
+        merger: &VisionMergerGpu,
+        ex: &ffi::Warp34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_addr: u64,
+        marlin_ws_ints: usize,
+        d_x: &DeviceBuffer,
+        d_norm: &DeviceBuffer,
+        d_merger_mid: &DeviceBuffer,
+        total_patches: usize,
+        total_merged: usize,
+        hidden: usize,
+        merger_hidden: usize,
+        out_hidden: usize,
+        allow_defer_bias: bool,
+    ) -> Result<DeviceBuffer> {
+        let (norm_rows, norm_cols) = if merger.use_postshuffle_norm {
+            (total_merged as i32, merger_hidden as i32)
+        } else {
+            (total_patches as i32, hidden as i32)
+        };
         check_rc(
-            // SAFETY: `d_x` and `d_norm` are valid device buffers with capacity for `total_patches * hidden * 2` bytes,
-            // merger norm weights are valid device weights.
+            // SAFETY: `d_x` and `d_norm` are valid device buffers with capacity `total_patches * hidden * 2`
+            // (`== total_merged * merger_hidden * 2`) bytes, and merger norm weights match `norm_cols`.
             unsafe {
                 ffi::warp34_vision_layernorm_f16(
-                    &ex,
+                    ex,
                     d_x.addr() as *const c_void,
-                    self.merger_norm_w as *const c_void,
-                    self.merger_norm_b as *const c_void,
+                    merger.norm_w as *const c_void,
+                    merger.norm_b as *const c_void,
                     d_norm.addr() as *mut c_void,
-                    total_patches as i32,
-                    hidden as i32,
+                    norm_rows,
+                    norm_cols,
                     1e-6,
                 )
             },
             "warp34_vision_layernorm_f16(merger.norm)",
         )?;
 
-        let d_visual_out = DeviceBuffer::alloc(self.device_id, total_merged * out_hidden * 2)?;
+        let d_visual_out = DeviceBuffer::alloc(device_id, total_merged * out_hidden * 2)?;
 
         let merger_fc1_deferred_bias = forward_bias_maybe_defer(
-            &self.merger_fc1_w,
-            &ex,
+            &merger.fc1_w,
+            ex,
             cublas,
             marlin_ws_addr,
             marlin_ws_ints,
             d_norm.addr(),
-            self.merger_fc1_b,
+            merger.fc1_b,
             d_merger_mid.addr(),
             total_merged,
             allow_defer_bias,
@@ -1745,7 +1927,7 @@ impl Qwen3VisionEncoder {
             // in-place exact GELU on active stream.
             unsafe {
                 ffi::warp34_vision_bias_gelu_f16(
-                    &ex,
+                    ex,
                     d_merger_mid.addr() as *const c_void,
                     merger_fc1_deferred_bias,
                     d_merger_mid.addr() as *mut c_void,
@@ -1758,18 +1940,17 @@ impl Qwen3VisionEncoder {
         )?;
 
         forward_bias(
-            &self.merger_fc2_w,
-            &ex,
+            &merger.fc2_w,
+            ex,
             cublas,
             marlin_ws_addr,
             marlin_ws_ints,
             d_merger_mid.addr(),
-            self.merger_fc2_b,
+            merger.fc2_b,
             d_visual_out.addr(),
             total_merged,
         )?;
 
-        sample!("merger.output", d_visual_out, total_merged, out_hidden);
         Ok(d_visual_out)
     }
 
@@ -1902,5 +2083,27 @@ mod tests {
 
         let (h_large, w_large) = smart_resize(32, 70_000, 32, 1024, 1024 * 1024);
         assert!(h_large.max(w_large) <= h_large.min(w_large) * MAX_IMAGE_ASPECT_RATIO);
+    }
+
+    #[test]
+    fn test_composite_rgba_over_white_matches_pillow_muldiv255() {
+        let rgba = [
+            0u8, 128, 255, 0, // fully transparent -> white
+            10, 20, 30, 255, // fully opaque -> unchanged
+            100, 150, 200, 128, // 50% alpha
+        ];
+        let rgb = composite_rgba_over_white(&rgba, 1, 3);
+        assert_eq!(&rgb[0..3], &[255, 255, 255]);
+        assert_eq!(&rgb[3..6], &[10, 20, 30]);
+        // Pillow MULDIV255: (c * 128 + 127) / 255 + (255 - 128) = (c * 128 + 127) / 255 + 127
+        assert_eq!(rgb[6], ((100u32 * 128 + 127) / 255 + 127) as u8);
+        assert_eq!(rgb[7], ((150u32 * 128 + 127) / 255 + 127) as u8);
+        assert_eq!(rgb[8], ((200u32 * 128 + 127) / 255 + 127) as u8);
+
+        let rgba_tile = vec![200u8; 64 * 64 * 4];
+        let prep =
+            preprocess_rgba_image_for_vision(&rgba_tile, 64, 64, 16, 2, 2, 32 * 32, 512 * 512);
+        assert_eq!(prep.grid_thw, [1, 4, 4]);
+        assert_eq!(prep.num_merged_tokens(2), 4);
     }
 }

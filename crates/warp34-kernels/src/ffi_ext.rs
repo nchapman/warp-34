@@ -952,4 +952,75 @@ unsafe extern "C" {
         local_vocab_size: i32,
         vocab_offset: i32,
     ) -> i32;
+
+    pub fn warp34_rms_norm_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_fused_add_rms_norm_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_fused_qk_rmsnorm_rope_f16(
+        ex: *const Warp34Exec,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        positions: *const i32,
+        valid_token_mask: *const u8,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        num_tokens: i32,
+        pos_plane_stride: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        mrope_s0: i32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+        weight_bias: f32,
+    ) -> i32;
+
+    pub fn warp34_embedding_add_f16(
+        ex: *const Warp34Exec,
+        dst_embeds: *mut c_void,
+        src_visual_embeds: *const c_void,
+        token_indices: *const i32,
+        num_visual_tokens: i32,
+        dst_rows: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn warp34_mha_fa2_d128_f16(
+        ex: *const Warp34Exec,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        b: i32,
+        seqlen_q: i32,
+        seqlen_k: i32,
+        h: i32,
+        h_k: i32,
+        is_causal: i32,
+    ) -> i32;
 }

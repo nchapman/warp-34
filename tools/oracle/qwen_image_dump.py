@@ -213,6 +213,94 @@ def generate_synthetic_fixture(out_path: Path):
     tensors["vl_mrope.q_in"] = vl_q.contiguous()
     tensors["vl_mrope.q_out"] = apply_qwen3_vl_mrope_interleaved(vl_q, pos_3d).contiguous()
 
+    # 5. Miniature 2-layer Qwen3VLModel (vision + deepstack_visual_indexes=[0, 1] + language_model pre-norm tap)
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+        Qwen3VLConfig,
+        Qwen3VLTextConfig,
+        Qwen3VLVisionConfig,
+    )
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    torch.manual_seed(20260422)
+    vcfg = Qwen3VLVisionConfig(
+        depth=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_heads=4,
+        in_channels=3,
+        out_hidden_size=256,
+        patch_size=16,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[0, 1],
+    )
+    tcfg = Qwen3VLTextConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        rms_norm_eps=1e-6,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5000000.0,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+        },
+    )
+    vl_cfg = Qwen3VLConfig(
+        vision_config=vcfg.to_dict(),
+        text_config=tcfg.to_dict(),
+        image_token_id=10,
+    )
+    vl_model = Qwen3VLModel(vl_cfg).eval().to(torch.float16)
+    with torch.no_grad():
+        for p in vl_model.parameters():
+            p.normal_(mean=0.0, std=0.05)
+
+    for k, v in vl_model.state_dict().items():
+        tensors[f"model.{k}"] = v.contiguous()
+
+    captured = {}
+
+    def _capture_pre_norm(_mod, args):
+        captured["pre_norm"] = args[0].detach().clone()
+
+    hook_handle = vl_model.language_model.norm.register_forward_pre_hook(_capture_pre_norm)
+
+    # 5a. Text-only conditioning forward pass
+    txt_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+    with torch.no_grad():
+        vl_model(input_ids=txt_ids)
+    tensors["vl.txt_input_ids"] = txt_ids.view(-1).to(torch.int32).contiguous()
+    tensors["vl.txt_pre_norm"] = captured["pre_norm"].squeeze(0).contiguous()
+
+    # 5b. Multimodal conditioning forward pass (16 patches = 1x4x4 -> 4 merged tokens at id=10)
+    mm_ids = torch.tensor([[1, 2, 10, 10, 10, 10, 3, 4]], dtype=torch.long)
+    mm_token_type_ids = (mm_ids == 10).long()
+    pixel_values = torch.randn(16, 1536, dtype=torch.float16)
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    with torch.no_grad():
+        vis_out = vl_model.visual(pixel_values, grid_thw=image_grid_thw)
+        vl_model(
+            input_ids=mm_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+    hook_handle.remove()
+
+    tensors["vl.mm_input_ids"] = mm_ids.view(-1).to(torch.int32).contiguous()
+    tensors["vl.mm_pixel_values"] = pixel_values.to(torch.float32).contiguous()
+    tensors["vl.mm_grid_thw"] = image_grid_thw.view(-1).to(torch.int32).contiguous()
+    tensors["vl.mm_vis_pooler"] = vis_out.pooler_output.contiguous()
+    tensors["vl.mm_vis_deepstack_0"] = vis_out.deepstack_features[0].contiguous()
+    tensors["vl.mm_vis_deepstack_1"] = vis_out.deepstack_features[1].contiguous()
+    tensors["vl.mm_pre_norm"] = captured["pre_norm"].squeeze(0).contiguous()
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out_path))
     print(f"Wrote {len(tensors)} oracle tensors to {out_path}")
