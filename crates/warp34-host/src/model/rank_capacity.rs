@@ -157,9 +157,9 @@ pub const TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT: usize = 104;
 /// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for larger serving KV budgets (`> 1.5 GiB`).
 pub const TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT: usize = 96;
 
-/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`256 / 512` experts across 2 GPUs),
+/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`320 / 512` experts across 2 GPUs),
 /// leaving room for `100%` VRAM-resident `MTP` (`256 / 256` local experts) plus `>= 1.4 GiB` headroom.
-pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 128;
+pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 160;
 
 /// Extra expert-stride slots (`512`) reserved on `TP=1` / `TP=2` for `TieredMoeWorkspace` staging
 /// and downstream `MTP` expert cache allocation.
@@ -469,23 +469,24 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
         let reserve = hot.saturating_mul(actual_per_hot_step) + compact_extra_reserve;
         return (hot, reserve);
     }
-    let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
-        let max_affordable =
-            (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
-        let full_residency_slack = 4 * 1024 * 1024 * 1024usize;
-        let full_residency_need = fixed_overhead
-            .saturating_add(local_experts.saturating_mul(per_hot_step))
-            .saturating_add(full_residency_slack);
-        if available_vram_after_weights_and_scratch >= full_residency_need {
-            local_experts
+    let hot =
+        if available_vram_after_weights_and_scratch > fixed_overhead && actual_per_hot_step > 0 {
+            let max_affordable =
+                (available_vram_after_weights_and_scratch - fixed_overhead) / actual_per_hot_step;
+            let full_residency_slack = 4 * 1024 * 1024 * 1024usize;
+            let full_residency_need = fixed_overhead
+                .saturating_add(local_experts.saturating_mul(actual_per_hot_step))
+                .saturating_add(full_residency_slack);
+            if available_vram_after_weights_and_scratch >= full_residency_need {
+                local_experts
+            } else {
+                let aligned = (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT)
+                    * TIERED_MOE_HOT_SLOT_ALIGNMENT;
+                aligned.clamp(min_hot, default_hot)
+            }
         } else {
-            let aligned =
-                (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT) * TIERED_MOE_HOT_SLOT_ALIGNMENT;
-            aligned.clamp(min_hot, default_hot)
-        }
-    } else {
-        min_hot
-    };
+            min_hot
+        };
     let reserve = hot.saturating_mul(actual_per_hot_step) + extra_reserve;
     (hot, reserve)
 }

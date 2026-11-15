@@ -1,5 +1,13 @@
 # warp34 — Session Orientation & Current State
 
+## Mixed W2/W4 HGPTQ-RCO Tiered-MoE Hot Cache Sizing & `warp34` Naming Standardization
+
+- **Mixed W2/W4 HGPTQ-RCO Hot Expert Cache Planner (`crates/warp34-host/src/model/rank_capacity.rs`, `crates/warp34-host/src/model/tests.rs`, `crates/warp34-host/tests/qwen4_flash_next.rs`):**
+  - Updated `plan_tiered_moe_hot_per_layer_with_dflash` to divide `(available_vram_after_weights_and_scratch - fixed_overhead)` and compute `full_residency_need` using `actual_per_hot_step` (summing per-layer `layer_moe_expert_pack_layout(l)` strides across `W2B2` GDN layers and `W4B8` QSA layers, e.g. `61.875–63.95 MiB/hot step` on `nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO`) instead of the pessimistic upper-bound `per_hot_step` (`48 × 2,036 KiB = 95.625 MiB/hot step` pure-W4).
+  - Raised `TIERED_MOE_TP2_DEFAULT_HOT` from `128` to `160` (`320 / 512 = 62.5%` hot experts across 2 GPUs), allowing `TP=2` on 2× 24 GB GPUs at `8,192` `TQ4` KV pages (`128K` context) + `100%` VRAM-resident `MTP-3` to allocate `160` hot experts/layer/rank with `~2.45 GiB` post-pool headroom instead of stepping down to `112` and leaving `~5.5 GiB/card` idle.
+- **`warp34` Repository & Casing Standardization (`crates/warp34-kernels/`, `crates/warp34-host/`, `benchmarks/perf/warp34perf/`, `dashboard/`):**
+  - Standardized crate names (`warp34-kernels`, `warp34-host`), CLI binary (`warp34`), FFI header/entrypoints (`warp34_cuda.h`, `warp34_*`), environment variables/constants (`WARP34_*`), and PascalCase type/struct names (`Warp34*`), and pushed to `git@github.com:nchapman/warp34.git`.
+
 ## Embedded Web Console API Playground & Multi-Turn Wire Workbench (`dashboard/`, `crates/warp34-host/src/dashboard.rs`)
 
 - **Interactive API Playground (`dashboard/src/{playground.ts,Playground.tsx,Playground.test.tsx}`, `dashboard/src/{App.tsx,style.css}`, `crates/warp34-host/src/dashboard.rs`):**

@@ -217,7 +217,7 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (104 and 128),
+        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (104 and 160),
         // while TP=1 with 4096-page KV reserve uses 96 so MTP-3 keeps k_hot = 192 in VRAM.
         let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
@@ -239,18 +239,18 @@ mod serving_capacity_tests {
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             2,
-            20_800 * 1024 * 1024,
+            22_500 * 1024 * 1024,
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp2_default, 128);
+        assert_eq!(hot_tp2_default, 160);
 
         // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100 where >= 4 GiB slack remains
         // after placing all local experts in VRAM), `plan_tiered_moe_hot_per_layer` promotes
         // `hot_per_layer` to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
-        let (hot_tp1_a100_80g, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, 60 * gib, 2 * gib, gib);
+        let (hot_tp1_a100_80g, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, 70 * gib, 2 * gib, gib);
         assert_eq!(hot_tp1_a100_80g, 512);
-        let (hot_tp2_a100_40g, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, 30 * gib, 2 * gib, gib);
+        let (hot_tp2_a100_40g, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, 38 * gib, 2 * gib, gib);
         assert_eq!(hot_tp2_a100_40g, 256);
 
         // When DFlash2 reserve exceeds default MTP/graph reserve (e.g. 24 GiB sm_89 TP=2
@@ -320,6 +320,99 @@ mod serving_capacity_tests {
                 * exp_bytes
         );
         assert!(548 * mib + 252 * mib + reserve_3060ti_tp2 <= 4702 * mib);
+
+        // Mixed W2/W4 HGPTQ-RCO (36 GDN layers @ 1,196 KiB W2 + 12 QSA layers @ 2,036 KiB W4 =
+        // 65,488 KiB = 63.95 MiB/hot step instead of 95.625 MiB pure-W4): `plan_tiered_moe_hot_per_layer`
+        // divides available VRAM by `actual_per_hot_step`, allowing TP=2 at 8,192 TQ4 KV pages
+        // (~128K context) + MTP-3 on 24 GiB cards to reach `TIERED_MOE_TP2_DEFAULT_HOT` (160)
+        // instead of stepping down to 112.
+        let mut rco_targets_w2 = Vec::new();
+        let mut rco_targets_w4 = Vec::new();
+        for layer in 0..48usize {
+            let pat = format!(
+                "re:.*(?<!mtp\\.)layers\\.{layer}\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+            );
+            if (layer + 1).is_multiple_of(4) {
+                rco_targets_w4.push(pat);
+            } else {
+                rco_targets_w2.push(pat);
+            }
+        }
+        let rco_quant_json = serde_json::json!({
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "w2_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w2,
+                    "weights": {
+                        "actorder": null,
+                        "dynamic": false,
+                        "group_size": 64,
+                        "num_bits": 2,
+                        "strategy": "group",
+                        "symmetric": true,
+                        "type": "int"
+                    }
+                },
+                "w4_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w4,
+                    "weights": {
+                        "actorder": null,
+                        "dynamic": false,
+                        "group_size": 64,
+                        "num_bits": 4,
+                        "strategy": "group",
+                        "symmetric": true,
+                        "type": "int"
+                    }
+                }
+            },
+            "transform_config": {
+                "config_groups": {
+                    "v": {
+                        "head_dim": 64,
+                        "precision": "torch.float32",
+                        "randomize": false,
+                        "requires_grad": false,
+                        "type": "hadamard",
+                        "apply": [
+                            {
+                                "ignore": [],
+                                "inverse": true,
+                                "location": "weight_input",
+                                "targets": [
+                                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+                                ]
+                            },
+                            {
+                                "ignore": [],
+                                "inverse": false,
+                                "location": "input",
+                                "targets": [
+                                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let mut rco_cfg = cfg.clone();
+        rco_cfg.moe_intermediate_size = 512;
+        rco_cfg.quant = crate::loader::ModelConfig::parse_quant(Some(&rco_quant_json)).unwrap();
+        let base_plus_kv_8k_tq4 = gib + 1152 * mib;
+        let min_state_18 = 1200 * mib;
+        let (hot_rco_tp2_8k, reserve_rco_tp2_8k) = plan_tiered_moe_hot_per_layer(
+            &rco_cfg,
+            2,
+            16_400 * mib,
+            base_plus_kv_8k_tq4,
+            min_state_18,
+        );
+        assert_eq!(hot_rco_tp2_8k, TIERED_MOE_TP2_DEFAULT_HOT);
+        assert!(base_plus_kv_8k_tq4 + min_state_18 + reserve_rco_tp2_8k <= 16_400 * mib);
     }
 
     #[test]

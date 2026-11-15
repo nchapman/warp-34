@@ -1270,8 +1270,8 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
     rt.block_on(worker_c4.shutdown())
         .expect("c=4 worker shutdown");
 
-    // Verify `plan_tiered_moe_hot_per_layer` adapts TP=2 hot cache down from 128 when
-    // multi-thousand-page contexts (`4096..8192` pages) + MTP headroom are requested.
+    // Verify `plan_tiered_moe_hot_per_layer` adapts TP=2 hot cache from 136 (at 256 pages)
+    // down to 104 when multi-thousand-page contexts (`4096..12288` pages) + MTP headroom are requested.
     let cfg = warp34_host::loader::ModelConfig::from_dir(dir).unwrap();
     let mut real_like_cfg = cfg;
     real_like_cfg.num_hidden_layers = 48;
@@ -1286,7 +1286,7 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
         gib + 38 * 1024 * 1024,
         450 * 1024 * 1024,
     );
-    assert_eq!(hot_small, 128);
+    assert_eq!(hot_small, 136);
     let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;
     let min_state_12k = 1200 * 1024 * 1024;
     let (hot_12k, reserve_12k) = warp34_host::model::plan_tiered_moe_hot_per_layer(
