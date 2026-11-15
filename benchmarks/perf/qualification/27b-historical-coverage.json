@@ -2,7 +2,7 @@
   "schema_version": 1,
   "publication_certified": false,
   "scope": "Historical local bundles whose path contains 27b; no deduplication or current-build qualification",
-  "reproduce": "Source: python3 -m w34perf audit results. Snapshot projection retains only bundles with 27b in the path, excludes deployments and coverage fields plus top-level totals/count_semantics, and adds scope/reproduce. Counts describe trials and requests, not independent restarts; absent cells may be unselected, not necessarily unrun or unsupported. Later runs add bundles; verify each listed input SHA-256 rather than expecting the live directory inventory to be unchanged.",
+  "reproduce": "Source: python3 -m warp34perf audit results. Snapshot projection retains only bundles with 27b in the path, excludes deployments and coverage fields plus top-level totals/count_semantics, and adds scope/reproduce. Counts describe trials and requests, not independent restarts; absent cells may be unselected, not necessarily unrun or unsupported. Later runs add bundles; verify each listed input SHA-256 rather than expecting the live directory inventory to be unchanged.",
   "bundles": [
     {
       "path": "27b-fp16-final-20261030-202035",

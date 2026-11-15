@@ -4,7 +4,7 @@
 
 Decision models ("System-1 classifiers / structured scorers") evaluate one or more typed decision questions (`noul`, `choice`, `score`) over a shared `state` in **a single prefill forward pass with zero autoregressive decode tokens**, returning calibrated probability distributions, expected scores, and analytical confidence metrics.
 
-`warp-34` exposes two first-class HTTP endpoints backed by one unified decision engine:
+`warp34` exposes two first-class HTTP endpoints backed by one unified decision engine:
 
 1. **`POST /v1/systemone`** (and `POST /systemone`) — TypeSafe System One wire contract.
 2. **`POST /v1/decisions`** (and `POST /decisions`) — Ergonomic ordered-array Decisions adapter (`object: "decision.list"`, `decisions[]` + `answers{}` with `"noul" | "choice" | "score"`), translating deterministically onto the same execution & calibration pipeline.
@@ -26,9 +26,9 @@ Decision models ("System-1 classifiers / structured scorers") evaluate one or mo
 
 ---
 
-## 2. Supported Model Family Scope on `warp-34`
+## 2. Supported Model Family Scope on `warp34`
 
-`warp-34`'s inference spine is purpose-built for Qwen 3.5 / 3.6 / 3.8 hybrid GDN + paged full-attention (+ MoE + Vision) models. Decision profiles are auto-detected at model load time from `decision_config.json`, `config.json`, and `readout.safetensors`:
+`warp34`'s inference spine is purpose-built for Qwen 3.5 / 3.6 / 3.8 hybrid GDN + paged full-attention (+ MoE + Vision) models. Decision profiles are auto-detected at model load time from `decision_config.json`, `config.json`, and `readout.safetensors`:
 
 | Profile | Detection Rule | Backbone | Readout Mechanism | Max Options & Special Rules |
 |---|---|---|---|---|
@@ -104,20 +104,20 @@ Translates ordered-array or simplified decision payloads (`state` or `context`, 
 
 1. **Optional `lm_head` & `language_model.*` Weight Prefixes**:
    - `SafetensorsArchive::resolve_name` resolves bare `language_model.layers.*` / `language_model.embed_tokens.*` / `language_model.norm.*` tensor names used by `GLiDE` and `d3` checkpoints alongside standard `model.language_model.*` and `model.layers.*` prefixes.
-   - `Qwen3_5ModelRank::lm_head` is `Option<LinearProj>`. When `tie_word_embeddings == false` and no `lm_head` tensor exists in the checkpoint, `warp-34` skips allocating the vocab projection (~1–2 GiB saved) and suppresses `selected_rows` (`emit_mask = false`) on `HiddenPositions`-only prefill batches.
+   - `Qwen3_5ModelRank::lm_head` is `Option<LinearProj>`. When `tie_word_embeddings == false` and no `lm_head` tensor exists in the checkpoint, `warp34` skips allocating the vocab projection (~1–2 GiB saved) and suppresses `selected_rows` (`emit_mask = false`) on `HiddenPositions`-only prefill batches.
 2. **`noncausal_full_attention` & `prefix_bidir` State-Once Execution**:
-   - Full-attention layers use `W34_ATTN_MASK_SYMMETRIC_WINDOW` (`sliding_window = 0`) when `cfg.noncausal_full_attention` is true or when `ScheduledBatchSlice::prefix_bidir` is true for the current prefill chunk.
+   - Full-attention layers use `WARP34_ATTN_MASK_SYMMETRIC_WINDOW` (`sliding_window = 0`) when `cfg.noncausal_full_attention` is true or when `ScheduledBatchSlice::prefix_bidir` is true for the current prefill chunk.
    - When `prefix_bidir_len = Some(P)` is set on a `d3` `state_once` request, `SchedulerV1::schedule_step` and `ScheduledVision::step_prefill` split prefill chunks at the exact token boundary `P` (`prefix_bidir = true` for `start_pos + len <= P`, `prefix_bidir = false` for `start_pos >= P`) and disable `MambaRadixCache` prefix donation for bidirectional prefixes.
-3. **`midloop` Damped-Euler Recurrence (`w34_midloop_damped_euler_f16`)**:
+3. **`midloop` Damped-Euler Recurrence (`warp34_midloop_damped_euler_f16`)**:
    - When `cfg.midloop` (`start_layer`, `end_layer`, `passes > 1`) is configured on a `GLiDE` model, `Qwen3_5ModelRank::run_decoder_layers_into` snapshots `x_0` and each GDN layer's `(conv_state, ssm_state)` before `start_layer`.
-   - After each pass through `start_layer..=end_layer`, it applies `w34_midloop_damped_euler_f16` (`h <- x_i + (1 / passes) * (f(x_i) - x_i)` with `alpha = 1.0 / passes as f32`); on passes `0..passes - 1`, it updates `x_{i+1} <- h`, restores GDN states, and re-evaluates `start_layer.input_layernorm` before the next pass.
+   - After each pass through `start_layer..=end_layer`, it applies `warp34_midloop_damped_euler_f16` (`h <- x_i + (1 / passes) * (f(x_i) - x_i)` with `alpha = 1.0 / passes as f32`); on passes `0..passes - 1`, it updates `x_{i+1} <- h`, restores GDN states, and re-evaluates `start_layer.input_layernorm` before the next pass.
    - On the final pass (`pass_idx == passes - 1`), GDN states and KV pages remain at their post-pass values and the following layer (`end_layer + 1` or final norm) normalizes the damped-Euler updated residual.
 
 ---
 
 ## 5. JevBench Benchmarking (`benchmarks/perf/campaigns/decision-models.toml`)
 
-`w34perf` supports `kind = "decision"` (`POST /v1/systemone`) benchmark cases with ground-truth accuracy scoring against the public MIT-licensed [JevBench](https://github.com/fstandhartinger/jevbench) suite (`609a664e81f46e03731600bd7bd9f1b7a61257c5`, data card: `https://benchmarkheaven.com/jev-models/data`):
+`warp34perf` supports `kind = "decision"` (`POST /v1/systemone`) benchmark cases with ground-truth accuracy scoring against the public MIT-licensed [JevBench](https://github.com/fstandhartinger/jevbench) suite (`609a664e81f46e03731600bd7bd9f1b7a61257c5`, data card: `https://benchmarkheaven.com/jev-models/data`):
 
 - `benchmarks/perf/fixtures/jevbench_public.json`: 128 single-question `/v1/systemone` items (`72` `original.jsonl` + `16` `easy.jsonl` + `40` `hard.jsonl`).
 - `benchmarks/perf/fixtures/jevbench_multiquestion.json`: 16 multi-question `/v1/systemone` requests (`4` questions per request = `64` decisions).

@@ -1,6 +1,6 @@
 """Full-row FP16 parity with installed native Torch LayerNorm.
 Run on an exclusively reserved GPU, for example:
-flock /tmp/w34-gpu1.lock env CUDA_VISIBLE_DEVICES=1 python tools/oracle/vision_norm_probe.py
+flock /tmp/warp34-gpu1.lock env CUDA_VISIBLE_DEVICES=1 python tools/oracle/vision_norm_probe.py
 This GPU/native-version probe is intentionally separate from CPU unittest discovery.
 Compiles the production translation unit with its production fast-math setting.
 Donor source: pytorch/pytorch cf30153c4c131c8164ee7798e5022d810682e2cb,
@@ -30,10 +30,10 @@ class VisionNorm(unittest.TestCase):
                             "-gencode=arch=compute_86,code=sm_86",
                             "-gencode=arch=compute_89,code=sm_89",
                             "-gencode=arch=compute_89,code=compute_89",
-                            str(root / "crates/w34-kernels/csrc/ops/op_vision.cu"),
+                            str(root / "crates/warp34-kernels/csrc/ops/op_vision.cu"),
                             "-o", libpath], check=True)
             lib = ctypes.CDLL(libpath, mode=os.RTLD_LAZY)
-            norm = lib.w34_vision_layernorm_f16
+            norm = lib.warp34_vision_layernorm_f16
             norm.argtypes = [ctypes.POINTER(Exec)] + [ctypes.c_void_p]*4 + [ctypes.c_int]*2 + [ctypes.c_float]
             norm.restype = ctypes.c_int
             torch.manual_seed(7429)

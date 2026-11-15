@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from w34perf.audit import audit
+from warp34perf.audit import audit
 
 
 class AuditTests(unittest.TestCase):

@@ -149,7 +149,7 @@ class AlignedProtocolTests(unittest.TestCase):
         self.assertEqual((p['tp'], p['M']), (1, 16))
         self.assertIsNone(p['verify_rounds'])
         self.assertIsNone(p['output_ids'])
-        self.assertNotEqual(p['kv_policy']['oracle'], p['kv_policy']['w34'])
+        self.assertNotEqual(p['kv_policy']['oracle'], p['kv_policy']['warp34'])
 
     def test_snapshot_fail_closed(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Targeted CUDA `compute-sanitizer` regression gate for `w34-kernels`.
+"""Targeted CUDA `compute-sanitizer` regression gate for `warp34-kernels`.
 
 Runs `/opt/cuda/bin/compute-sanitizer --error-exitcode=1` (`memcheck`,
 `racecheck`, and `synccheck`) across a fast curated matrix covering all six
-`w34-kernels` CUDA subsystems:
+`warp34-kernels` CUDA subsystems:
   1. Quantized Linear (`Marlin` W4A16/W2A16/BF16, `small_n_gemm`, fused `LoRA`)
   2. KV Cache, `TQ4`/`Q8_0`, Paged Attention, Paged FA2, & QSA
   3. Gated DeltaNet (`GDN` decode, `WY` / `WY64` chunked prefill, `conv1d`)
@@ -39,7 +39,7 @@ ALL_TOOLS: tuple[str, ...] = ("memcheck", "racecheck", "synccheck")
 @dataclasses.dataclass(frozen=True)
 class SanitizerCase:
     subsystem: str
-    target: str  # "lib" for `w34-host --lib`, otherwise `--test <target>`
+    target: str  # "lib" for `warp34-host --lib`, otherwise `--test <target>`
     test_name: str
     min_gpus: int = 1
     tools: tuple[str, ...] = ALL_TOOLS
@@ -315,7 +315,7 @@ def build_test_executables(
         "test",
         "--release",
         "-p",
-        "w34-host",
+        "warp34-host",
         "--features",
         "cuda",
         "--no-run",
@@ -347,7 +347,7 @@ def build_test_executables(
         target_info = msg.get("target") or {}
         kinds = target_info.get("kind") or []
         name = target_info.get("name")
-        if "lib" in kinds and name == "w34_host":
+        if "lib" in kinds and name == "warp34_host":
             executables["lib"] = pathlib.Path(exe)
         elif "test" in kinds and name in targets:
             executables[name] = pathlib.Path(exe)

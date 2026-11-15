@@ -3,7 +3,7 @@
 ## Objective
 
 Finish the independent HTTP comparison suite for Qwen3.8-27B first, then
-Qwen3.8-Flash-Next. Reuse `w34perf`; do not couple publication runs to development
+Qwen3.8-Flash-Next. Reuse `warp34perf`; do not couple publication runs to development
 oracles, tensor parity tests, or profiler tooling. This ledger supplements
 [PLAN.md](PLAN.md), whose broader feature backlog is not all on this critical path.
 
@@ -16,7 +16,7 @@ historical settings still apply. Base implementation at planning: `66974d8`.
 - [x] Reconcile historical manifests/summaries into deployment × workload coverage.
       `qualification/27b-historical-coverage.json` records 31 local historical
       bundles, per-cell counts/repetitions/blockers and hashes of input files.
-      Reproduce the full read-only inventory with `python3 -m w34perf audit results`.
+      Reproduce the full read-only inventory with `python3 -m warp34perf audit results`.
       Counts are recorded summary counts, not independent verification of raw requests.
 - [x] Retain provenance, preflight, startup and quality evidence with run bundles.
       Missing historical/startup receipts remain explicit; attachments are not

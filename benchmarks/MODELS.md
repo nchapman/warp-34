@@ -2,7 +2,7 @@
 
 ## Active model selection
 
-- **warp-34 quantized targets:** `nchapman/*-HGPTQ*` (normally `W4A16-HGPTQ`).
+- **warp34 quantized targets:** `nchapman/*-HGPTQ*` (normally `W4A16-HGPTQ`).
   Do not substitute the deprecated `nchapman/*-W4A16-GPTQ` exports.
 - **vLLM / SGLang quantized Qwen baselines:** cyankiwi quants of the **official
   Qwen base**, not uncensored, abliterated, or otherwise fine-tuned derivatives.
@@ -10,7 +10,7 @@
   Format-loader coverage is not a benchmark model endorsement.
 - Pin the checkpoint and tokenizer revisions. Keep the API `model` alias,
   launch path, quantization metadata, and receipt consistent. Never inherit
-  warp-34's artifact hashes or HGPTQ metadata into a competitor profile.
+  warp34's artifact hashes or HGPTQ metadata into a competitor profile.
 
 | Family | vLLM / SGLang checkpoint | Revision | Weight format |
 |---|---|---|---|
@@ -28,10 +28,10 @@ Download the exact competitor snapshots before using offline launch profiles:
 ```sh
 hf download cyankiwi/Qwen3.8-27B-AWQ-INT4 --revision e3a700906e6a73ba4290b1873dc2ba8198527ab5
 hf download cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit --revision f1e8415c4f29508fe281da4e256df26573213bfd
-mise run test-prep-all  # pinned warp-34 HGPTQ and correctness fixtures
+mise run test-prep-all  # pinned warp34 HGPTQ and correctness fixtures
 ```
 
-Use the pins in each campaign for warp-34; `tools/prep_test_models.py` prepares
+Use the pins in each campaign for warp34; `tools/prep_test_models.py` prepares
 the core test pins. The quality suite has its own explicitly documented HGPTQ
 pin in [quality/AUTOMATION.md](quality/AUTOMATION.md).
 

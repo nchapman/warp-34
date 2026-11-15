@@ -77,9 +77,9 @@ def install_hook(worker, out_dir, override_visual=None, capture_layers=False, ca
         raise RuntimeError("requires unpruned, non-deepstack, weight-TP vision")
     vc = model.config.vision_config
     if (vc.patch_size, vc.spatial_merge_size, vc.temporal_patch_size) != (16, 2, 2):
-        raise RuntimeError("vision config does not match w34 geometry")
+        raise RuntimeError("vision config does not match warp34 geometry")
     state = {"count": 0, "text_count": 0, "rank": worker.rank}
-    worker._w34_vl_capture = state
+    worker._warp34_vl_capture = state
     original = model._process_image_input
     source = Path(inspect.getfile(original))
     state["source"] = {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
@@ -148,7 +148,7 @@ def install_hook(worker, out_dir, override_visual=None, capture_layers=False, ca
                 f"nan={int(torch.isnan(visual).sum())}, inf={int(torch.isinf(visual).sum())}, "
                 f"bad_traces={bad_traces[:6]})"
             )
-        # w34 dump stores FP16 values widened to F32; preserve exact native FP16 too.
+        # warp34 dump stores FP16 values widened to F32; preserve exact native FP16 too.
         tensors = {"visual_embeddings": visual.float(), "visual_embeddings_fp16": visual,
                    "pixel_values": pixels, "image_grid_thw": grid}
         tensors.update(vision_tensors)
@@ -197,7 +197,7 @@ def install_hook(worker, out_dir, override_visual=None, capture_layers=False, ca
 
 
 def capture_status(worker):
-    state = worker._w34_vl_capture
+    state = worker._warp34_vl_capture
     if state["count"] != 1 or state.get("text_count") != 1:
         raise RuntimeError(f"incomplete vision/text hook capture on rank {worker.rank}")
     return state

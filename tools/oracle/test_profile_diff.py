@@ -25,16 +25,16 @@ class Windows(unittest.TestCase):
                 INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(1, 10, 20, 0), (1, 30, 40, 0), (1, 100, 120, 0);
                 CREATE TABLE NVTX_EVENTS(text, textId, start, end, globalTid);
                 INSERT INTO NVTX_EVENTS VALUES
-                ('w34.bench.measured', NULL, 0, 50, 1),
-                ('w34.decode', NULL, 10, 40, 1),
-                ('w34.bench.measured', NULL, 80, 110, 1),
-                ('w34.decode', NULL, 90, 105, 1),
-                ('w34.decode', NULL, 91, 104, 2);
+                ('warp34.bench.measured', NULL, 0, 50, 1),
+                ('warp34.decode', NULL, 10, 40, 1),
+                ('warp34.bench.measured', NULL, 80, 110, 1),
+                ('warp34.decode', NULL, 90, 105, 1),
+                ('warp34.decode', NULL, 91, 104, 2);
             ''')
 
     def test_last_nested_candidates_not_gpu_window(self):
         result = nvtx_candidates(self.db)
-        self.assertEqual(result['decode_cpu_candidates'], [('w34.decode', 90, 105, 1)])
+        self.assertEqual(result['decode_cpu_candidates'], [('warp34.decode', 90, 105, 1)])
         with self.assertRaises(ValueError):
             parse_explicit_window(self.db, 90, 105, self.meta)
 
@@ -59,13 +59,13 @@ class Windows(unittest.TestCase):
 
     def test_missing_nested_decode(self):
         with sqlite3.connect(self.db) as c:
-            c.execute("DELETE FROM NVTX_EVENTS WHERE text = 'w34.decode' AND start >= 90")
+            c.execute("DELETE FROM NVTX_EVENTS WHERE text = 'warp34.decode' AND start >= 90")
         with self.assertRaises(ValueError):
             nvtx_candidates(self.db)
 
     def test_command(self):
         cmd = [sys.executable, str(Path(__file__).with_name('profile_diff.py')),
-               '--mode', 'strict', '--w34', str(self.db), '--metadata', str(self.meta),
+               '--mode', 'strict', '--warp34', str(self.db), '--metadata', str(self.meta),
                '--window-start-ns', '10', '--window-end-ns', '40']
         proc = subprocess.run(cmd, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -85,10 +85,10 @@ class Correlated(unittest.TestCase):
             INSERT INTO StringIds VALUES(1,'gemm'),(2,'cudaGraphLaunch');
             CREATE TABLE NVTX_EVENTS(text,textId,start,end,globalTid,endGlobalTid);
             INSERT INTO NVTX_EVENTS VALUES
-            ('w34.decode',NULL,1,50,16777217,NULL),
-            ('w34.bench.measured',NULL,90,210,16777217,NULL),
-            ('w34.decode',NULL,100,200,16777217,NULL),
-            ('w34.proposer',NULL,120,160,16777218,NULL);
+            ('warp34.decode',NULL,1,50,16777217,NULL),
+            ('warp34.bench.measured',NULL,90,210,16777217,NULL),
+            ('warp34.decode',NULL,100,200,16777217,NULL),
+            ('warp34.proposer',NULL,120,160,16777218,NULL);
             CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start,end,globalTid,correlationId,nameId,returnValue);
             INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES
             (130,140,16777218,7,2,0),(20,30,16777217,8,2,0),
@@ -128,10 +128,10 @@ class Correlated(unittest.TestCase):
 
     def test_missing_ambiguous_markers(self):
         with sqlite3.connect(self.db) as c:
-            c.execute("INSERT INTO NVTX_EVENTS SELECT * FROM NVTX_EVENTS WHERE text='w34.decode' AND start=100")
+            c.execute("INSERT INTO NVTX_EVENTS SELECT * FROM NVTX_EVENTS WHERE text='warp34.decode' AND start=100")
         with self.assertRaises(ValueError): self.parse()
         with sqlite3.connect(self.db) as c:
-            c.execute("DELETE FROM NVTX_EVENTS WHERE text='w34.bench.measured'")
+            c.execute("DELETE FROM NVTX_EVENTS WHERE text='warp34.bench.measured'")
         with self.assertRaises(ValueError): self.parse()
 
     def test_metadata(self):
@@ -146,8 +146,8 @@ class OracleCorrelated(Correlated):
     def setUp(self):
         super().setUp()
         with sqlite3.connect(self.db) as c:
-            c.execute("UPDATE NVTX_EVENTS SET text='oracle.decode.round:oracle-measured' WHERE text='w34.decode' AND start=100")
-            c.execute("UPDATE NVTX_EVENTS SET text='oracle.decode.round:oracle-warm' WHERE text='w34.decode'")
+            c.execute("UPDATE NVTX_EVENTS SET text='oracle.decode.round:oracle-measured' WHERE text='warp34.decode' AND start=100")
+            c.execute("UPDATE NVTX_EVENTS SET text='oracle.decode.round:oracle-warm' WHERE text='warp34.decode'")
 
     def parse(self, meta=None):
         from profile_diff import parse_oracle_nvtx_correlated

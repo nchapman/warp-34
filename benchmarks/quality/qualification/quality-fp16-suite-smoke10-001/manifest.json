@@ -4,7 +4,7 @@
       "mode": "mtp3",
       "revision": "1de743eedefdb7422e6b171174c7080204f5b005",
       "command": [
-        "/workspace/warp-34/target/release/w34",
+        "/workspace/warp34/target/release/warp34",
         "serve",
         "--model",
         "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",

@@ -1,6 +1,6 @@
-# warp-34 — Comprehensive Front-to-Back Feature Inventory
+# warp34 — Comprehensive Front-to-Back Feature Inventory
 
-`warp-34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV) targeting **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** (primary targets: RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
+`warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV) targeting **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** (primary targets: RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
 
 This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. **Implementation is not production qualification.** Scope-specific grades, evidence, limitations, and release gates live in [`READINESS.md`](READINESS.md); the launch checklist lives in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).
 
@@ -9,7 +9,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 1. Command-Line Interface (CLI) & Operational Tooling
-*Location: `crates/w34-host/src/cli/`, `crates/w34-host/src/main.rs`*
+*Location: `crates/warp34-host/src/cli/`, `crates/warp34-host/src/main.rs`*
 
 * **CLI Dispatch & Subcommands:**
   * `generate`: Standalone single/multimodal generation supporting plain, MTP, and DFlash2 execution across TP=1/2/4.
@@ -30,7 +30,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 2. Multi-API HTTP Gateway & Serving Architecture
-*Location: `crates/w34-host/src/server/`, `crates/w34-host/src/server/http.rs`*
+*Location: `crates/warp34-host/src/server/`, `crates/warp34-host/src/server/http.rs`*
 
 * **Asynchronous Axum Server Architecture:**
   * Complete decoupling of HTTP parsing, JSON serialization, and vision preprocessing onto an asynchronous CPU worker pool (`preprocessing`), protecting the bounded GPU `EngineWorker` from event-loop stalls.
@@ -44,13 +44,13 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Dedicated input token counting endpoint: `POST /v1/chat/completions/input_tokens` (and unversioned alias `/chat/completions/input_tokens`).
   * Legacy completions fallback: `POST /v1/completions` with parallel token/logprob arrays.
 * **OpenAI Responses API (`POST /v1/responses`):**
-  * Implementation of the Responses routes and behaviors documented in [`GENERATIVE_APIS.md`](GENERATIVE_APIS.md), not a blanket claim of upstream specification completeness (`crates/w34-host/src/responses_api/`).
+  * Implementation of the Responses routes and behaviors documented in [`GENERATIVE_APIS.md`](GENERATIVE_APIS.md), not a blanket claim of upstream specification completeness (`crates/warp34-host/src/responses_api/`).
   * In-memory bounded session store (`ResponseStore`, default capacity 256 responses, 64 per credential scope) partitioned by credential-derived scope and supporting request chaining via `previous_response_id`.
   * Cryptographically unguessable 128-bit response IDs (`resp_<32hex>`) generated via `/dev/urandom`.
   * Stateful lifecycle routes: `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`, and `POST /v1/responses/input_tokens`.
   * Specialized 0-indexed monotonic `sequence_number` SSE event streaming (`response.created`, `response.in_progress`, `response.output_item.added`, `response.output_text.delta`, `response.completed`).
 * **Anthropic Messages API (`POST /v1/messages`):**
-  * Direct ingestion of Anthropic Messages wire format (`crates/w34-host/src/anthropic_api.rs`) translating system blocks, thinking blocks, user images, and `tool_use`/`tool_result` content.
+  * Direct ingestion of Anthropic Messages wire format (`crates/warp34-host/src/anthropic_api.rs`) translating system blocks, thinking blocks, user images, and `tool_use`/`tool_result` content.
   * Transparent Claude Code `cch=` billing-header stripping to maximize `MambaRadixCache` prefix-sharing hits.
   * Supports thinking budgets (`budget_tokens >= 1024`), adaptive thinking, and redacted thinking compatibility.
   * Streaming Anthropic SSE event format (`message_start`, `content_block_start`, `content_block_delta`, `message_delta`, `message_stop`) with typed tool use IDs (`toolu_*`).
@@ -65,7 +65,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 3. Specialized Decision-Model Serving Engine
-*Location: `crates/w34-host/src/decision.rs`, `crates/w34-host/src/clef.rs`*
+*Location: `crates/warp34-host/src/decision.rs`, `crates/warp34-host/src/clef.rs`*
 
 * **TypeSafe Decision Model Endpoints:**
   * Exposes `POST /v1/systemone` (and unversioned `/systemone`) and `POST /v1/decisions` (and `/decisions`) for specialized decision pipelines without modifying generative routes.
@@ -79,7 +79,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 4. API Authentication & Web Dashboard
-*Location: `crates/w34-host/src/api_auth.rs`, `crates/w34-host/src/dashboard.rs`*
+*Location: `crates/warp34-host/src/api_auth.rs`, `crates/warp34-host/src/dashboard.rs`*
 
 * **Digest-Based API Credential Layer:**
   * Opt-in protection for all inference, tokenization, model catalog, and response routes (while leaving health, metrics, and dashboard public).
@@ -94,7 +94,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 5. Native Rust XGrammar Structured Outputs & Constraints
-*Location: `crates/w34-host/src/constraints.rs`, `crates/w34-host/src/request_constraints.rs`*
+*Location: `crates/warp34-host/src/constraints.rs`, `crates/warp34-host/src/request_constraints.rs`*
 
 * **High-Performance Grammar Compilation:**
   * Pinned integration with native `xgrammar-rs 0.2.8` and Hugging Face `tokenizers 0.22`, eliminating custom Python/Triton grammars and runtime fallbacks.
@@ -111,7 +111,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 6. Tool-Calling & Reasoning Parsing Subsystem
-*Location: `crates/w34-host/src/parser/`, `crates/w34-host/src/tool_constraints.rs`, `crates/w34-host/src/chatml.rs`*
+*Location: `crates/warp34-host/src/parser/`, `crates/warp34-host/src/tool_constraints.rs`, `crates/warp34-host/src/chatml.rs`*
 
 * **Qwen3 XML Structural Tool System:**
   * Canonical Qwen XML envelope representation: `<tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>`.
@@ -128,7 +128,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 7. Execution Engine & Continuous Batching Scheduler
-*Location: `crates/w34-host/src/scheduler.rs`, `crates/w34-host/src/engine_worker/`*
+*Location: `crates/warp34-host/src/scheduler.rs`, `crates/warp34-host/src/engine_worker/`*
 
 * **Token-Budget Scheduler (`SchedulerV1`):**
   * Continuous batching with unified multi-request scheduling up to `max_num_batched_tokens` (default: 2,048) and `max_num_seqs` (default: 16).
@@ -143,7 +143,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 8. CUDA Graphs & Memory Arena Architecture
-*Location: `crates/w34-host/src/cuda.rs`, `crates/w34-host/src/model/rank_runtime.rs`*
+*Location: `crates/warp34-host/src/cuda.rs`, `crates/warp34-host/src/model/rank_runtime.rs`*
 
 * **CUDA Graph Engine:**
   * Pre-captures execution graphs across plain decode (`decode_graph`), batched decode (`batched_decode_graphs` for batch sizes 1..16), and speculative verification (`spec_verify_graph` for M_verify 2..16).
@@ -156,7 +156,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 9. Hybrid Radix Prefix Caching (`MambaRadixCache`)
-*Location: `crates/w34-host/src/radix.rs` (Donor: `SGLang v0.5.19` `mamba_radix_cache.py`)*
+*Location: `crates/warp34-host/src/radix.rs` (Donor: `SGLang v0.5.19` `mamba_radix_cache.py`)*
 
 * **SGLang-Donor Hybrid Radix Tree:**
   * Unifies full-attention KV cache pages and GDN recurrent `StateBundle` checkpoints into a single prefix tree.
@@ -168,7 +168,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 10. Decoupled Memory Pools & State Transactions
-*Location: `crates/w34-host/src/cache.rs`*
+*Location: `crates/warp34-host/src/cache.rs`*
 
 * **Typed KV Pool (`KvPool`):**
   * Logical `page_id = token_pos / 16` addressing completely decoupled from per-layer physical byte strides.
@@ -182,7 +182,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 11. Multimodal & Vision Transformer Pipeline
-*Location: `crates/w34-host/src/vision/`, `crates/w34-host/src/scheduled_vision.rs`, `crates/w34-kernels/csrc/ops/op_vision*.cu`*
+*Location: `crates/warp34-host/src/vision/`, `crates/warp34-host/src/scheduled_vision.rs`, `crates/warp34-kernels/csrc/ops/op_vision*.cu`*
 
 * **Qwen3-VL Vision Architecture:**
   * Native implementation of `Qwen3_VisionTransformer` parameterized by model `VisionConfig` (e.g. 24 layers, 1,024 hidden size, 4,096 intermediate size, 16 heads on 4B/8B).
@@ -199,10 +199,10 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 12. Speculative Decoding Subsystem (MTP & DFlash2)
-*Location: `crates/w34-host/src/speculative.rs`, `crates/w34-host/src/mtp/`, `crates/w34-host/src/dflash.rs`*
+*Location: `crates/warp34-host/src/speculative.rs`, `crates/warp34-host/src/mtp/`, `crates/warp34-host/src/dflash.rs`*
 
 * **Native Multi-Token Prediction (`MTP`):**
-  * Clean-room implementation of `Qwen3_5MTP` / `Qwen3_5MoeMTP` (vLLM donor, `crates/w34-host/src/mtp.rs`).
+  * Clean-room implementation of `Qwen3_5MTP` / `Qwen3_5MoeMTP` (vLLM donor, `crates/warp34-host/src/mtp.rs`).
   * Single-layer TP-sharded predictor with projection, gated attention, dense/MoE FFN, and borrowed target LM head.
   * Online LM-head quantization: Quantizes unquantized target LM heads into a private `MarlinW4A16` (group size 64) proposal head on the fly when VRAM headroom permits.
   * Pre-captured proposal CUDA Graphs supporting up to 4 concurrent speculative slots (`MAX_MTP_BATCH_SLOTS = 4`).
@@ -213,13 +213,13 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Low-rank candidate selector kernel (`op_dflash2.cu`, `DFLASH2_MAX_TOP_K = 16`, selector rank up to 1,024).
 * **Speculative Transaction Contract & Rejection Sampling:**
   * Enforces the 4-length transactional invariant across verify rounds: `processed_len` (target consumed), `emitted_len` (caller visible), `reserved_len` (allocated headroom), and `draft_context_len` (proposer cache).
-  * Speculative commit & rollback (`crates/w34-host/src/speculative.rs`): Atomically commits accepted drafts, emits bonus anchor tokens, and rolls back grammar matcher state.
+  * Speculative commit & rollback (`crates/warp34-host/src/speculative.rs`): Atomically commits accepted drafts, emits bonus anchor tokens, and rolls back grammar matcher state.
   * Lossless dynamic speculative handoff (`tests/speculative_handoff.rs`): Dynamically yields speculative resources to incoming batched requests without dropping tokens or breaking state.
 
 ---
 
 ## 13. Model Architecture Support Matrix
-*Location: `crates/w34-host/src/model/`, `crates/w34-kernels/csrc/ops/op_hc.cu`, `op_ple.cu`, `op_qsa.cu`*
+*Location: `crates/warp34-host/src/model/`, `crates/warp34-kernels/csrc/ops/op_hc.cu`, `op_ple.cu`, `op_qsa.cu`*
 
 * **Target Model Family Implementations:**
   * **Qwen 3.5 Dense Models (0.8B, 2B, 4B, 9B, 27B):** Hybrid architecture interleaving 3× Gated DeltaNet (GDN) linear attention layers with 1× Full Attention layer.
@@ -237,7 +237,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 14. Model Loading & Marlin Quantization Engine
-*Location: `crates/w34-host/src/loader/`, `crates/w34-kernels/csrc/marlin/`, `op_marlin.cu`*
+*Location: `crates/warp34-host/src/loader/`, `crates/warp34-kernels/csrc/marlin/`, `op_marlin.cu`*
 
 * **Universal Checkpoint Ingestion:**
   * Direct memory-mapped SafeTensors loading with automated shard resolution from local directories or Hugging Face Hub (`HF_HUB_CACHE`).
@@ -251,7 +251,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 15. Tiered MoE & Asynchronous CPU Offload Subsystem
-*Location: `crates/w34-host/src/moe_offload/`, `crates/w34-host/src/moe_cpu_bridge/`, `crates/w34-kernels/csrc/ops/op_moe*.cu`*
+*Location: `crates/warp34-host/src/moe_offload/`, `crates/warp34-host/src/moe_cpu_bridge/`, `crates/warp34-kernels/csrc/ops/op_moe*.cu`*
 
 * **512-Expert Tiered Offloading Engine:**
   * Designed for memory-constrained execution of 80B models (Qwen3.8-Flash-Next) on 8 GB–24 GB GPUs.
@@ -268,7 +268,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 16. Recurrent Linear Attention Kernels (Gated DeltaNet)
-*Location: `crates/w34-kernels/csrc/ops/op_gdn.cu`, `op_gdn_wy.cu`, `op_gdn_wy_chunk64.cu`*
+*Location: `crates/warp34-kernels/csrc/ops/op_gdn.cu`, `op_gdn_wy.cu`, `op_gdn_wy_chunk64.cu`*
 
 * **Native CUDA C++ GDN Implementation:**
   * Ported and hardened from `vllm.cpp` (`50d425bec`), verified against `vLLM` FLA golden dumps.
@@ -285,7 +285,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 17. Attention & TurboQuant 4-Bit KV Cache Kernels
-*Location: `crates/w34-kernels/csrc/tq/`, `op_kv_cache.cu`, `op_hadamard.cu`, `op_paged_attn.cu`, `op_paged_fa2.cu`*
+*Location: `crates/warp34-kernels/csrc/tq/`, `op_kv_cache.cu`, `op_hadamard.cu`, `op_paged_attn.cu`, `op_paged_fa2.cu`*
 
 * **TurboQuant 4-Bit KV Cache (`TQ4`):**
   * Pinned in-house implementation with **`3.07×` effective KV compression** for the documented 27B layout (21,376 bytes/token). Historical 262k-context runs on a single 24 GB GPU are recorded in [`STATE.md`](STATE.md); capacity and quality depend on the checkpoint, other memory allocations, and workload, and require release-specific qualification.
@@ -301,7 +301,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 18. Fused Layer Norms, RoPE, Activations & Small-N GEMMs
-*Location: `crates/w34-kernels/csrc/ops/op_norms_rope_act.cu`*
+*Location: `crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu`*
 
 * **Fused Operators:**
   * `GemmaRMSNorm`: Vectorized (vec8) RMSNorm with `(1.0 + weight)` unit offset and FP32 variance accumulation.
@@ -315,19 +315,19 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 19. Cross-GPU Collectives & Tensor Parallelism
-*Location: `crates/w34-kernels/csrc/ops/op_collectives.cu`*
+*Location: `crates/warp34-kernels/csrc/ops/op_collectives.cu`*
 
 * **High-Efficiency TP Collectives:**
   * Primary verified implementation: Pinned-sysmem TP=2 (`op_collectives.cu`) over PCIe Gen4 x8 (e.g. 2× RTX 3090 Ti / 3060 Ti / 4060 Ti / 4090).
   * System-scope release/acquire memory fences (`st.release.sys.global` / `ld.acquire.sys.global`) with monotonic epoch parity: small in-kernel transfers use one barrier; the large Copy-Engine DMA path uses two barriers.
   * Dynamic DMA cutoff (`kDmaThresholdBytes = 64 KiB`): Selects in-kernel register writeback for small transfers and asynchronous Copy-Engine DMA for bulk payloads.
   * Strictly typed collective entrypoints: Typed routines for `FP16` hidden states, `BF16` draft tokens, `FP32` reductions, and `INT32` token IDs (never casting integer tokens through float collectives).
-  * Implemented NVLink P2P VRAM staging and TP=4 execution plans (`crates/w34-host/src/cuda/collectives.rs`), with historical 4× RTX 3090 qualification in [`STATE.md`](STATE.md). These require separate hardware/topology requalification for a release.
+  * Implemented NVLink P2P VRAM staging and TP=4 execution plans (`crates/warp34-host/src/cuda/collectives.rs`), with historical 4× RTX 3090 qualification in [`STATE.md`](STATE.md). These require separate hardware/topology requalification for a release.
 
 ---
 
 ## 20. GPU Sampler & Speculative Rejection
-*Location: `crates/w34-kernels/csrc/ops/op_sampler.cu`, `op_rejection.cu`*
+*Location: `crates/warp34-kernels/csrc/ops/op_sampler.cu`, `op_rejection.cu`*
 
 * **9-Step Persistent GPU Sampler:**
   * GPU sampling uses device scratch buffers, reductions, and specialized fast paths; random draws are supplied by host `SamplerV1`. The policy includes:
@@ -347,7 +347,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 21. Real-Time Telemetry & Verification Framework
-*Location: `crates/w34-host/src/telemetry.rs`, `tools/oracle/`*
+*Location: `crates/warp34-host/src/telemetry.rs`, `tools/oracle/`*
 
 * **Thread-Safe Metrics & Prometheus Monitoring:**
   * Non-blocking CPU snapshots tracking request counts (submitted, running, completed, failed, cancelled).
@@ -355,7 +355,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * High-resolution latency histograms: Time-To-First-Token (`ttft`), Queue Wait Time (`queue`), End-to-End Latency (`e2e`), and Inter-Token Latency (`time_per_output_token`).
   * Memory pool utilization: Tracks live capacity, active pages, cached/evictable pages, and free physical pages across KV and GDN pools.
 * **Continuous Parity Oracle Suite (`tools/oracle/`):**
-  * Automated Python/Triton test harnesses running `vLLM 0.31.0` and `SGLang v0.5.19` side-by-side with `warp-34`.
+  * Automated Python/Triton test harnesses running `vLLM 0.31.0` and `SGLang v0.5.19` side-by-side with `warp34`.
   * Provides a 12-prompt canonical multi-turn/reasoning oracle suite. Exact token matches, numerical tensor tolerances, and adjudicated divergences are distinct outcomes; historical results are not a guarantee of universal token equivalence or a fresh release pass.
 
 ---
@@ -367,8 +367,8 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Multi-stage build process decoupling the Node/pnpm React dashboard compilation from the CUDA/Rust binary build.
   * Runtime image based on `ubuntu:26.04` (historical shared-link runtime filesystem size ~775.6 MB; the ~575.4 MB static variant was an experiment, not the current default; see [`CUBLAS_PACKAGING_EXPERIMENT.md`](CUBLAS_PACKAGING_EXPERIMENT.md)) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
-  * Security hardening: Runs under an unprivileged system user (`w34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
+  * Security hardening: Runs under an unprivileged system user (`warp34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**
   * Compiles native SASS cubins for both Ampere (`sm_86`) and Ada Lovelace (`sm_89`) plus compute_86 PTX fallback.
-  * Embedded device code compression enabled (`W34_NVCC_EXTRA=--compress-mode=size`).
-  * Dynamic hardware detection (`w34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 142 SMs on RTX 4090).
+  * Embedded device code compression enabled (`WARP34_NVCC_EXTRA=--compress-mode=size`).
+  * Dynamic hardware detection (`warp34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 142 SMs on RTX 4090).

@@ -6,15 +6,15 @@ The pinned source is `https://github.com/Niko1221/Strata` at
 
 ```sh
 export PATH=/opt/cuda/bin:$PATH
-cmake -S /tmp/w34-benchmark-refs/Strata \
-  -B "$HOME/.cache/w34-benchmark-builds/Strata" \
+cmake -S /tmp/warp34-benchmark-refs/Strata \
+  -B "$HOME/.cache/warp34-benchmark-builds/Strata" \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86 \
   -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON \
   -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_SPLIT=OFF -DSTRATA_BUILD_DSV41=OFF
-cmake --build "$HOME/.cache/w34-benchmark-builds/Strata" --target strata -j 6
-uv venv /tmp/w34-benchmark-refs/Strata/.venv --python 3.12
-uv pip install --python /tmp/w34-benchmark-refs/Strata/.venv/bin/python \
-  -r /tmp/w34-benchmark-refs/Strata/requirements.txt
+cmake --build "$HOME/.cache/warp34-benchmark-builds/Strata" --target strata -j 6
+uv venv /tmp/warp34-benchmark-refs/Strata/.venv --python 3.12
+uv pip install --python /tmp/warp34-benchmark-refs/Strata/.venv/bin/python \
+  -r /tmp/warp34-benchmark-refs/Strata/requirements.txt
 hf download unsloth/Qwen3.8-Flash-Next-GGUF \
   --revision 38bb39ee97821de2c9009abb7e93950eec396e66 --include 'UD-IQ4_XS/*'
 ```
@@ -25,11 +25,11 @@ The packer needs `gguf-py` from a llama.cpp checkout. This campaign used
 not a model/runtime failure.
 
 ```sh
-cd /tmp/w34-benchmark-refs/Strata
+cd /tmp/warp34-benchmark-refs/Strata
 STRATA_GGUF_PY=/home/nchapman/Code/warp3090/vendor/llama.cpp/gguf-py \
   .venv/bin/python tools/iq_pack.py \
   --gguf "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf" \
-  --out "$HOME/.cache/w34-benchmark-models/strata-flash-iq4xs" --compat-bf16
+  --out "$HOME/.cache/warp34-benchmark-models/strata-flash-iq4xs" --compat-bf16
 ```
 
 Retain `conversions.json`, `compat-bf16.json`, `index.txt` and

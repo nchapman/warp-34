@@ -43,14 +43,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -63,14 +63,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4all-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "unverified",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -149,17 +149,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -169,7 +169,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -181,12 +181,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/longctx-coding-agent.md\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/longctx-coding-agent.md\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
             "stderr": ""
           },
           "gpu": {
@@ -1543,14 +1543,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -1563,14 +1563,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4all-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "unverified",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18035/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
               "enabled": true
             },
             {
@@ -1649,17 +1649,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -1669,7 +1669,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -1681,12 +1681,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/longctx-coding-agent.md\n?? benchmarks/perf/campaigns/longctx-coding-agent.results.json\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/longctx-coding-agent.md\n?? benchmarks/perf/campaigns/longctx-coding-agent.results.json\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
             "stderr": ""
           },
           "gpu": {
@@ -3049,11 +3049,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -3069,11 +3069,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -3113,7 +3113,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -3163,17 +3163,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -3183,7 +3183,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -3195,12 +3195,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/OPEN_SWE.md\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
             "stderr": ""
           },
           "gpu": {
@@ -4171,11 +4171,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -4191,11 +4191,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -4235,7 +4235,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -4285,17 +4285,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -4305,7 +4305,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -4317,12 +4317,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n?? benchmarks/perf/tests/test_long_context.py\n",
             "stderr": ""
           },
           "gpu": {
@@ -5357,11 +5357,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -5377,11 +5377,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -5421,7 +5421,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -5471,17 +5471,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -5491,7 +5491,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -5503,12 +5503,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -6543,11 +6543,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -6563,11 +6563,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -6607,7 +6607,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -6657,17 +6657,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -6677,7 +6677,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -6689,12 +6689,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -7729,11 +7729,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -7749,11 +7749,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -7793,7 +7793,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -7852,17 +7852,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -7872,7 +7872,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -7884,12 +7884,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -8832,11 +8832,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -8852,11 +8852,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -8896,7 +8896,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -8955,17 +8955,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -8975,7 +8975,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -8987,12 +8987,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -9935,11 +9935,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -9955,11 +9955,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -9999,7 +9999,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -10058,17 +10058,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -10078,7 +10078,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -10090,12 +10090,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -11518,11 +11518,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -11538,11 +11538,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -11582,7 +11582,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -11641,17 +11641,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "3b447665f52a4d31c3e7ec8a4bc0573f57660656812806c463a320a8a24bd887",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "d97616f7123cb88b36871b5ff20f110e5f4f3fc5a0cd1c7926ad8bfd4c388b06",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "1d634f7de2d17928522cb3e7a1adacea97d4758524716859c774eff42817ef94",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -11661,7 +11661,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -11673,12 +11673,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/w34perf/config.py\n M benchmarks/perf/w34perf/metrics.py\n M benchmarks/perf/w34perf/report.py\n M benchmarks/perf/w34perf/workloads.py\n M crates/w34-host/examples/needle_gate.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
+            "stdout": " M benchmarks/perf/tests/test_perf.py\n M benchmarks/perf/warp34perf/config.py\n M benchmarks/perf/warp34perf/metrics.py\n M benchmarks/perf/warp34perf/report.py\n M benchmarks/perf/warp34perf/workloads.py\n M crates/warp34-host/examples/needle_gate.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/src/ffi.rs\n?? benchmarks/perf/campaigns/27b-tp1-262k-coding-agent.toml\n?? benchmarks/perf/campaigns/27b-tp2-longctx-coding-agent.toml\n?? benchmarks/perf/campaigns/9b-longctx-coding-agent.toml\n?? benchmarks/perf/fixtures/open_swe_agent_120k.json\n?? benchmarks/perf/fixtures/open_swe_agent_252k.json\n?? benchmarks/perf/fixtures/open_swe_agent_64k.json\n?? benchmarks/perf/fixtures/open_swe_cold_read_60k.json\n",
             "stderr": ""
           },
           "gpu": {
@@ -13101,11 +13101,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -13121,11 +13121,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -13165,7 +13165,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -13627,17 +13627,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -13647,7 +13647,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -13659,12 +13659,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/w34-host/src/cache.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/engine_worker.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-host/tests/paged_fa2.rs\n M crates/w34-host/tests/phase0_1_2_gates.rs\n M crates/w34-host/tests/phase6_gpu_sampler.rs\n M crates/w34-host/tests/phase6_speculative_handoff.rs\n M crates/w34-kernels/csrc/ops/op_gdn.cu\n M crates/w34-kernels/csrc/ops/op_marlin.cu\n M crates/w34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/w34-kernels/csrc/ops/op_sampler.cu\n M crates/w34-kernels/csrc/w34_cuda.h\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/w34-host/src/model_scratch.rs\n?? crates/w34-host/tests/model_scratch_layout.rs\n",
+            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/warp34-host/src/cache.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/engine_worker.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-host/tests/paged_fa2.rs\n M crates/warp34-host/tests/phase0_1_2_gates.rs\n M crates/warp34-host/tests/phase6_gpu_sampler.rs\n M crates/warp34-host/tests/phase6_speculative_handoff.rs\n M crates/warp34-kernels/csrc/ops/op_gdn.cu\n M crates/warp34-kernels/csrc/ops/op_marlin.cu\n M crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/warp34-kernels/csrc/ops/op_sampler.cu\n M crates/warp34-kernels/csrc/warp34_cuda.h\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/warp34-host/src/model_scratch.rs\n?? crates/warp34-host/tests/model_scratch_layout.rs\n",
             "stderr": ""
           },
           "gpu": {
@@ -15003,11 +15003,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -15023,11 +15023,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-9b-tp1-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -15067,7 +15067,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -15529,17 +15529,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -15549,7 +15549,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -15561,12 +15561,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/w34-host/src/cache.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/engine_worker.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-host/tests/paged_fa2.rs\n M crates/w34-host/tests/phase0_1_2_gates.rs\n M crates/w34-host/tests/phase6_gpu_sampler.rs\n M crates/w34-host/tests/phase6_speculative_handoff.rs\n M crates/w34-kernels/csrc/ops/op_gdn.cu\n M crates/w34-kernels/csrc/ops/op_marlin.cu\n M crates/w34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/w34-kernels/csrc/ops/op_sampler.cu\n M crates/w34-kernels/csrc/w34_cuda.h\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/w34-host/src/model_scratch.rs\n?? crates/w34-host/tests/model_scratch_layout.rs\n",
+            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/warp34-host/src/cache.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/engine_worker.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-host/tests/paged_fa2.rs\n M crates/warp34-host/tests/phase0_1_2_gates.rs\n M crates/warp34-host/tests/phase6_gpu_sampler.rs\n M crates/warp34-host/tests/phase6_speculative_handoff.rs\n M crates/warp34-kernels/csrc/ops/op_gdn.cu\n M crates/warp34-kernels/csrc/ops/op_marlin.cu\n M crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/warp34-kernels/csrc/ops/op_sampler.cu\n M crates/warp34-kernels/csrc/warp34_cuda.h\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/warp34-host/src/model_scratch.rs\n?? crates/warp34-host/tests/model_scratch_layout.rs\n",
             "stderr": ""
           },
           "gpu": {
@@ -16905,11 +16905,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -16925,11 +16925,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -16969,7 +16969,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -17298,17 +17298,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -17318,7 +17318,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -17330,12 +17330,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/w34-host/src/cache.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/engine_worker.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-host/tests/paged_fa2.rs\n M crates/w34-host/tests/phase0_1_2_gates.rs\n M crates/w34-host/tests/phase6_gpu_sampler.rs\n M crates/w34-host/tests/phase6_speculative_handoff.rs\n M crates/w34-kernels/csrc/ops/op_gdn.cu\n M crates/w34-kernels/csrc/ops/op_marlin.cu\n M crates/w34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/w34-kernels/csrc/ops/op_sampler.cu\n M crates/w34-kernels/csrc/w34_cuda.h\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/w34-host/src/model_scratch.rs\n?? crates/w34-host/tests/model_scratch_layout.rs\n",
+            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/warp34-host/src/cache.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/engine_worker.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-host/tests/paged_fa2.rs\n M crates/warp34-host/tests/phase0_1_2_gates.rs\n M crates/warp34-host/tests/phase6_gpu_sampler.rs\n M crates/warp34-host/tests/phase6_speculative_handoff.rs\n M crates/warp34-kernels/csrc/ops/op_gdn.cu\n M crates/warp34-kernels/csrc/ops/op_marlin.cu\n M crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/warp34-kernels/csrc/ops/op_sampler.cu\n M crates/warp34-kernels/csrc/warp34_cuda.h\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/warp34-host/src/model_scratch.rs\n?? crates/warp34-host/tests/model_scratch_layout.rs\n",
             "stderr": ""
           },
           "gpu": {
@@ -18286,11 +18286,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-tq4",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -18306,11 +18306,11 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp2-fp16",
-              "engine": "warp-34",
+              "engine": "warp34",
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -18350,7 +18350,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name warp34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -18679,17 +18679,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -18699,7 +18699,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -18711,12 +18711,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/w34-host/src/cache.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/engine_worker.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-host/tests/paged_fa2.rs\n M crates/w34-host/tests/phase0_1_2_gates.rs\n M crates/w34-host/tests/phase6_gpu_sampler.rs\n M crates/w34-host/tests/phase6_speculative_handoff.rs\n M crates/w34-kernels/csrc/ops/op_gdn.cu\n M crates/w34-kernels/csrc/ops/op_marlin.cu\n M crates/w34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/w34-kernels/csrc/ops/op_sampler.cu\n M crates/w34-kernels/csrc/w34_cuda.h\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/w34-host/src/model_scratch.rs\n?? crates/w34-host/tests/model_scratch_layout.rs\n",
+            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/warp34-host/src/cache.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/engine_worker.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-host/tests/paged_fa2.rs\n M crates/warp34-host/tests/phase0_1_2_gates.rs\n M crates/warp34-host/tests/phase6_gpu_sampler.rs\n M crates/warp34-host/tests/phase6_speculative_handoff.rs\n M crates/warp34-kernels/csrc/ops/op_gdn.cu\n M crates/warp34-kernels/csrc/ops/op_marlin.cu\n M crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/warp34-kernels/csrc/ops/op_sampler.cu\n M crates/warp34-kernels/csrc/warp34_cuda.h\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/warp34-host/src/model_scratch.rs\n?? crates/warp34-host/tests/model_scratch_layout.rs\n",
             "stderr": ""
           },
           "gpu": {
@@ -19661,14 +19661,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -19681,14 +19681,14 @@
               "conv_state_dtype": "float16",
               "speculation": "none",
               "id": "warp34-27b-tp1-tq4all-262k",
-              "engine": "warp-34",
+              "engine": "warp34",
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18035/v1",
               "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
               "enabled": true
             },
             {
@@ -20160,17 +20160,17 @@
           "suite_version": "0.1.0",
           "suite_source_sha256": "5ee0e57e450b87db40389a2c5cbcf909f3f5163804bccdfd5e3a7e9516df6514",
           "source_files": {
-            "w34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
-            "w34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
-            "w34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
-            "w34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
-            "w34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
-            "w34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
-            "w34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
-            "w34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
-            "w34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
-            "w34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
-            "w34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
+            "warp34perf/__init__.py": "2f081870fdf59ccce368f5036aa1affea01ffcb57ae4a125bd6665240ebb285b",
+            "warp34perf/__main__.py": "489d0bf9920ad7d672496335e7a94f7b32797cb58a44e188aa82940568a77b22",
+            "warp34perf/artifacts.py": "4d581f84a8e9731d7eae29ed3de63350e1a07203c1871dbb55b20f1cbef303b5",
+            "warp34perf/config.py": "81c08d487d95d32b51cd92f77501b580f40c1fdb4590b7a221ad1bbf7ffafbd3",
+            "warp34perf/metrics.py": "c2ec3045e32920a1d263d3956b42a15aee6ae42c446f3284d6228a8542bba61b",
+            "warp34perf/preflight.py": "b9ce76b5752fce0a649daa4565cb57dd98c98bf574c738c17fc405ea354efa16",
+            "warp34perf/report.py": "20fd961ae9c6c4df6e0ed77a6669c1e36d02d2140817fbfe514f31b4171af390",
+            "warp34perf/runner.py": "3b4078d1e51bfa84135e82b4d06b4155976e23f19c411eb9978d27b179078619",
+            "warp34perf/selection.py": "23a8343664d9163857aad37c2bfb834cb052392a9aefa6ce64cbbfb13ba32b1b",
+            "warp34perf/transport.py": "c3008d63d77883c191805f24762fe8daebfadde1054453433997528659201753",
+            "warp34perf/workloads.py": "67fc3b97561c1068aea1bcab154f1064747f3e73bbd86e25c6a4ba60947fee95"
           },
           "python": "3.12.12 (main, Feb 12 2026, 00:42:33) [Clang 21.1.4 ]",
           "platform": "Linux-7.2.8-2-cachyos-x86_64-with-glibc2.44",
@@ -20180,7 +20180,7 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "rev-parse",
               "HEAD"
             ],
@@ -20192,12 +20192,12 @@
             "argv": [
               "git",
               "-C",
-              "/home/nchapman/Code/warp-34/benchmarks/perf",
+              "/home/nchapman/Code/warp34/benchmarks/perf",
               "status",
               "--porcelain"
             ],
             "returncode": 0,
-            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/w34-host/src/cache.rs\n M crates/w34-host/src/cuda.rs\n M crates/w34-host/src/engine_worker.rs\n M crates/w34-host/src/model.rs\n M crates/w34-host/src/scheduler.rs\n M crates/w34-host/tests/paged_fa2.rs\n M crates/w34-host/tests/phase0_1_2_gates.rs\n M crates/w34-host/tests/phase6_gpu_sampler.rs\n M crates/w34-host/tests/phase6_speculative_handoff.rs\n M crates/w34-kernels/csrc/ops/op_gdn.cu\n M crates/w34-kernels/csrc/ops/op_marlin.cu\n M crates/w34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/w34-kernels/csrc/ops/op_paged_attn.cu\n M crates/w34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/w34-kernels/csrc/ops/op_sampler.cu\n M crates/w34-kernels/csrc/w34_cuda.h\n M crates/w34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/w34-host/src/model_scratch.rs\n?? crates/w34-host/tests/model_scratch_layout.rs\n",
+            "stdout": " M benchmarks/perf/campaigns/longctx-coding-agent.md\n M crates/warp34-host/src/cache.rs\n M crates/warp34-host/src/cuda.rs\n M crates/warp34-host/src/engine_worker.rs\n M crates/warp34-host/src/model.rs\n M crates/warp34-host/src/scheduler.rs\n M crates/warp34-host/tests/paged_fa2.rs\n M crates/warp34-host/tests/phase0_1_2_gates.rs\n M crates/warp34-host/tests/phase6_gpu_sampler.rs\n M crates/warp34-host/tests/phase6_speculative_handoff.rs\n M crates/warp34-kernels/csrc/ops/op_gdn.cu\n M crates/warp34-kernels/csrc/ops/op_marlin.cu\n M crates/warp34-kernels/csrc/ops/op_norms_rope_act.cu\n M crates/warp34-kernels/csrc/ops/op_paged_attn.cu\n M crates/warp34-kernels/csrc/ops/op_paged_fa2.cu\n M crates/warp34-kernels/csrc/ops/op_sampler.cu\n M crates/warp34-kernels/csrc/warp34_cuda.h\n M crates/warp34-kernels/src/ffi.rs\n M docs/STATE.md\n?? crates/warp34-host/src/model_scratch.rs\n?? crates/warp34-host/tests/model_scratch_layout.rs\n",
             "stderr": ""
           },
           "gpu": {
@@ -21819,7 +21819,7 @@
         "bundle": "goal-9b-fp16",
         "command": [
           "python3",
-          "/tmp/w34-round2-http.py",
+          "/tmp/warp34-round2-http.py",
           "campaigns/9b-longctx-coding-agent.toml",
           "warp34-9b-tp1-fp16",
           "results/goal-9b-fp16"
@@ -21837,7 +21837,7 @@
         "bundle": "goal-27b-tp2-fp16",
         "command": [
           "python3",
-          "/tmp/w34-round2-http.py",
+          "/tmp/warp34-round2-http.py",
           "campaigns/27b-tp2-longctx-coding-agent.toml",
           "warp34-27b-tp2-fp16",
           "results/goal-27b-tp2-fp16"
@@ -21855,7 +21855,7 @@
         "bundle": "goal-9b-tq4",
         "command": [
           "python3",
-          "/tmp/w34-round2-http.py",
+          "/tmp/warp34-round2-http.py",
           "campaigns/9b-longctx-coding-agent.toml",
           "warp34-9b-tp1-tq4",
           "results/goal-9b-tq4"
@@ -21873,7 +21873,7 @@
         "bundle": "goal-27b-tp2-tq4",
         "command": [
           "python3",
-          "/tmp/w34-round2-http.py",
+          "/tmp/warp34-round2-http.py",
           "campaigns/27b-tp2-longctx-coding-agent.toml",
           "warp34-27b-tp2-tq4",
           "results/goal-27b-tp2-tq4"
@@ -21891,7 +21891,7 @@
         "bundle": "goal-27b-tp1-262k",
         "command": [
           "python3",
-          "/tmp/w34-round2-http.py",
+          "/tmp/warp34-round2-http.py",
           "campaigns/27b-tp1-262k-coding-agent.toml",
           "warp34-27b-tp1-tq4-262k",
           "results/goal-27b-tp1-262k"
@@ -21908,12 +21908,12 @@
         "crates_tree_sha256": "e1b67ef230877a0facb487401ab037c3ba15660c5e969444b782bfadfc6350e0",
         "bundle": "goal-needle",
         "command": [
-          "/home/nchapman/Code/warp-34/target/release/examples/needle_gate",
+          "/home/nchapman/Code/warp34/target/release/examples/needle_gate",
           "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "tq4",
           "262144",
           "50",
-          "/home/nchapman/Code/warp-34/benchmarks/perf/results/goal-needle/27b_tp1_tq4_262144_d50.json"
+          "/home/nchapman/Code/warp34/benchmarks/perf/results/goal-needle/27b_tp1_tq4_262144_d50.json"
         ],
         "started_utc": "2026-11-01T06:03:18.927957+00:00",
         "completed_utc": "2026-11-01T06:13:13.590551+00:00",

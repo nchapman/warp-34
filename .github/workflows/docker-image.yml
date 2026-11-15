@@ -47,7 +47,7 @@ jobs:
           cargo test --lib
           cargo test --doc
           python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v
-          cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m w34perf validate suite.toml
+          cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m warp34perf validate suite.toml
 
   image:
     needs: checks

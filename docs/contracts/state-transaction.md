@@ -32,9 +32,9 @@ Because each 27B `StateBundle` is `~73.4 MiB/rank`, all state slots (active requ
    - Must be an integer multiple of both `B = 16` and `BT = 64`, and satisfy `C >= max_spec_verify_rows` (`64 >= 16`).
    - Guarantees at most **one** radix checkpoint boundary can be crossed within a single speculative verify step (`block_rows <= 16`).
 
-## 4. Explicit Input / Output / Spec / Checkpoint Indexing (`w34_gdn_batch`)
+## 4. Explicit Input / Output / Spec / Checkpoint Indexing (`warp34_gdn_batch`)
 
-GDN kernels NEVER assume `state_out == state_in`. Every prefill, decode, and speculative verify launch accepts an explicit `w34_gdn_batch` descriptor:
+GDN kernels NEVER assume `state_out == state_in`. Every prefill, decode, and speculative verify launch accepts an explicit `warp34_gdn_batch` descriptor:
 
 ```c
 typedef struct {
@@ -50,7 +50,7 @@ typedef struct {
     int32_t total_tokens;                      // Active tokens N <= N_max
     int32_t max_verify_tokens;                 // Stride of spec_state_indices (e.g. 8 or 16; 0 if unused)
     int32_t max_checkpoints_per_req;           // Stride of checkpoint_* arrays (0 if unused)
-} w34_gdn_batch;
+} warp34_gdn_batch;
 ```
 
 ### Transactional Semantics Across Modes

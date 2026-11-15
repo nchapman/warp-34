@@ -80,11 +80,11 @@ runpy.run_path({str(Path(vl.__file__).resolve())!r}, run_name='host_test')
 
     def test_empty_hook_fails(self):
         with self.assertRaises(RuntimeError):
-            vl.capture_status(NS(rank=0, _w34_vl_capture={"count": 0}))
+            vl.capture_status(NS(rank=0, _warp34_vl_capture={"count": 0}))
         with self.assertRaises(RuntimeError):
-            vl.capture_status(NS(rank=0, _w34_vl_capture={"count": 1, "text_count": 0}))
+            vl.capture_status(NS(rank=0, _warp34_vl_capture={"count": 1, "text_count": 0}))
         state = {"count": 1, "text_count": 1}
-        self.assertIs(vl.capture_status(NS(_w34_vl_capture=state)), state)
+        self.assertIs(vl.capture_status(NS(_warp34_vl_capture=state)), state)
 
     def test_processor_bounds(self):
         self.assertEqual(vl.PROCESSOR, dict(min_pixels=1024, max_pixels=1048576,

@@ -35,7 +35,7 @@ def install_worker(cls):
     @wraps(original_ingest)
     def ingest(self, *args, **kwargs):
         import torch
-        with torch.cuda.nvtx.range('w34.proposer'):
+        with torch.cuda.nvtx.range('warp34.proposer'):
             return original_ingest(self, *args, **kwargs)
     cls._append_target_hidden_to_draft_kv_by_loc = ingest
     original = cls.forward_batch_generation
@@ -103,7 +103,7 @@ def inject(root):
                     raise ValueError('ambiguous draft scope')
                 a, b = text.index(begin), text.index(end)
                 block = text[a:b]
-                text = (text[:a] + "        with torch.cuda.nvtx.range('w34.proposer'):\n"
+                text = (text[:a] + "        with torch.cuda.nvtx.range('warp34.proposer'):\n"
                         + ''.join('    ' + line if line.strip() else line
                                   for line in block.splitlines(keepends=True)) + text[b:])
             if line not in text:

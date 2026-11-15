@@ -7,8 +7,8 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks/perf'))
-from w34perf.resources import summarize_resources
-from w34perf.evidence import quality_status
+from warp34perf.resources import summarize_resources
+from warp34perf.evidence import quality_status
 
 
 def sha(path):

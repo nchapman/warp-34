@@ -10,7 +10,7 @@ Produce regularly refreshable, shareable comparisons against **vLLM, SGLang,
 llama.cpp, and Don-Chad/ninfer-3090**, independent of development oracles.
 Primary hardware: one and two RTX 3090 **Ti** 24 GB cards; no NVLink/P2P.
 **4-bit weights are the common ground**, with best practical equivalents for
-GGUF/`.ninfer`; active warp-34 HGPTQ versus cyankiwi official-base AWQ
+GGUF/`.ninfer`; active warp34 HGPTQ versus cyankiwi official-base AWQ
 on vLLM/SGLang is a practical comparison, not identical weights. KV precision is a separate
 axis. No oracle dependencies, tensor parity, donor patches, or `nsys` requirements.
 
@@ -40,7 +40,7 @@ Retain all failed, unsupported, and untested cells rather than dropping them.
 | Axis | Campaign targets |
 |---|---|
 | Source models | Mutually supported 27B dense first; then 4B, 9B, 35B-A3B MoE where supported |
-| Weights | warp-34 HGPTQ; vLLM/SGLang cyankiwi official-base AWQ INT4 g32 asymmetric; independently qualified GGUF Q4 / ninfer variants |
+| Weights | warp34 HGPTQ; vLLM/SGLang cyankiwi official-base AWQ INT4 g32 asymmetric; independently qualified GGUF Q4 / ninfer variants |
 | GPUs | 1 card; 2 cards using documented TP/layer/pipeline strategy; separate 2× single-card replicas later |
 | KV | Native 16-bit baseline (label FP16/BF16); qualified 8-bit, 4-bit, mixed policies; no FP8 support assumptions on sm_86 |
 | Speculation | Off; native MTP; DFlash2 where supported, with pinned proposer and block settings |
@@ -108,7 +108,7 @@ HTTP tests; configured one/two-card profiles; clear failure/partial-run behavior
       network/GPU probes. No precision/parallelism fallback.
 - [x] Manually retain observed pre-HTTP launch failures and probe outcomes in
       `qualification/27b-one-card.json`, including explicit BF16 vs FP16 variants.
-- [x] Run the first fresh newer-27B FP16 comparison across warp-34, vLLM and
+- [x] Run the first fresh newer-27B FP16 comparison across warp34, vLLM and
       SGLang: three repetitions, 96 measured requests per engine, checked-in
       [numbers and evidence hashes](campaigns/27b-fp16-first.md).
 - [ ] Automatically record managed launch failures/OOM/quality failures; the HTTP
@@ -176,14 +176,14 @@ run manifests.
   passes for **10 profiles / 13 cases**.
 - Real **TP=1 / FP16 KV** smoke passes short, concurrent, primed prefix,
   Poisson-arrival and coding-agent replay requests:
-  `/tmp/w34-perf-tp1-smoke-fixed/` (one repetition, two sessions/case,
+  `/tmp/warp34-perf-tp1-smoke-fixed/` (one repetition, two sessions/case,
   32-token ceilings, reduced context). All **16 measured requests** succeed
   with valid usage, including eight turns across two agent sessions.
 - Real **TP=2 / TQ4 KV** smoke passes short, reduced mixed-traffic, and coding-agent
-  replay cases: `/tmp/w34-perf-tp2-smoke/`, all **12 measured requests** succeed
+  replay cases: `/tmp/warp34-perf-tp2-smoke/`, all **12 measured requests** succeed
   with valid usage. Both temporary servers were stopped after validation.
 - The initial TP1 replay attempted new tool calls despite prose instructions
-  (`/tmp/w34-perf-tp1-smoke/`). A regression test reproduced missing
+  (`/tmp/warp34-perf-tp1-smoke/`). A regression test reproduced missing
   `tool_choice=none`; the explicit control fixed the replay. The original failed
   run is retained and not treated as a pass.
 - Initial review found three important issues: unvalidated RNG seed, malformed
@@ -194,7 +194,7 @@ run manifests.
   reporting, invalid URL ports, and warmup/priming failure exit classification.
 - Final `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **212.22 s**:
   **208 Rust tests/doc-tests + 69 oracle tests + 22 independent suite tests**,
-  formatting and both Clippy feature states. Log: `/tmp/w34-perf-final-check.log`.
+  formatting and both Clippy feature states. Log: `/tmp/warp34-perf-final-check.log`.
   `git diff --check` passes.
 
 Review suggestions intentionally deferred: additional malformed **operator-owned**
@@ -231,10 +231,10 @@ explicitly documented as HTTP responsiveness in the repository README.
   **not an optimized speed comparison**. Eager startup loaded 16.81 GiB model
   memory per vLLM log (not a sampled peak). Reduced `batch-8` case used C2, not C8.
   Server stopped and GPU processes cleared before final project checks.
-  Evidence: `/tmp/w34-perf-vllm27-eager-smoke/`,
-  `/tmp/w34-perf-vllm27-{startup.log,models.json}`,
-  `/tmp/w34-perf-vllm-serve-help-all.txt`,
-  `/tmp/w34-perf-27b-gptq-inventory.json`.
+  Evidence: `/tmp/warp34-perf-vllm27-eager-smoke/`,
+  `/tmp/warp34-perf-vllm27-{startup.log,models.json}`,
+  `/tmp/warp34-perf-vllm-serve-help-all.txt`,
+  `/tmp/warp34-perf-27b-gptq-inventory.json`.
 - New regression coverage includes all-skipped no-network behavior, omitted
   endpoint fields, credential rejection even in disabled metadata, filter/CLI
   parity, failure/not-run distinctions, inventory drift/relocation/symlink names,
@@ -251,9 +251,9 @@ explicitly documented as HTTP responsiveness in the repository README.
 - Final post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.38 s**:
   **208 Rust tests/doc-tests + 69 oracle tests + 36 standalone performance tests**,
   formatting and both Clippy feature states. Log:
-  `/tmp/w34-perf-selection-final-check.log`. Candidate JSON fields and suite local
+  `/tmp/warp34-perf-selection-final-check.log`. Candidate JSON fields and suite local
   doc links validated; `git diff --check` passes. Real CLI single-card planning
-  selects five profiles, and `/tmp/w34-perf-disabled-dual-smoke/` retains a skipped
+  selects five profiles, and `/tmp/warp34-perf-disabled-dual-smoke/` retains a skipped
   ninfer two-card run with an empty journal and rendered coverage report.
 
 ## Repeated one-card 27B qualification follow-up
@@ -269,7 +269,7 @@ explicitly documented as HTTP responsiveness in the repository README.
   Marlin; 0df text-only flag unsupported for Qwen3.5; 0df FP16 GDN convolution
   BF16/FP16 Triton branch mismatch. Worker failure can yield Docker exit 0;
   never infer serving readiness from that code alone. No engine patches.
-- Explicit **BF16 SGLang**, graph-enabled **FP16 vLLM 0.31.0**, and **FP16 warp-34**
+- Explicit **BF16 SGLang**, graph-enabled **FP16 vLLM 0.31.0**, and **FP16 warp34**
   each pass preflight and **42/42 measured requests / nine trials**: three
   repetitions of short C1, offered C8 and four-turn C1 agent replay. Preset and
   machine-readable outcomes/hashes are in `qualification/27b-one-card.{toml,json}`.
@@ -277,7 +277,7 @@ explicitly documented as HTTP responsiveness in the repository README.
   correction pins the disabled c11 placeholder separately from 0df defaults.
 - SGLang is active-limit 2, BF16 KV and loads vision; vLLM requests active 8,
   text-only, FP16 KV and confirmed torch.compile + piecewise/full graph captures.
-  Warp-34 uses its built-in renderer, not artifact Jinja. These remain **different
+  Warp34 uses its built-in renderer, not artifact Jinja. These remain **different
   operational deployments**, not token/dtype/admission/memory-aligned rankings.
 - All temporary servers stopped; no downloads, engine patches, quality pass,
   autonomous-agent success, long-context, saturation or two-card claim.
@@ -295,7 +295,7 @@ explicitly documented as HTTP responsiveness in the repository README.
 - Final post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **214.83 s**:
   **208 Rust tests/doc-tests + 69 oracle tests + 47 standalone suite tests**,
   formatting and both Clippy feature states. Log:
-  `/tmp/w34-perf-one-card-final-check.log`. Final `mise run perf-check` also passes
+  `/tmp/warp34-perf-one-card-final-check.log`. Final `mise run perf-check` also passes
   after metadata corrections. Validated the five-profile/three-case preset, all
   JSON and doc links, every ledger/run-bundle checksum and executed config hash;
   rendered Markdown/CSV for all three runs. `git diff --check` passes and GPUs
@@ -305,7 +305,7 @@ explicitly documented as HTTP responsiveness in the repository README.
 
 Superseded for active runs: `qualification/27b-one-card.toml` now pins cyankiwi
 AWQ `e3a700906e6a73ba4290b1873dc2ba8198527ab5` for vLLM/SGLang and our
-HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for warp-34. Generate new
+HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for warp34. Generate new
 inventories/template hashes; old GPTQ receipts below are historical only and
 provide no AWQ qualification. No identical-weight claim applies.
 
@@ -324,11 +324,11 @@ provide no AWQ qualification. No identical-weight claim applies.
   no differences. Candidate JSON/current documentation now mark c11 retired.
   Cached refs are local state, not a claim about upstream `main`; pin explicit
   0df revisions/paths for reproducible downloads and runs.
-- Deletion receipt: `/tmp/w34-perf-old-snapshot-removal.json`; re-verification:
-  `/tmp/w34-perf-new-snapshot-after-retirement.json`. Full post-retirement
+- Deletion receipt: `/tmp/warp34-perf-old-snapshot-removal.json`; re-verification:
+  `/tmp/warp34-perf-new-snapshot-after-retirement.json`. Full post-retirement
   `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **216.60 s**, including
   **208 Rust tests/doc-tests + 69 oracle tests + 47 performance tests**, fmt and
-  both Clippy feature states (`/tmp/w34-old-quant-retirement-check.log`). Preset,
+  both Clippy feature states (`/tmp/warp34-old-quant-retirement-check.log`). Preset,
   JSON/doc links and `git diff --check` pass. No engine/test behavior changed.
 
 ## SGLang explicit FP16 convolution history
@@ -368,7 +368,7 @@ provide no AWQ qualification. No identical-weight claim applies.
   controlled speedup study or task-quality ranking.
 - Full post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.98 s**:
   **208 Rust tests/doc-tests + 69 oracle tests + 47 performance tests**, fmt and
-  both Clippy feature states. Log `/tmp/w34-sglang-conv16-pinned-final-check.log`.
+  both Clippy feature states. Log `/tmp/warp34-sglang-conv16-pinned-final-check.log`.
   Evidence checksums/counts, pinned launch/inventory-root binding, JSON/doc links
   and `git diff --check` pass. One Important review finding (mutable local ref)
   fixed with failing-first regression; no further implementation changes.

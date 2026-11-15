@@ -15,9 +15,9 @@ def audit(path: Path, max_rows: int = 16) -> dict:
     with sqlite3.connect(path) as conn:
         scopes = conn.execute('''SELECT n.start,n.end,n.globalTid,n.endGlobalTid
             FROM NVTX_EVENTS n LEFT JOIN StringIds s ON s.id=n.textId
-            WHERE COALESCE(n.text,s.value)='w34.sampler' ''').fetchall()
+            WHERE COALESCE(n.text,s.value)='warp34.sampler' ''').fetchall()
         if not scopes:
-            raise ValueError('No w34.sampler ranges: trace is not evidence')
+            raise ValueError('No warp34.sampler ranges: trace is not evidence')
         sizes = Counter()
         for start, end, tid, end_tid in scopes:
             if (start is None or end is None or tid is None or end <= start
@@ -39,7 +39,7 @@ def audit(path: Path, max_rows: int = 16) -> dict:
                     or size > max_rows * RECORD_BYTES or size % RECORD_BYTES):
                 raise ValueError(f'Invalid compact sampler output: bytes={size}, status={status}')
             sizes[size] += 1
-    return {'source': str(path), 'scope': 'w34.sampler', 'passed': True,
+    return {'source': str(path), 'scope': 'warp34.sampler', 'passed': True,
             'scope_count': len(scopes), 'record_bytes': RECORD_BYTES,
             'max_rows': max_rows, 'dtoh_sizes': dict(sorted(sizes.items())),
             'dtoh_total_bytes': sum(size * count for size, count in sizes.items()),

@@ -11,7 +11,7 @@ Its tensors and provenance were not changed to resolve numerical differences.
 ## Verified full-model and operator results
 
 - `dflash_proposer actual_sglang_full_model_hidden_parity` checks original input
-  tokens, anchor, and bitwise target BF16 taps (`w34_tap_add_f16_to_bf16`), then
+  tokens, anchor, and bitwise target BF16 taps (`warp34_tap_add_f16_to_bf16`), then
   compares final hidden states against the `< 0.005` relative-L2 gate (`relL2=0,
   maxabs=0` measured on this 4B capture).
 - `dflash_bf16_attention` measured bit-exact outputs for each of five layers
@@ -23,8 +23,8 @@ Its tensors and provenance were not changed to resolve numerical differences.
 Mechanisms verified:
 
 1. Production RoPE uses an FP32 cos/sin cache even with BF16 activations.
-   `w34_dflash_qk_norm_rope_bf16_f32_table` and
-   `w34_dflash_qk_norm_rope_bf16_f32_table_qout` are declared in the shared CUDA
+   `warp34_dflash_qk_norm_rope_bf16_f32_table` and
+   `warp34_dflash_qk_norm_rope_bf16_f32_table_qout` are declared in the shared CUDA
    header and Rust FFI and registered in execution-plan warmup. The BF16-table
    variant remains available for its separate component contract.
 2. FA2 head-dimension-256 attention uses 16-key tiles, BF16-rounded softmax

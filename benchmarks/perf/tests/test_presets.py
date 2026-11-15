@@ -1,5 +1,5 @@
 import unittest
-from w34perf.presets import apply_preset
+from warp34perf.presets import apply_preset
 
 
 class PresetTests(unittest.TestCase):
@@ -18,7 +18,7 @@ class PresetTests(unittest.TestCase):
     def test_config_load_rejects_invalid_preset(self):
         from pathlib import Path
         import tempfile
-        from w34perf.config import load
+        from warp34perf.config import load
         suite = Path(__file__).resolve().parents[1] / 'suite.toml'
         # Keep fixture resolution relative to the original suite directory.
         text = suite.read_text().replace('fixture = "fixtures/',

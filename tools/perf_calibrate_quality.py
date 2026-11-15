@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks/perf'))
-from w34perf.quality import _checks
+from warp34perf.quality import _checks
 
 
 def main():

@@ -1,6 +1,6 @@
 import unittest
 
-from w34perf.metrics import cached_tokens, summarize
+from warp34perf.metrics import cached_tokens, summarize
 from test_perf import result
 
 

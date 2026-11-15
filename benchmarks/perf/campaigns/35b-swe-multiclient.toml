@@ -43,27 +43,27 @@ request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-35b-tp1"
-engine = "warp-34"
+engine = "warp34"
 version = "656c3ca"
 weight_format = "HGPTQ-int4"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 (3.07x) 8192 KV pages (131072 tokens, 8 MTP batch slots), MambaRadixCache, 8 active seqs, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "warp34-35b-tp1-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "656c3ca"
 weight_format = "HGPTQ-int4"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 (3.07x) 8192 KV pages (131072 tokens), MambaRadixCache, 8 active seqs, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "warp34-35b-tp2-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "656c3ca"
 gpu_count = 2
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3,GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
@@ -72,11 +72,11 @@ weight_format = "HGPTQ-int4"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 (3.07x) 8192 KV pages (131072 tokens), MambaRadixCache, 8 active seqs, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --tp 2 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --tp 2 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "warp34-35b-tp2"
-engine = "warp-34"
+engine = "warp34"
 version = "656c3ca"
 gpu_count = 2
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3,GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
@@ -85,7 +85,7 @@ weight_format = "HGPTQ-int4"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 (3.07x) 8192 KV pages (131072 tokens, 8 MTP batch slots), MambaRadixCache, 8 active seqs, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --revision 4f5de21c886d79e17af5b8a4bfc625e226703fb6 --offline --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "vllm-35b-tp2"
@@ -143,7 +143,7 @@ quantization_details = "cyankiwi AWQ GEMM, asymmetric INT4 group-32; unquantized
 kv_format = "fp16"
 speculation = "none"
 cache_config = "BF16 KV, MambaRadixCache v2, max_running_requests 8, context_length 16384"
-launch_command = "docker run -d --name w34-sglang-35b-swe-bench --gpus all --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 2 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.90 --mamba-scheduler-strategy extra_buffer --host 127.0.0.1 --port 18835"
+launch_command = "docker run -d --name warp34-sglang-35b-swe-bench --gpus all --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 2 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.90 --mamba-scheduler-strategy extra_buffer --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "sglang-35b-tp2-mtp"
@@ -161,7 +161,7 @@ quantization_details = "cyankiwi AWQ GEMM, asymmetric INT4 group-32; unquantized
 kv_format = "fp16"
 speculation = "mtp-3"
 cache_config = "BF16 KV, MambaRadixCache v2 + NEXTN (3 steps, 4 draft tokens), max_running_requests 8, context_length 16384"
-launch_command = "docker run -d --name w34-sglang-35b-swe-bench --gpus all --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 2 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.90 --mamba-scheduler-strategy extra_buffer --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --host 127.0.0.1 --port 18835"
+launch_command = "docker run -d --name warp34-sglang-35b-swe-bench --gpus all --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 2 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.90 --mamba-scheduler-strategy extra_buffer --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --host 127.0.0.1 --port 18835"
 
 [[engines]]
 id = "vllm-35b-tp1"
@@ -193,7 +193,7 @@ quantization_details = "cyankiwi AWQ GEMM, asymmetric INT4 group-32; unquantized
 kv_format = "fp16"
 speculation = "none"
 cache_config = "FP16 KV, MambaRadixCache v2, max_running_requests 8, context_length 16384"
-launch_command = "docker run -d --name w34-sglang-35b-swe-bench --gpus device=1 --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 1 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.92 --mamba-scheduler-strategy extra_buffer --host 127.0.0.1 --port 18835"
+launch_command = "docker run -d --name warp34-sglang-35b-swe-bench --gpus device=1 --ipc=host --network=host -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -v /home/nchapman/.cache/huggingface:/root/.cache/huggingface lmsysorg/sglang:v0.5.19 python3 -m sglang.launch_server --model-path /root/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd --served-model-name qwen36-35b-a3b --tp-size 1 --context-length 16384 --max-running-requests 8 --chunked-prefill-size 2048 --mem-fraction-static 0.92 --mamba-scheduler-strategy extra_buffer --host 127.0.0.1 --port 18835"
 
 [[cases]]
 id = "smoke-warmup"

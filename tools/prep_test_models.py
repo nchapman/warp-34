@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and verify Hugging Face checkpoints and repo fixtures required by the warp-34 test suite.
+"""Prepare and verify Hugging Face checkpoints and repo fixtures required by the warp34 test suite.
 
 Usage:
     python3 tools/prep_test_models.py            # ensure core 4B/drafter/tokenizer test fixtures are cached

@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from w34perf.resources import summarize_resources
+from warp34perf.resources import summarize_resources
 
 
 def sample(t, power=100):

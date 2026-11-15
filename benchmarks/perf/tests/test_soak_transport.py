@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from w34perf.transport import stream
+from warp34perf.transport import stream
 
 
 def event(delta, finish=None):

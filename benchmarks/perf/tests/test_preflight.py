@@ -8,11 +8,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from w34perf.__main__ import main
-from w34perf.artifacts import save_inventory
-from w34perf.config import digest, load
-from w34perf.preflight import preflight
-from w34perf.transport import models
+from warp34perf.__main__ import main
+from warp34perf.artifacts import save_inventory
+from warp34perf.config import digest, load
+from warp34perf.preflight import preflight
+from warp34perf.transport import models
 from test_perf import ROOT
 
 
@@ -167,7 +167,7 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text())["status"], "interrupted")
 
     def test_disabled_profile_skips_without_accessing_inventory_or_network(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.preflight.models") as discover:
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.preflight.models") as discover:
             report = preflight(config({"id": "skip", "enabled": False, "skip_reason": "unsupported release"}),
                                "skip", Path(tmp) / "absent", Path(tmp) / "skipped.json")
             self.assertEqual(report["status"], "skipped")
@@ -182,7 +182,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual({e["artifact_sha256"] for e in runnable}, {"unknown"})
         self.assertEqual({e["chat_template_sha256"] for e in runnable}, {"unknown"})
         for e in runnable:
-            warp = e["engine"] == "warp-34"
+            warp = e["engine"] == "warp34"
             revision = ("ae51987e3339a2a70070702548571e10fe8bcbc2" if warp else
                         "e3a700906e6a73ba4290b1873dc2ba8198527ab5")
             repo = ("models--nchapman--Qwen3.8-27B-W4A16-HGPTQ" if warp else

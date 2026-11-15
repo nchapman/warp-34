@@ -519,9 +519,9 @@ function ConnectionGuide() {
 }
 
 function titleFromPathname(pathname: string): string {
-  if (pathname.startsWith("/playground")) return "warp-34 · Playground";
-  if (pathname.startsWith("/connect")) return "warp-34 · Connect";
-  return "warp-34 · Overview";
+  if (pathname.startsWith("/playground")) return "warp34 · Playground";
+  if (pathname.startsWith("/connect")) return "warp34 · Connect";
+  return "warp34 · Overview";
 }
 
 function DashboardShell({ state }: { state: MetricsState }) {
@@ -539,7 +539,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
         Skip to content
       </a>
       <header className="topbar">
-        <Link className="brand" to="/" aria-label="warp-34 home">
+        <Link className="brand" to="/" aria-label="warp34 home">
           <svg viewBox="0 0 32 32" aria-hidden="true">
             <path d="m6 23 6-14h5l-6 14zm10 0 6-14h5l-6 14z" />
           </svg>
@@ -579,7 +579,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
       </main>
       <footer>
         <span>
-          warp-34 <span className="separator">/</span> Built for real work.
+          warp34 <span className="separator">/</span> Built for real work.
         </span>
         <span>
           {state.connection === "live"

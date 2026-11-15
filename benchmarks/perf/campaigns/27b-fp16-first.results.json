@@ -42,7 +42,7 @@
     },
     {
       "profile": "warp34",
-      "engine": "warp-34",
+      "engine": "warp34",
       "path": "benchmarks/perf/results/27b-fp16-first-2026-10-30/warp34",
       "bundle_index_sha256": "c7110f8a34b3d978fe4ecc10838bebede3399fb5f3560b30ad827e296ccc6a93",
       "preflight_sha256": "dfb090a81aea51193688605ed38f9be81304741c46de548c34034148c8689ff6",
@@ -183,7 +183,7 @@
       "session_p50_s": 2.982181326020509
     },
     {
-      "engine": "warp-34",
+      "engine": "warp34",
       "profile": "warp34",
       "case": "decode-c1",
       "status": "passed",
@@ -199,7 +199,7 @@
       "session_p50_s": 5.6338510473724455
     },
     {
-      "engine": "warp-34",
+      "engine": "warp34",
       "profile": "warp34",
       "case": "throughput-c8",
       "status": "passed",
@@ -215,7 +215,7 @@
       "session_p50_s": 7.1047196600120515
     },
     {
-      "engine": "warp-34",
+      "engine": "warp34",
       "profile": "warp34",
       "case": "agent-c1",
       "status": "passed",
@@ -231,7 +231,7 @@
       "session_p50_s": 11.901973843341693
     },
     {
-      "engine": "warp-34",
+      "engine": "warp34",
       "profile": "warp34",
       "case": "prefill-primed-c1",
       "status": "passed",

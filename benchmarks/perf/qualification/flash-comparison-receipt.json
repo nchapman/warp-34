@@ -4,7 +4,7 @@
   "sha256": "af9bd8713a426c03e2917616dbfdd45dca270f6fbba1f99b0b276b97104a9783",
   "bytes": 12971458,
   "reproduce_cwd": "benchmarks/perf",
-  "reproduce": "python3 -m w34perf compare results/completion-flash-serving/warp34-flash-tp1-target/run results/completion-flash-fit/warp34-flash-tp2-target-8k/run results/completion-flash-reference1/qfn-3090-mtp3/run results/completion-flash-serving/qfn-2x3090-mtp3/run results/completion-flash-strata-lookup/strata-flash-tp1-lookup4/run",
+  "reproduce": "python3 -m warp34perf compare results/completion-flash-serving/warp34-flash-tp1-target/run results/completion-flash-fit/warp34-flash-tp2-target-8k/run results/completion-flash-reference1/qfn-3090-mtp3/run results/completion-flash-serving/qfn-2x3090-mtp3/run results/completion-flash-strata-lookup/strata-flash-tp1-lookup4/run",
   "comparisons": 253,
   "statuses": {"incompatible": 253},
   "publication_ready": false,

@@ -76,7 +76,7 @@ def protocol(tokenizer):
                 sampling=dict(temperature=0, max_new_tokens=128, ignore_eos=True),
                 tp=1, M=16, target_dtype='float16', draft_dtype='bfloat16',
                 prefix_cache=False, reset_after_warm=True,
-                kv_policy=dict(oracle='float16', w34='tq4',
+                kv_policy=dict(oracle='float16', warp34='tq4',
                                comparison='different KV policies, NOT identical KV'),
                 timing_contract='wall TTFT to first streamed token; decode to final token',
                 verify_rounds=None, output_ids=None,
@@ -133,7 +133,7 @@ PLAN = [
     'retain prefill in trace but exclude its correlated launches from decode analysis.',
     'Save streamed output IDs, actual generated count=128, TTFT/decode wall ms, worker '
     'round events and resolved settings. Missing IDs/telemetry/dtype evidence fails closed. '
-    'No parity claim until fresh donor and w34 artifacts are compared.',
+    'No parity claim until fresh donor and warp34 artifacts are compared.',
 ]
 
 
@@ -161,7 +161,7 @@ def execute(args, data, root):
                 runtime_environment={'SGLANG_MAMBA_CONV_DTYPE': 'float16'},
                 helper_sha256=sha(Path(__file__).with_name('aligned_worker_hook.py')),
                 quantization_deviation='Pinned target declares compressed-tensors; explicit gptq_marlin rejected. Auto resolves checkpoint quantization.',
-                profiling_limitations='External nsys required; ORACLE_PROFILE_FLUSH=1 flushes worker traces before shutdown. No matched w34 correctness/profile gate.',
+                profiling_limitations='External nsys required; ORACLE_PROFILE_FLUSH=1 flushes worker traces before shutdown. No matched warp34 correctness/profile gate.',
                 instrumentation='worker NVTX per decode round; synchronous commit telemetry; draft ModelConfig dtype override',
                 comparison_complete=False)
     data['protocol']['runtime_telemetry'] = 'Execution starting; runtime evidence pending.'

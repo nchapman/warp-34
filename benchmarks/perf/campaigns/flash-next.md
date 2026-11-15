@@ -1,7 +1,7 @@
 # Flash-Next HTTP serving campaign
 
 Configuration: [flash-next-serving.toml](flash-next-serving.toml). This is a
-standalone `w34perf` HTTP campaign, not a server launcher or a results report.
+standalone `warp34perf` HTTP campaign, not a server launcher or a results report.
 Qualification attempts are complete, including failed cells. Frozen profiles
 retain their original **unverified** metadata; assessed outcomes are recorded
 separately rather than retroactively changing profile digests. Both specialized
@@ -50,13 +50,13 @@ albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE@ef554143369a706525336f6b42a09094835dc07
 /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077
 ```
 
-Native version: `66974d8`. Expected `target/release/w34` SHA-256:
+Native version: `66974d8`. Expected `target/release/warp34` SHA-256:
 `f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f`.
-Check `sha256sum target/release/w34` before launch; these identifiers are pinned
+Check `sha256sum target/release/warp34` before launch; these identifiers are pinned
 provenance, not an assertion that this campaign qualified that binary.
 
 Recipes were checked against the actual option parser in
-`crates/w34-host/src/main.rs`: `serve --model`, `--offline`, `--tp`,
+`crates/warp34-host/src/main.rs`: `serve --model`, `--offline`, `--tp`,
 `--kv-format`, `--kv-pages`, `--host`, `--port`, `--speculative mtp`, and
 `--mtp-k 3`. Target-only means omitting speculation entirely. No invented
 `--moe-offload-mode` or hot-cache tuning CLI is used. Earlier design sections in
@@ -75,7 +75,7 @@ and record hashes; missing assets or startup failure must remain failures rather
 than silently substituting a model.
 
 Native HTTP model IDs deliberately equal the full snapshot path passed to
-`--model`: no alias is set. `crates/w34-host/src/server/http.rs` advertises the configured model name
+`--model`: no alias is set. `crates/warp34-host/src/server/http.rs` advertises the configured model name
 at `/v1/models`. The reference explicitly serves `Qwen3.8-Flash-Next`, matching
 its TOML request model. Always inspect `/v1/models` before running; do not send
 the upstream base-model ID to a server advertising a different ID.
@@ -84,18 +84,18 @@ the upstream base-model ID to a server advertising a different ID.
 
 Each runnable TOML deployment contains its complete launch command. Execute
 native commands from the repository root. The reference command changes to its
-checkout. `w34perf` does not launch or stop these servers. They deliberately
+checkout. `warp34perf` does not launch or stop these servers. They deliberately
 share port 18034: stop one before starting another and wait for readiness.
 
 ```sh
-cd /home/nchapman/Code/warp-34/benchmarks/perf
-python3 -m w34perf validate campaigns/flash-next-serving.toml
+cd /home/nchapman/Code/warp34/benchmarks/perf
+python3 -m warp34perf validate campaigns/flash-next-serving.toml
 # After manually starting the chosen deployment:
 curl -fsS http://127.0.0.1:18034/v1/models
-python3 -m w34perf run campaigns/flash-next-serving.toml \
+python3 -m warp34perf run campaigns/flash-next-serving.toml \
   --engine warp34-flash-tp1-target --gpus 1 \
   --out results/flash-next-tp1-target
-python3 -m w34perf report results/flash-next-tp1-target
+python3 -m warp34perf report results/flash-next-tp1-target
 ```
 
 Use fresh output paths and repeat for `warp34-flash-tp1-mtp3`,
@@ -117,7 +117,7 @@ from successful TOML validation.
 
 ## Reference recipe and its prerequisites
 
-Reference checkout: `/tmp/w34-benchmark-refs/qfn-2x3090`, pinned commit
+Reference checkout: `/tmp/warp34-benchmark-refs/qfn-2x3090`, pinned commit
 `4dca58f7243f3910ba072a97e7f29fcf6f5636f3`. Read inputs are
 `configs/2x3090-128gb.env`, `scripts/docker_serve.sh`,
 `scripts/serve-container.sh`, `docker/Dockerfile`, and `repro.lock.json`.
@@ -177,6 +177,6 @@ an explicit run configuration. A process restart still does not cold-clear the
 OS page cache or persistent JIT caches. Do not drop system caches implicitly.
 
 Validation performed from `benchmarks/perf`:
-`python3 -m w34perf validate campaigns/flash-next-serving.toml` →
+`python3 -m warp34perf validate campaigns/flash-next-serving.toml` →
 `valid: 11 deployments, 5 cases`. This validates schema/fixtures only; no serving
 measurements or support qualification are claimed.

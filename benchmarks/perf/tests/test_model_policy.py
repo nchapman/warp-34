@@ -4,7 +4,7 @@ import re
 import shlex
 import unittest
 
-from w34perf.config import load
+from warp34perf.config import load
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -31,7 +31,7 @@ class ModelPolicyTests(unittest.TestCase):
                 for retired in ('llmfan46', 'SergiioB', 'rcs1000', 'uncensored'):
                     self.assertNotIn(retired.lower(), selection.lower())
                 self.assertNotRegex(selection, r'nchapman(?:/|--)[^\s"\']*-W\d+(?:\.\d+)?A\d+-GPTQ')
-                if engine['engine'] == 'warp-34':
+                if engine['engine'] == 'warp34':
                     args = shlex.split(engine.get('launch_command', ''))
                     for flag in ('--model', '--draft-model'):
                         if flag not in args:

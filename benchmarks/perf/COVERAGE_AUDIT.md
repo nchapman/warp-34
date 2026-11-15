@@ -3,7 +3,7 @@
 Audit baseline: `496d1a1` (post-HGPTQ merge). Inventory below describes that
 baseline; the follow-up Flash-Next campaign is `campaigns/flash-next-hgptq.toml`.
 Scope: the standalone HTTP
-`w34perf` suite, not internal `w34 bench`, oracle parity, kernel profiling, or
+`warp34perf` suite, not internal `warp34 bench`, oracle parity, kernel profiling, or
 model-quality evaluation. No GPU benchmarks or server qualification were run
 for this audit. Configured coverage is not evidence of successful execution.
 
@@ -30,8 +30,8 @@ Paths below are relative to `benchmarks/perf/` unless stated otherwise.
 | 9B | `campaigns/9b-longctx-coding-agent.toml`: plain GPTQ long-context replay | HGPTQ and short/medium-context decode coverage |
 | 27B | `27b-completion.toml`, `27b-kv-spec-completion.toml`, `27b-spec-and-tp2.toml` and long-context/capacity campaigns: GPTQ, KV sweeps, MTP, BF16 DFlash2 drafter, multiple engines | HGPTQ target; HGPTQ drafter; updated engine binaries and newly qualified serving configurations |
 | 35B-A3B | `35b-a3b-moe-serving.toml`: `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`, MTP-k2 | Plain versus MTP; multi-client SWE serving coverage |
-| Flash-Next | `flash-next-serving.toml`, `flash-next-longctx.toml`: `albucino/...W4A16-FP8PLE`, warp-34 target/MTP TP1/TP2; specialized vLLM overlays and other practical baselines | HGPTQ/lut4 PLE target; quantized DFlash2 drafter; current residency policy; new serving qualification |
-| Multimodal | Workload schema supports only text and agent replay (`w34perf/config.py`, `workloads.py`) | No first-class image performance cases; a gap if claiming coverage of all serving capabilities |
+| Flash-Next | `flash-next-serving.toml`, `flash-next-longctx.toml`: `albucino/...W4A16-FP8PLE`, warp34 target/MTP TP1/TP2; specialized vLLM overlays and other practical baselines | HGPTQ/lut4 PLE target; quantized DFlash2 drafter; current residency policy; new serving qualification |
+| Multimodal | Workload schema supports only text and agent replay (`warp34perf/config.py`, `workloads.py`) | No first-class image performance cases; a gap if claiming coverage of all serving capabilities |
 
 No campaign TOML currently names an HGPTQ checkpoint. The 27B DFlash2
 configurations use `incoai/Qwen3.8-27B-DFlash2`, not the new quantized drafter.
@@ -47,14 +47,14 @@ be copied onto current runs without checking startup allocation. Specialized
 
 Maintain two distinct comparison tracks:
 
-1. **Practical engine comparison:** nchapman HGPTQ on warp-34 versus official-base
+1. **Practical engine comparison:** nchapman HGPTQ on warp34 versus official-base
    cyankiwi AWQ on vLLM/SGLang, as pinned in the [checkpoint policy](../MODELS.md).
    These are not identical weights. Match source model, tokenizer/template,
    workload, hardware and precision controls; label remaining differences.
    Compare plain decoding first, then explicitly labeled speculation/KV sweeps.
-2. **Warp-34 configuration comparison:** hold the HGPTQ target fixed while
+2. **Warp34 configuration comparison:** hold the HGPTQ target fixed while
    comparing KV formats, speculation and parallelism. Deprecated in-house plain
-   GPTQ exports and AutoRound targets are not active warp-34 baselines. Archived
+   GPTQ exports and AutoRound targets are not active warp34 baselines. Archived
    cross-quant measurements remain historical evidence only.
 
 Require the same underlying model/version (not a fine-tune, uncensored
@@ -82,7 +82,7 @@ repository name or use a moving `main` in retained launch evidence.
 Avoid a full Cartesian product. Use the following tiers, and retain explicit
 skip/failure/capacity outcomes rather than dropping unsuccessful profiles.
 
-### Tier 1: current warp-34 capability coverage
+### Tier 1: current warp34 capability coverage
 
 Scope is limited to four mainstream, unmodified model families: **9B, 27B,
 35B-A3B, and Flash-Next**. Exclude uncensored derivatives. Do not add 2B
@@ -111,7 +111,7 @@ Start with the existing 27B plain-GPTQ common checkpoint on all three engines,
 TP1/TP2, plain decode and then qualified speculative modes. Extend the common
 checkpoint lane to the other model families where available. Qualify Flash-Next
 stock-engine support separately from custom overlays. Do not expand this refresh into third-party practical comparisons. Retain the
-old FP8-PLE Flash-Next lane as a labeled warp-34 reference, not an equivalent
+old FP8-PLE Flash-Next lane as a labeled warp34 reference, not an equivalent
 HGPTQ artifact; historical runs on different hardware are not controlled quant
 comparisons.
 
@@ -217,7 +217,7 @@ CUDA project check was not run for this documentation-only audit.
   refresh launch metadata without overwriting historical campaigns.
 - **P0:** Define representative decode cases and state protocols; qualify serving
   profiles on the pod. No new performance claims before this step.
-- **P1:** Add drafter comparison controls and explicitly labeled within-warp-34
+- **P1:** Add drafter comparison controls and explicitly labeled within-warp34
   quant reporting. Third-party checkpoint replacement is deferred.
 - **P1:** Expand concurrency, long-context and offered-load coverage; capture
   optional speculative/residency diagnostics.

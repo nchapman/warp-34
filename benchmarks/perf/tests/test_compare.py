@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from w34perf.compare import compare
+from warp34perf.compare import compare
 
 
 class CompareTests(unittest.TestCase):

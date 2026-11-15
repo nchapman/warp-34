@@ -2,7 +2,7 @@
   "purpose": "Short cross-server/model tooling qualification, not quality measurement",
   "engine_source": "f6ab96e (engine tree, merged into benchmark at 9b04799)",
   "server_command": [
-    "/workspace/warp-34/target/release/w34",
+    "/workspace/warp34/target/release/warp34",
     "serve",
     "--model",
     "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",

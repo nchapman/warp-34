@@ -20,27 +20,27 @@ For `Qwen3.8-Flash-Next` (`qwen4_exp`), `KvPool` additionally allocates per-laye
 
 ## 3. Per-Layer Physical Descriptor (`KvLayerLayout`)
 
-Mirrored identically in Rust (`crates/w34-kernels/src/ffi.rs`) and CUDA C (`crates/w34-kernels/csrc/w34_cuda.h`):
+Mirrored identically in Rust (`crates/warp34-kernels/src/ffi.rs`) and CUDA C (`crates/warp34-kernels/csrc/warp34_cuda.h`):
 
 ```c
 typedef enum {
-    W34_KV_NAMESPACE_TARGET_FULL_ATTN    = 0,
-    W34_KV_NAMESPACE_MTP_FULL_ATTN       = 1,
-    W34_KV_NAMESPACE_DFLASH_DRAFT_CTX    = 2,
-} w34_kv_namespace;
+    WARP34_KV_NAMESPACE_TARGET_FULL_ATTN    = 0,
+    WARP34_KV_NAMESPACE_MTP_FULL_ATTN       = 1,
+    WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX    = 2,
+} warp34_kv_namespace;
 
 typedef enum {
-    W34_KV_FORMAT_FP16     = 0, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
-    W34_KV_FORMAT_BF16     = 1, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
-    W34_KV_FORMAT_TQ4      = 2, // block_tq4_0:        66 B per 128 elems (132 B/row at d=256)
-    W34_KV_FORMAT_Q8_0     = 3, // block_q8_0:         68 B per 64 elems  (272 B/row at d=256)
-    W34_KV_FORMAT_FP8_E4M3 = 4, // block_fp8_e4m3_256: 264 B per 256 elems (sm_89+ Ada/Hopper+)
-} w34_kv_format;
+    WARP34_KV_FORMAT_FP16     = 0, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
+    WARP34_KV_FORMAT_BF16     = 1, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
+    WARP34_KV_FORMAT_TQ4      = 2, // block_tq4_0:        66 B per 128 elems (132 B/row at d=256)
+    WARP34_KV_FORMAT_Q8_0     = 3, // block_q8_0:         68 B per 64 elems  (272 B/row at d=256)
+    WARP34_KV_FORMAT_FP8_E4M3 = 4, // block_fp8_e4m3_256: 264 B per 256 elems (sm_89+ Ada/Hopper+)
+} warp34_kv_format;
 
 typedef enum {
-    W34_KV_TRANSFORM_IDENTITY           = 0,
-    W34_KV_TRANSFORM_RADEMACHER_WHT256  = 1, // Seed-42 Rademacher sign + WHT-256
-} w34_kv_transform;
+    WARP34_KV_TRANSFORM_IDENTITY           = 0,
+    WARP34_KV_TRANSFORM_RADEMACHER_WHT256  = 1, // Seed-42 Rademacher sign + WHT-256
+} warp34_kv_transform;
 
 typedef struct {
     uint64_t k_base;                // Device pointer to layer K slab base
@@ -51,17 +51,17 @@ typedef struct {
     uint64_t v_page_stride_bytes;   // Bytes between consecutive physical pages in V
     uint64_t v_head_stride_bytes;   // Bytes between KV heads within a page in V
     uint64_t v_token_stride_bytes;  // Bytes between tokens (u in 0..16) within a head in V
-    int32_t  namespace_id;          // w34_kv_namespace
+    int32_t  namespace_id;          // warp34_kv_namespace
     int32_t  layer_id;              // Full-attn slot index within namespace
     int32_t  local_kv_heads;        // KV heads on this TP rank
     int32_t  head_dim;              // 128 or 256
     int32_t  block_size;            // Always 16
-    int32_t  k_format;              // w34_kv_format
-    int32_t  v_format;              // w34_kv_format
-    int32_t  k_transform;           // w34_kv_transform (independent of v_transform)
-    int32_t  v_transform;           // w34_kv_transform (independent of k_transform)
+    int32_t  k_format;              // warp34_kv_format
+    int32_t  v_format;              // warp34_kv_format
+    int32_t  k_transform;           // warp34_kv_transform (independent of v_transform)
+    int32_t  v_transform;           // warp34_kv_transform (independent of k_transform)
     int32_t  reserved;
-} w34_kv_layer_layout;
+} warp34_kv_layer_layout;
 ```
 
 ### Physical Byte Address Formula & Alignment Invariant
@@ -78,10 +78,10 @@ For physical page `p`, local KV head `h in 0..local_kv_heads`, and intra-page to
 
 ```c
 typedef enum {
-    W34_ATTN_MASK_CAUSAL                  = 0,
-    W34_ATTN_MASK_SYMMETRIC_WINDOW        = 1, // Non-causal within query chunk, sliding window
-    W34_ATTN_MASK_NONCAUSAL_WINDOW        = 1,
-} w34_attn_mask_mode;
+    WARP34_ATTN_MASK_CAUSAL                  = 0,
+    WARP34_ATTN_MASK_SYMMETRIC_WINDOW        = 1, // Non-causal within query chunk, sliding window
+    WARP34_ATTN_MASK_NONCAUSAL_WINDOW        = 1,
+} warp34_attn_mask_mode;
 
 typedef struct {
     const int32_t* query_start_loc;      // [R_max + 1] device ptr
@@ -96,11 +96,11 @@ typedef struct {
     int32_t max_blocks_per_req;          // Row stride of block_tables
     int32_t max_q_len;                   // Host-known upper bound on max_r(q_len[r])
     int32_t max_seq_len;                 // Host-known upper bound on max_r(seq_lens_after[r])
-    int32_t mask_mode;                   // w34_attn_mask_mode
+    int32_t mask_mode;                   // warp34_attn_mask_mode
     int32_t sliding_window;              // 0 = full, >0 = window size (e.g. 2048)
     float   sm_scale;                    // 1.0f / sqrtf(head_dim)
     int32_t reserved;
-} w34_attention_batch;
+} warp34_attention_batch;
 ```
 
 ## 5. Copy-on-Write (COW) & Radix Ownership Rules

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Static CUDA fatbinary resource & stack-spill gate for `w34-kernels`.
+"""Static CUDA fatbinary resource & stack-spill gate for `warp34-kernels`.
 
-Inspects `libw34_kernels.a` via `cuobjdump --dump-resource-usage` across all
+Inspects `libwarp34_kernels.a` via `cuobjdump --dump-resource-usage` across all
 compiled `sm_86` and `sm_89` kernel specializations (~1,070 entries) and fails
 fast if any kernel:
-  1. Fails to compile for both `sm_86` and `sm_89` (unless `W34_ARCH` overrides).
+  1. Fails to compile for both `sm_86` and `sm_89` (unless `WARP34_ARCH` overrides).
   2. Allocates `.local` memory (`LOCAL > 0`).
   3. Exceeds the 48 KiB opt-in-free static shared-memory ceiling (`SHARED > 49152`).
   4. Allocates non-zero `STACK` outside the explicit call-frame / vendor allowlist
@@ -34,7 +34,7 @@ MIN_KERNELS_PER_ARCH = 400
 
 # Explicit STACK ceilings (bytes) ONLY for kernels with unavoidable libdevice /
 # `__noinline__` call frames or upstream vendor templates. Every other kernel in
-# `w34-kernels` must compile with `STACK:0`.
+# `warp34-kernels` must compile with `STACK:0`.
 STACK_ALLOWLIST: tuple[tuple[str, int, str], ...] = (
     ("_ZN6marlin6Marlin", 64, "Marlin template specialization"),
     ("_ZN5flash16flash_fwd_kernel", 192, "FlashAttention-2 vision fwd template"),
@@ -126,20 +126,20 @@ def find_or_build_archive(repo_root: pathlib.Path, profile: str = "release") -> 
     env = os.environ.copy()
     if "/opt/cuda/bin" not in env.get("PATH", ""):
         env["PATH"] = f"/opt/cuda/bin:{env.get('PATH', '')}"
-    cmd = ["cargo", "build", "-p", "w34-kernels", "--features", "cuda", "--quiet"]
+    cmd = ["cargo", "build", "-p", "warp34-kernels", "--features", "cuda", "--quiet"]
     if profile == "release":
         cmd.append("--release")
     subprocess.run(cmd, cwd=repo_root, env=env, check=True)
     candidates = sorted(
         [
-            *build_root.glob("w34-kernels-*/out/libw34_kernels.a"),
-            *build_root.glob("w34-kernels/*/out/libw34_kernels.a"),
+            *build_root.glob("warp34-kernels-*/out/libwarp34_kernels.a"),
+            *build_root.glob("warp34-kernels/*/out/libwarp34_kernels.a"),
         ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise FileNotFoundError(f"libw34_kernels.a not found under {build_root}")
+        raise FileNotFoundError(f"libwarp34_kernels.a not found under {build_root}")
     return candidates[0]
 
 
@@ -174,11 +174,11 @@ def parse_cuobjdump_resources(text: str) -> list[KernelResource]:
     return out
 
 
-def expected_arches_from_env(w34_arch_env: str | None) -> tuple[str, ...]:
-    if not w34_arch_env or not w34_arch_env.strip():
+def expected_arches_from_env(warp34_arch_env: str | None) -> tuple[str, ...]:
+    if not warp34_arch_env or not warp34_arch_env.strip():
         return ("sm_80", "sm_86", "sm_89")
     arches: list[str] = []
-    for tok in re.split(r"[,\s;]+", w34_arch_env.strip()):
+    for tok in re.split(r"[,\s;]+", warp34_arch_env.strip()):
         if not tok:
             continue
         norm = tok if tok.startswith("sm_") else f"sm_{tok.removeprefix('compute_')}"
@@ -249,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         "--archive",
         type=pathlib.Path,
         default=None,
-        help="Path to libw34_kernels.a (auto-discovered under target/release/build if omitted)",
+        help="Path to libwarp34_kernels.a (auto-discovered under target/release/build if omitted)",
     )
     args = parser.parse_args(argv)
 
@@ -263,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         check=True,
     )
     entries = parse_cuobjdump_resources(proc.stdout)
-    expected_arches = expected_arches_from_env(os.environ.get("W34_ARCH"))
+    expected_arches = expected_arches_from_env(os.environ.get("WARP34_ARCH"))
     failures = audit_kernel_resources(entries, expected_arches=expected_arches)
     elapsed_ms = (time.monotonic() - t0) * 1000.0
 

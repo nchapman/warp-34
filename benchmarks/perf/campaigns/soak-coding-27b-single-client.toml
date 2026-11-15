@@ -12,7 +12,7 @@ max_inflight = 1
 
 [[engines]]
 id = "warp34-soak"
-engine = "warp-34"
+engine = "warp34"
 version = "0105610b5ac89ea132b17a208900e91b9f0b6293"
 support = "unverified"
 model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
@@ -30,7 +30,7 @@ kv_format = "tq4"
 parallelism = "single"
 speculation = "mtp-3"
 cache_config = "12288 KV pages; 1 active sequence; max model len 196608"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 12288 --max-num-seqs 1 --max-model-len 196608 --port 18834"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 12288 --max-num-seqs 1 --max-model-len 196608 --port 18834"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[cases]]

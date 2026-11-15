@@ -1,4 +1,4 @@
-# Contributing to warp-34
+# Contributing to warp34
 
 Start with [FEATURES](docs/FEATURES.md), the [readiness register](docs/READINESS.md), [architecture/contracts](docs/ROADMAP.md), and [hardware constraints](docs/HARDWARE.md). A feature's existence is not a blanket support guarantee. Report and preserve the configuration in which behavior is expected.
 
@@ -31,7 +31,7 @@ Check GPU occupancy first; select free cards and never interrupt another user's 
 export PATH="/opt/cuda/bin:$PATH"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
 python3 tools/prep_test_models.py --check
-CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 mise run check
+CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 mise run check
 ```
 
 Choose device IDs appropriate to the available hardware. `mise run check` includes formatting, CUDA/CPU Clippy, rustdoc, CUDA release tests, oracle-tooling/performance-tooling tests and dashboard checks. Some tests require two GPUs, large cached checkpoints, or explicit `--ignored`; see the [release checklist](docs/RELEASE_CHECKLIST.md). Native fatbinary qualification also sets `CUDA_DISABLE_PTX_JIT=1`.

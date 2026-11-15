@@ -124,7 +124,7 @@ assembled traces and claiming faithful trajectories.
 Server (repository root):
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/warp34 serve \
   --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --kv-format tq4 \
   --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 --port 18834
 ```
@@ -132,8 +132,8 @@ CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/w34 serve \
 Client (`benchmarks/perf`; actual PID was 1450097):
 
 ```sh
-python3 -m w34perf soak campaigns/soak-coding.toml \
-  --engine warp34-soak --out /tmp/w34-soak-single-gpu-10min \
+python3 -m warp34perf soak campaigns/soak-coding.toml \
+  --engine warp34-soak --out /tmp/warp34-soak-single-gpu-10min \
   --duration-s 600 --min-completed 1000 --max-duration-s 900 \
   --sustained-s 60 --burst-s 15 --cancel-every 10 \
   --progress-timeout-s 120 --drain-s 10 --telemetry-interval 1 \
@@ -141,7 +141,7 @@ python3 -m w34perf soak campaigns/soak-coding.toml \
   --max-rss-growth-mib 512 --max-gpu-growth-mib 256
 ```
 
-- Artifacts: `/tmp/w34-soak-single-gpu-10min/` (local, not durable release storage).
+- Artifacts: `/tmp/warp34-soak-single-gpu-10min/` (local, not durable release storage).
 - `soak_summary.json` SHA-256:
   `55ea4f5d4f1606ab1b044a6612dd6dacaeee5b93c27a9188f26e4cc34f6eb7e6`.
 - Canonical config SHA-256:

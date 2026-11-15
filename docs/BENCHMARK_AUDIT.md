@@ -131,7 +131,7 @@ minimum cosine 0.999131, and matching top-1 token.
       cold misses into the 24 dynamic GPU slots (`k_static..k_hot`), even
       running `M=1` twice from the same `state_in_slot` changes dynamic slot
       residency by `1` FP16 ULP (`0.000244`).
-    - Across batch sizes, `w34_moe_w4a16_mlp_f16` switches between GEMV
+    - Across batch sizes, `warp34_moe_w4a16_mlp_f16` switches between GEMV
       (`M=1..3`), grouped-vec (`M=4..7`), and sparse-MMA (`M>=8`), and
       `launch_qsa_sparse_paged_attn_f16` scales Split-K `num_splits` with
       `num_tokens` (`32` at `M=1`, `8` at `M=4`, `4` at `M=8`).
@@ -193,7 +193,7 @@ This is one five-token microbenchmark, not an end-to-end comparison or a
 statistically established improvement over previous numbers.
 
 HTTP follow-up: 4B TP1, FP16 KV, 4096 pages, plain serving on port 18834,
-using the existing `w34perf` smoke and B=8 cases with three repetitions each:
+using the existing `warp34perf` smoke and B=8 cases with three repetitions each:
 **198/198 measured requests succeeded**. Median aggregate throughput was
 **185.19 tok/s** for smoke and **1099.93 tok/s** for B=8. These are finite-trial
 HTTP measurements, not comparable to native decode-only tok/s. The generic
@@ -218,7 +218,7 @@ export PATH="/opt/cuda/bin:$PATH"
 export CUDA_VISIBLE_DEVICES=0,1 CUDA_DISABLE_PTX_JIT=1
 python3 tools/prep_test_models.py --check --all
 mise run check
-./target/release/w34 bench --offline \
+./target/release/warp34 bench --offline \
   --model nchapman/Qwen3.5-9B-W4A16-HGPTQ --tp 2 \
   --kv-format tq4 --prompt-len 128 --gen-len 64 --out result.json
 # Repeat with --speculative mtp --mtp-k 3; use the target/drafter table above
@@ -229,5 +229,5 @@ Local raw evidence is retained under
 `benchmarks/perf/results/native-audit-1503ac5/` (gitignored): full JSON outputs,
 command manifests, fixture revisions, build/check logs, alternating repeats,
 and candidate measurements. Original scratch evidence is also under
-`/tmp/w34-benchmark-audit-1503ac5/`. Historical benchmark outputs and the
+`/tmp/warp34-benchmark-audit-1503ac5/`. Historical benchmark outputs and the
 pre-existing untracked `outputs/` directory were not modified.

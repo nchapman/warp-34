@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from w34perf.__main__ import main
-from w34perf.config import load
-from w34perf.report import render
-from w34perf.runner import execute
-from w34perf.selection import select
+from warp34perf.__main__ import main
+from warp34perf.config import load
+from warp34perf.report import render
+from warp34perf.runner import execute
+from warp34perf.selection import select
 from test_perf import ROOT, result
 
 
@@ -75,8 +75,8 @@ class SelectionTests(unittest.TestCase):
         cfg = config()
         cfg["engines"][0].update(enabled=False, skip_reason="temporarily unavailable", api_key_env="ABSENT_TEST_KEY")
         cfg["engines"][1].update(support="unsupported", skip_reason="no two-card backend")
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream") as stream, \
-                patch("w34perf.runner.provenance") as provenance:
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream") as stream, \
+                patch("warp34perf.runner.provenance") as provenance:
             out = Path(tmp) / "run"
             self.assertEqual(execute(cfg, out, [e["id"] for e in cfg["engines"]]), [])
             stream.assert_not_called()
@@ -93,8 +93,8 @@ class SelectionTests(unittest.TestCase):
 
     def test_filtered_endpoints_do_not_trigger_duplicate_url_guard(self):
         cfg = config()
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream", return_value=result()), \
-                patch("w34perf.runner.provenance", return_value={}):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream", return_value=result()), \
+                patch("warp34perf.runner.provenance", return_value={}):
             out = Path(tmp) / "run"
             rows = execute(cfg, out, gpu_count=1)
             coverage = json.loads((out / "coverage.json").read_text())
@@ -107,8 +107,8 @@ class SelectionTests(unittest.TestCase):
         cfg = config()
         cfg["engines"][1]["base_url"] = "http://127.0.0.1:19001/v1"
         cfg["run"].update(repetitions=1, warmup_requests=1)
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.provenance", return_value={}), \
-                patch("w34perf.runner.stream", return_value={**result(), "status": "timeout"}):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.provenance", return_value={}), \
+                patch("warp34perf.runner.stream", return_value={**result(), "status": "timeout"}):
             out = Path(tmp) / "failed"
             with self.assertRaises(RuntimeError):
                 execute(cfg, out)
@@ -116,8 +116,8 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual([c["status"] for c in cells], ["failed", "not_run"])
             self.assertEqual(cells[0]["completed_repetitions"], 0)
         cfg["run"]["warmup_requests"] = 0
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.provenance", return_value={}), \
-                patch("w34perf.runner.stream", return_value={**result(), "usage": {}}):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.provenance", return_value={}), \
+                patch("warp34perf.runner.stream", return_value={**result(), "usage": {}}):
             out = Path(tmp) / "usage"
             execute(cfg, out, [cfg["engines"][0]["id"]])
             cells = json.loads((out / "coverage.json").read_text())

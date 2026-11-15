@@ -33,7 +33,7 @@ failed before the fix at the expected admission check and passed afterward.
 
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
-CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/warp34 serve \
   --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline \
   --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 16384 \
@@ -67,7 +67,7 @@ The server stopped cleanly afterward.
 ## Follow-on MTP budgeting issue
 
 Reducing to `--kv-pages 14336 --max-model-len 229376` after only the target-placement
-fix caused startup `CUDA error 2 (out of memory) in w34_malloc`: the smaller target
+fix caused startup `CUDA error 2 (out of memory) in warp34_malloc`: the smaller target
 pool allowed GPU-resident embeddings again, but subsequent MTP allocations were
 not included in the placement/state-pool plan. Lower context is not a monotonic
 memory improvement while placement and optional allocations can change.
@@ -158,7 +158,7 @@ explicit reserve; MTP's existing MoE/QSA allocation contracts are not rewritten 
 
 ## Final verification
 
-`PATH="/opt/cuda/bin:$PATH" CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1
+`PATH="/opt/cuda/bin:$PATH" CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1
 CUDA_DISABLE_PTX_JIT=1 mise run check` passed after the final state-floor fix:
 **505 Rust tests passed, 0 failed, 13 ignored**, plus the non-GPU checks, in
 **373.40 seconds**. The five worker-capacity tests include plain/MTP long-context
@@ -168,26 +168,26 @@ Code review findings were addressed. A separate state-lifetime investigation
 identified the preferred-versus-required DFlash pool distinction; its correction
 was verified by the regression and the live cached-prefix smoke above.
 
-Log: `/tmp/w34-speculative-budget-final-check-2.log`; SHA-256
+Log: `/tmp/warp34-speculative-budget-final-check-2.log`; SHA-256
 `56487354157aafe1d23ee87e025196b6cb5b7871add888f831ca6ecae7e8d484`.
 
 ## Local evidence
 
-- Before/after regression logs: `/tmp/w34-262k-regression-before.log` and
-  `/tmp/w34-262k-regression-after.log`.
-- Boundary probe: `/tmp/w34-27b-262k-probe.py` and
-  `/tmp/w34-27b-262k-probe.log`.
-- `/tmp/w34-27b-mtp-262k-fixed/`: request journal, one-second GPU/RSS samples,
+- Before/after regression logs: `/tmp/warp34-262k-regression-before.log` and
+  `/tmp/warp34-262k-regression-after.log`.
+- Boundary probe: `/tmp/warp34-27b-262k-probe.py` and
+  `/tmp/warp34-27b-262k-probe.log`.
+- `/tmp/warp34-27b-mtp-262k-fixed/`: request journal, one-second GPU/RSS samples,
   one-second server metrics, before/after summary.
 
-- `/tmp/w34-27b-mtp-192k-reserved/`, `/tmp/w34-27b-192k-probe.py` and
-  `/tmp/w34-27b-192k-probe.log`: selected-capacity evidence.
+- `/tmp/warp34-27b-mtp-192k-reserved/`, `/tmp/warp34-27b-192k-probe.py` and
+  `/tmp/warp34-27b-192k-probe.log`: selected-capacity evidence.
 - 192 Ki `summary.json` SHA-256:
   `c4ab0eab0abfe052aa6c647ae19a659303a3e2cc11960d91e59e50c361ae3a6f`.
 
-- Final MTP CLI smoke: `/tmp/w34-27b-mtp-final-smoke/` and matching `.py` / `.log`.
+- Final MTP CLI smoke: `/tmp/warp34-27b-mtp-final-smoke/` and matching `.py` / `.log`.
   Summary SHA-256: `1b5726fd3492a90eadffcd4fe6ba45a1480c2c6ba09c94e8b6de444000971e91`.
-- DFlash smoke: `/tmp/w34-27b-dflash-budget-smoke/` and matching `.py` / `.log`.
+- DFlash smoke: `/tmp/warp34-27b-dflash-budget-smoke/` and matching `.py` / `.log`.
   Summary SHA-256: `8f03829411dac227c4ff0ec7003817ea4d56f19e7168e6f593d5508794619f0e`.
 
 These are local temporary artifacts, not durable release receipts. No eight-hour

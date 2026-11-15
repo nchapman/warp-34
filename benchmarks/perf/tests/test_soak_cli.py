@@ -5,8 +5,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from w34perf.__main__ import main
-from w34perf.config import load
+from warp34perf.__main__ import main
+from warp34perf.config import load
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "campaigns/soak-coding.toml"
@@ -28,7 +28,7 @@ class SoakCliTests(unittest.TestCase):
                 "--max-rss-growth-mib", "512", "--max-gpu-growth-mib", "256"]
         for status, code in (("passed", 0), ("failed", 1)):
             with self.subTest(status=status), contextlib.redirect_stdout(io.StringIO()), \
-                    patch("w34perf.soak.execute_soak", return_value={"status": status}) as execute:
+                    patch("warp34perf.soak.execute_soak", return_value={"status": status}) as execute:
                 self.assertEqual(main(argv), code)
                 args, kwargs = execute.call_args
                 self.assertEqual(args[2], "warp34-soak")
@@ -46,7 +46,7 @@ class SoakCliTests(unittest.TestCase):
                 "--duration-s", "1", "--min-completed", "1", "--max-duration-s", "2"]
         for error, code in ((ValueError("invalid policy"), 2), (KeyboardInterrupt(), 130)):
             with self.subTest(code=code), contextlib.redirect_stderr(io.StringIO()), \
-                    patch("w34perf.soak.execute_soak", side_effect=error):
+                    patch("warp34perf.soak.execute_soak", side_effect=error):
                 self.assertEqual(main(argv), code)
 
 

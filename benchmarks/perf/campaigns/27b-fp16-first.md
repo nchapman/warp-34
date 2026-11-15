@@ -5,7 +5,7 @@ Three repetitions and **96 measured requests per engine**. See the [campaign](RE
 
 ## Aggregate output throughput
 
-| Workload | warp-34 | vLLM 0.31.0 | SGLang 0.5.19 |
+| Workload | warp34 | vLLM 0.31.0 | SGLang 0.5.19 |
 |---|---:|---:|---:|
 | Sequential decode C1 | 45.5 tok/s | 50.7 tok/s | 51.7 tok/s |
 | Throughput C8 | 287.0 tok/s | 309.1 tok/s | 226.6 tok/s |
@@ -14,7 +14,7 @@ Three repetitions and **96 measured requests per engine**. See the [campaign](RE
 
 ## Median first-output latency
 
-| Workload | warp-34 | vLLM | SGLang |
+| Workload | warp34 | vLLM | SGLang |
 |---|---:|---:|---:|
 | Sequential decode C1 | 182.4 ms | 138.7 ms | 146.1 ms |
 | Throughput C8 | 733.8 ms | 910.1 ms | 774.3 ms |
@@ -23,7 +23,7 @@ Three repetitions and **96 measured requests per engine**. See the [campaign](RE
 
 ## Median complete agent session
 
-- **warp-34: 11.90 s**
+- **warp34: 11.90 s**
 - **vLLM: 8.71 s**
 - **SGLang: 7.91 s**
 
@@ -31,7 +31,7 @@ Three repetitions and **96 measured requests per engine**. See the [campaign](RE
 
 - All engines ran serially on GPU 0; 256-token decode/throughput ceilings and 128-token agent/prefill ceilings.
 - SGLang uses cache off for the unique-prompt C1/C8 cases, then cache on for the C1 agent/prefill cases. Its eight-active cached attempt OOMed and is retained, not mixed into the comparison.
-- warp-34 uses its built-in ChatML renderer; vLLM and SGLang use the artifact template.
+- warp34 uses its built-in ChatML renderer; vLLM and SGLang use the artifact template.
 - Throughput = total reported output tokens / total measured duration over all three repetitions.
 - TTFT = median client first-output latency across measured requests; agent time includes all four turns and configured think time.
 - [Machine-readable results and evidence hashes](27b-fp16-first.results.json); [CSV](27b-fp16-first.results.csv).

@@ -11,7 +11,7 @@ that all 4-bit formats use exactly four bits/parameter or have equal quality.
    Qwen revision; verify ninfer artifact provenance before picking the exact one.
    The 4B GPTQ entries in `suite.toml` are practical local smoke examples, **not**
    a qualified match for the ninfer/placeholder GGUF entries.
-2. Use our HGPTQ for warp-34 and cyankiwi official-base AWQ for active
+2. Use our HGPTQ for warp34 and cyankiwi official-base AWQ for active
    vLLM/SGLang baselines. This is a practical comparison, not identical weights.
    Target symmetric group-size 128 if compatible. Pin every shard, scale, config,
    tokenizer, template, and any native MTP/draft sidecar with a SHA-256 inventory.
@@ -45,7 +45,7 @@ release pins deliberately and retain older reports for longitudinal comparisons.
 
 | Engine | Initial pin / source | 1 card | 2 cards | Current qualification |
 |---|---|---|---|---|
-| warp-34 | current local commit, record exact binary hash | native | tensor parallel 2 | 4B runner smoke and repeated 27B 0df FP16 one-card probes pass; full campaign pending |
+| warp34 | current local commit, record exact binary hash | native | tensor parallel 2 | 4B runner smoke and repeated 27B 0df FP16 one-card probes pass; full campaign pending |
 | vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | 27B eager c11 smoke and compiled/CUDA-graph 0df one-card probes pass; quality/two-card pending |
 | SGLang | 0.5.19 / image below | native | `--tp-size 2` | 27B 0df BF16 probes pass; FP16 needs explicit FP16 convolution history (see below); earlier startup failures retained |
 | llama.cpp | `5047748f114564fcf271e6a648f60e2d2eae6264` | all layers GPU | layer split (`--split-mode layer --tensor-split 1,1`) | Candidate source pin; artifact/build/runtime pending |
@@ -128,7 +128,7 @@ without claiming cross-format source/quality equivalence.
 
 Historical GPTQ inventory is [`qualification/27b-gptq-0df.inventory.json`](qualification/27b-gptq-0df.inventory.json),
 stable hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`.
-Old `/tmp/w34-perf-27b-gptq-inventory.json` and hash
+Old `/tmp/warp34-perf-27b-gptq-inventory.json` and hash
 `cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2`
 are **historical c11 evidence**, not an inventory to use for new runs.
 Generate fresh inventories for active AWQ/HGPTQ run bundles; do not reuse these hashes. Inventory includes sidecars, so its total size is **not**
@@ -157,10 +157,10 @@ four-turn agent replay all succeeded: **8/8 measured requests**, valid server
 usage, one repetition and 32-token output ceilings. The reduced `batch-8` case
 was **C2, not C8**; resolved values are in its manifest.
 
-Evidence: `/tmp/w34-perf-vllm27-eager-smoke/` (full resolved config, raw SSE,
-coverage, summary, checksums), `/tmp/w34-perf-vllm27-startup.log`,
-`/tmp/w34-perf-vllm27-models.json`, and
-`/tmp/w34-perf-vllm-serve-help-all.txt`. Principal evidence hashes are in the
+Evidence: `/tmp/warp34-perf-vllm27-eager-smoke/` (full resolved config, raw SSE,
+coverage, summary, checksums), `/tmp/warp34-perf-vllm27-startup.log`,
+`/tmp/warp34-perf-vllm27-models.json`, and
+`/tmp/warp34-perf-vllm-serve-help-all.txt`. Principal evidence hashes are in the
 candidate JSON. The server was stopped; quality, optimized graph mode, long
 contexts, and vLLM two-card runs are not qualified by this smoke.
 
@@ -176,7 +176,7 @@ The [active preset](qualification/27b-one-card.toml) now selects
 `cyankiwi/Qwen3.8-27B-AWQ-INT4@e3a700906e6a73ba4290b1873dc2ba8198527ab5`
 (asymmetric int4 g32 compressed-tensors) for vLLM/SGLang and
 `nchapman/Qwen3.8-27B-W4A16-HGPTQ@ae51987e3339a2a70070702548571e10fe8bcbc2`
-for warp-34. Model and tokenizer pins are explicit; artifact/template hashes
+for warp34. Model and tokenizer pins are explicit; artifact/template hashes
 remain unknown pending fresh inventory. These are unverified practical profiles,
 not identical-weight comparisons. Historical successes/failures below do not
 qualify the new artifacts. Preserve archived inventories and receipts unchanged.
@@ -219,7 +219,7 @@ of torch.compile and piecewise/full CUDA graph captures**, not `--enforce-eager`
 Its profiled KV pool holds 17,347 tokens; pools and memory are not matched to
 SGLang. This is the graph-enabled qualification recipe, not exhaustive tuning.
 
-Warp-34 also passes preflight and **42/42 requests / nine trials** on those exact
+Warp34 also passes preflight and **42/42 requests / nine trials** on those exact
 bytes with FP16 activation/KV, FP32 SSM, target-only and 1024 requested KV pages
 (16,384 tokens). Its CLI leaves CUDA graphs enabled; this HTTP suite does not
 independently profile graph execution. The exact binary hash is in the ledger.
@@ -230,7 +230,7 @@ The preset uses three repetitions of short C1 (two requests), **offered C8**
 ceilings. Raw resolved configs, SSE, coverage, summaries, checksums, startup logs
 and preflight paths/hashes are in the ledger. Inventory, model ID and indexed
 shards pass the new `preflight` command; this is **not remote loaded-byte
-attestation**. Warp-34 uses its own ChatML renderer rather than executing the
+attestation**. Warp34 uses its own ChatML renderer rather than executing the
 artifact Jinja: matching stored template hashes do not establish token-aligned
 prompts. Different dtypes, rendering and admission must remain visible.
 
@@ -300,7 +300,7 @@ Do not use a field label alone to pretend the server changed storage precision.
 
 | Engine | Baseline KV | Quantized KV candidates | Important caveats |
 |---|---|---|---|
-| warp-34 | `--kv-format fp16` | `q8_0`, `tq4`, `tq4_all` | TQ4 boundary policy is model dependent; record effective bytes/token, not just nominal bits |
+| warp34 | `--kv-format fp16` | `q8_0`, `tq4`, `tq4_all` | TQ4 boundary policy is model dependent; record effective bytes/token, not just nominal bits |
 | vLLM | `--kv-cache-dtype auto` with `--dtype half` | FP8/other formats only if pinned release + hybrid model + sm_86 kernels actually support them | No presumed sm_86 native FP8; unsupported is a retained result, not FP16 silently substituted |
 | SGLang | auto with float16 | Quantized candidates supported by pinned hybrid-model backend | Same hardware/model qualification requirement; do not assume generic CLI support proves kernel support |
 | llama.cpp | `--cache-type-k f16 --cache-type-v f16` | K/V `q8_0`, `q4_0`, mixed K8/V4 where supported | Quantized V/attention backend and hybrid model support must be tested; Q4_0 != TQ4 |
@@ -310,11 +310,11 @@ The sample ninfer entry uses INT8 because that is a documented practical serving
 profile, **not** an FP16-equivalent baseline. Add the BF16 entry for the common
 baseline lane. Do not publish its INT8 result in an FP16-KV column.
 
-For warp-34 the same one-card example can be restarted with each KV format:
+For warp34 the same one-card example can be restarted with each KV format:
 
 ```sh
 # Run separately, not concurrently:
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --kv-format q8_0 --kv-pages 4096 --port 8000
 # Copy the endpoint table to id=warp34-1-q8, kv_format=q8_0, and record this command.

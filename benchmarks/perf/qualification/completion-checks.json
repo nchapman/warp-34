@@ -2,7 +2,7 @@
   "schema_version": 1,
   "base_revision": "66974d8",
   "command": "export PATH=/opt/cuda/bin:$PATH; mise run check",
-  "gpu_isolation": "held /tmp/w34-benchmark-gpu-reservation.lock for the full command",
+  "gpu_isolation": "held /tmp/warp34-benchmark-gpu-reservation.lock for the full command",
   "exit_code": 0,
   "log": "benchmarks/perf/results/completion-full-check.log",
   "log_sha256": "e3b09f6403c18f2be98d3930d4c203a8b30f522c2687e3ab283c13eff7d786f9",

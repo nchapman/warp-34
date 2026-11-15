@@ -123,7 +123,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -149,7 +149,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],
@@ -315,7 +315,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -336,7 +336,7 @@
           "gpu_ids": "0",
           "parallelism": "TP=1; routed EP=1",
           "speculation": "mtp-k3",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
           "enabled": true
         }
       ],
@@ -502,7 +502,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -523,7 +523,7 @@
           "gpu_ids": "0",
           "parallelism": "TP=1; routed EP=1",
           "speculation": "none",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],
@@ -689,7 +689,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -715,7 +715,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],
@@ -881,7 +881,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -902,7 +902,7 @@
           "gpu_ids": "0,1",
           "parallelism": "TP=2; routed EP=2",
           "speculation": "mtp-k3",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
           "enabled": true
         }
       ],
@@ -1068,7 +1068,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1089,7 +1089,7 @@
           "gpu_ids": "0,1",
           "parallelism": "TP=2; routed EP=2",
           "speculation": "none",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],
@@ -1255,7 +1255,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1281,7 +1281,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],
@@ -1366,7 +1366,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1387,7 +1387,7 @@
           "gpu_ids": "0",
           "parallelism": "TP=1; routed EP=1",
           "speculation": "mtp-k3",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
           "enabled": true
         }
       ],
@@ -1507,7 +1507,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1528,7 +1528,7 @@
           "gpu_ids": "0",
           "parallelism": "TP=1; routed EP=1",
           "speculation": "none",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],
@@ -1648,7 +1648,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1674,7 +1674,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],
@@ -1759,7 +1759,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1780,7 +1780,7 @@
           "gpu_ids": "0,1",
           "parallelism": "TP=2; routed EP=2",
           "speculation": "mtp-k3",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
           "enabled": true
         }
       ],
@@ -1900,7 +1900,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -1921,7 +1921,7 @@
           "gpu_ids": "0,1",
           "parallelism": "TP=2; routed EP=2",
           "speculation": "none",
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],
@@ -2041,7 +2041,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -2067,7 +2067,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],
@@ -2187,7 +2187,7 @@
         {
           "support": "unverified",
           "cohort": "flash-next-hgptq-serving",
-          "engine": "warp-34",
+          "engine": "warp34",
           "version": "b7f5fdd",
           "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
           "base_url": "http://127.0.0.1:18034/v1",
@@ -2213,7 +2213,7 @@
           "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
           "draft_activation_dtype": "bfloat16",
           "draft_block_size": 8,
-          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp34/target/release/warp34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
           "enabled": true
         }
       ],

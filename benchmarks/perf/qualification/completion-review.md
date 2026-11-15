@@ -24,7 +24,7 @@ Report: `.pi/review/call_4ff4c994121542f5ab5b445b115c6cf2_fc_0e0c1a151f17172e016
 
 - **Important calibration finding rejected with measured evidence.** Independently
   re-ran `tools/perf_calibrate_quality.py` against both pinned model snapshots to
-  `/tmp/w34-flash-calibration-review.json` and `/tmp/w34-27b-calibration-review.json`.
+  `/tmp/warp34-flash-calibration-review.json` and `/tmp/warp34-27b-calibration-review.json`.
   Each generated JSON equals its corresponding retained ledger exactly, including
   distinct tokenizer/template hashes. Both independently produce counts
   `32340,32340,127540,127541,251641,251640`. Different tokenizer/template files can

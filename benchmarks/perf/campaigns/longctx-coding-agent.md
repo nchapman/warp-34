@@ -16,7 +16,7 @@ These traces do not measure successful software repair.
 
 All six candidate suites below were measured serially on a single frozen release
 build (`crates_tree_sha256=e1b67ef230877a0facb487401ab037c3ba15660c5e969444b782bfadfc6350e0`,
-`w34` `binary_sha256=b125f589aa1f567420f6ce11e0a713db1e4dd1e202ca3df45bb6f648f12fcb4b`,
+`warp34` `binary_sha256=b125f589aa1f567420f6ce11e0a713db1e4dd1e202ca3df45bb6f648f12fcb4b`,
 `needle_gate` `d347dde3399f0e73827ab6f88361c424564b667b5af08fdd5cd1a87963bab6c3`,
 recorded in `results/goal-provenance.json`) with no GPU co-residency, reusing the
 identical fixtures, TOMLs, and pinned model snapshots; retained competitor rows
@@ -29,7 +29,7 @@ strict 256-token mixed decode/prefill cap preserved):
   `U`/`K` and `__half2` `s_H` stores (`kWyStage2SmemBytes=43520`, 128 regs, `STACK:0`),
   paired `__half2` `gdn_causal_conv1d_pair_f16_kernel` (`REG:40 STACK:0`, 4B alignment
   guard), and exact `grid_upper_chunks` checkpoint `H`-slot sizing.
-- **`op_sampler.cu`**: two-stage `w34_sampler_step_fast_greedy_masked_f16` (`REG:40/31 STACK:0`)
+- **`op_sampler.cu`**: two-stage `warp34_sampler_step_fast_greedy_masked_f16` (`REG:40/31 STACK:0`)
   replacing the 174 µs scalar masked sampler under stateful `tool_choice: "none"` bitmasks
   with 0-ULP parity.
 - **Attention, scratch & scheduler**: packed multi-request FP16 FA2 (`64x64`), Q8_0-only
@@ -42,28 +42,28 @@ strict 256-token mixed decode/prefill cap preserved):
 
 | Deployment | 59K agent C1 tok/s | 59K agent C2 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s |
 |---|---:|---:|---:|---:|---:|
-| **warp-34 FP16 (`goal-9b-fp16`)** | **27.02** | **28.91** | **14.51** | **14.61** | **36.28** |
-| **warp-34 TQ4 (`goal-9b-tq4`)** | **22.07** | **20.79** | **10.74** | **18.15** | **50.07** |
+| **warp34 FP16 (`goal-9b-fp16`)** | **27.02** | **28.91** | **14.51** | **14.61** | **36.28** |
+| **warp34 TQ4 (`goal-9b-tq4`)** | **22.07** | **20.79** | **10.74** | **18.15** | **50.07** |
 | vLLM 0.31.0 FP16 (retained) | 25.98 | 28.74 | 13.75 | 14.86 | 36.39 |
 | SGLang 0.5.19 FP16 (retained) | 26.14 | 28.81 | 13.62 | 15.26 | 37.59 |
 
-On 9B TP=1 FP16, `warp-34` exceeds both `vLLM 0.31.0` and `SGLang 0.5.19` across
+On 9B TP=1 FP16, `warp34` exceeds both `vLLM 0.31.0` and `SGLang 0.5.19` across
 all five cases (59K C1 `+4.0% / +3.4%`, 59K C2 `+0.6% / +0.4%` with warm-turn p50
 TTFT `383 / 517 ms`, 118K C1 `+5.6% / +6.6%` with warm-turn p50 TTFT `462 ms`, and
 lower cold 57.6K / 115.1K TTFT). 9B TQ4 improves `+8.7% / +18.3% / +10.8%` on
 59K C1 / 59K C2 / 118K C1 and `-10.4% / -11.3%` on 57.6K / 115.1K cold TTFT vs the
-original `warp-34` TQ4 baseline.
+original `warp34` TQ4 baseline.
 
 ### 27B TP=2: 84/84 candidate HTTP requests passed (42/42 FP16, 42/42 TQ4)
 
 | Deployment | 59K agent C1 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s | Warm-turn TTFT 59K / 118K ms |
 |---|---:|---:|---:|---:|---:|
-| **warp-34 FP16 (`goal-27b-tp2-fp16`)** | **13.60** | **6.96** | **33.96** | **78.79** | **837 / 1,012** |
-| **warp-34 TQ4 (`goal-27b-tp2-tq4`)** | **11.97** | **5.62** | **39.18** | **98.11** | **1,013 / 1,272** |
+| **warp34 FP16 (`goal-27b-tp2-fp16`)** | **13.60** | **6.96** | **33.96** | **78.79** | **837 / 1,012** |
+| **warp34 TQ4 (`goal-27b-tp2-tq4`)** | **11.97** | **5.62** | **39.18** | **98.11** | **1,013 / 1,272** |
 | vLLM 0.31.0 FP16 (retained) | 11.97 | 6.40 | 35.68 | 83.15 | 1,231 / 1,667 |
 | SGLang 0.5.19 FP16 (retained) | 12.00 | 6.44 | 36.58 | 85.07 | 1,339 / 1,307 |
 
-On 27B TP=2 FP16 over PCIe Gen4 x8 (no P2P/NVLink), `warp-34` exceeds both
+On 27B TP=2 FP16 over PCIe Gen4 x8 (no P2P/NVLink), `warp34` exceeds both
 `vLLM 0.31.0` and `SGLang 0.5.19` across all four cases (59K C1 `+13.6% / +13.3%`,
 118K C1 `+8.8% / +8.1%`, cold 57.6K TTFT `-4.8% / -7.2%`, cold 115.1K TTFT
 `-5.2% / -7.4%`, and warm-turn p50 TTFT `-32.0% / -37.5%` at 59K and `-39.3% / -22.5%`
@@ -92,18 +92,18 @@ includes prefill and finite-session fill/drain, not just decode.
 
 | Deployment | 59K agent C1 tok/s | 59K agent C2 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s |
 |---|---:|---:|---:|---:|---:|
-| warp-34 FP16 | 23.53 | 21.53 | 13.41 | 16.09 | 40.07 |
-| warp-34 TQ4 | 20.30 | 17.58 | 9.69 | 20.26 | 56.43 |
+| warp34 FP16 | 23.53 | 21.53 | 13.41 | 16.09 | 40.07 |
+| warp34 TQ4 | 20.30 | 17.58 | 9.69 | 20.26 | 56.43 |
 | vLLM 0.31.0 FP16 | 25.98 | 28.74 | 13.75 | 14.86 | 36.39 |
 | SGLang 0.5.19 FP16 | 26.14 | 28.81 | 13.62 | 15.26 | 37.59 |
 
 **No overall long-context win:** competitors lead cold prefill and C2 throughput.
-Warp-34 FP16 has lower agent C1 median first-output latency (511.80/706.28 ms at
+Warp34 FP16 has lower agent C1 median first-output latency (511.80/706.28 ms at
 59K/118K vs vLLM 590.37/834.00 and SGLang 628.26/870.63 ms), but that does not
 outweigh its cold bursts in total session throughput.
 
 Multi-request 64-query-row dispatch improved measured C2 throughput from
-13.43 → 21.53 tok/s (FP16) and 8.41 → 17.58 tok/s (TQ4). The earlier raw warp-34
+13.43 → 21.53 tok/s (FP16) and 8.41 → 17.58 tok/s (TQ4). The earlier raw warp34
 run directories were overwritten during the experiment, so these before values
 are session observations, not a retained independently re-auditable A/B bundle.
 
@@ -112,7 +112,7 @@ Retained bundles under `benchmarks/perf/results/`:
 `9b_longctx_vllm_fp16`, `9b_longctx_sglang_fp16`.
 The 9B competitor runs predate enabling cache-detail flags: their cache accounting
 is **unknown**, not zero. Updated TOMLs enable those flags for future runs.
-Warp-34 reports approximately 82.3–82.6% token-weighted prefix hits.
+Warp34 reports approximately 82.3–82.6% token-weighted prefix hits.
 
 ## 27B, TP=2
 
@@ -121,13 +121,13 @@ Each completed deployment below served 42/42 measured requests.
 
 | Deployment | 59K agent C1 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s | Warm-turn TTFT 59K / 118K ms |
 |---|---:|---:|---:|---:|---:|
-| warp-34 FP16 | 12.68 | 6.38 | 36.85 | 86.41 | 901 / 1042 |
-| warp-34 TQ4 | 11.16 | 5.55 | 40.19 | 100.21 | 1084 / 1310 |
+| warp34 FP16 | 12.68 | 6.38 | 36.85 | 86.41 | 901 / 1042 |
+| warp34 TQ4 | 11.16 | 5.55 | 40.19 | 100.21 | 1084 / 1310 |
 | vLLM 0.31.0 FP16 | 11.97 | 6.40 | 35.68 | 83.15 | 1231 / 1667 |
 | SGLang 0.5.19 FP16 | 12.00 | 6.44 | 36.58 | 85.07 | 1339 / 1307 |
 
 vLLM uses `--enable-prompt-tokens-details`; these warm-turn statistics use actual
-reported cache counts. Warp-34 FP16 improves the 59K session throughput and warm
+reported cache counts. Warp34 FP16 improves the 59K session throughput and warm
 TTFT, is essentially tied at 118K total throughput, and remains slower on cold
 reads. SGLang completed all 42/42 requests. Its `--enable-cache-report` emits
 null cache details on some requests (including the initial cold request), so total
@@ -195,7 +195,7 @@ The latter is kernel time, not a 2× end-to-end claim. JSON copies are retained 
 A clean `git archive a77ce42` release build provides the 9B baseline. On GPU 1,
 65,536-token TP=1 TQ4 prefill improved **34,475.33 → 23,329.80 ms**
 (**1,900.95 → 2,809.11 prompt tok/s**, +47.8% throughput, 32.3% lower TTFT).
-Both generated `[13, 220, 760, 3841]`. Commands used `w34 bench --tp 1 --stage
+Both generated `[13, 220, 760, 3841]`. Commands used `warp34 bench --tp 1 --stage
 decode --kv-format tq4 --kv-pages 4224 --prompt-len 65536 --gen-len 4` with the
 pinned 9B model; JSONs are `results/prefill64q-ab/9b-64k-{before,after}.json`.
 GPU 0 concurrently ran the 27B TP=1 HTTP campaign; there was no GPU co-residency,

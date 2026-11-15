@@ -379,7 +379,7 @@ export const ENDPOINTS: EndpointSpec[] = [
         description: "Legacy /v1/completions with top token logprobs",
         buildBody: (model) => ({
           model,
-          prompt: 'pub unsafe extern "C" fn w34_all_reduce_sum_f16(',
+          prompt: 'pub unsafe extern "C" fn warp34_all_reduce_sum_f16(',
           max_tokens: 64,
           temperature: 0,
           logprobs: 3,
@@ -405,7 +405,7 @@ export const ENDPOINTS: EndpointSpec[] = [
         buildBody: (model) => ({
           model,
           context:
-            "PR #412 modifies crates/w34-kernels/csrc/ops/op_paged_attn.cu to add FP8 E4M3 tail anchors on sm_89+. All 117 compute-sanitizer runs pass.",
+            "PR #412 modifies crates/warp34-kernels/csrc/ops/op_paged_attn.cu to add FP8 E4M3 tail anchors on sm_89+. All 117 compute-sanitizer runs pass.",
           decisions: [
             {
               id: "requires_gpu_ci",
@@ -502,7 +502,7 @@ export const ENDPOINTS: EndpointSpec[] = [
         label: "Encode Text -> Token IDs",
         description: "Tokenizes raw text using the loaded HF tokenizer",
         buildBody: () => ({
-          prompt: "<|im_start|>user\nHello from warp-34!<|im_end|>",
+          prompt: "<|im_start|>user\nHello from warp34!<|im_end|>",
         }),
       },
     ],

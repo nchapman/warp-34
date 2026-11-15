@@ -100,7 +100,7 @@ def host():
         label = 'baseline' if steps == 0 else f'nextn{steps}'
         result = outdir / f'{PREFIX}_{label}.json'
         log = outdir / f'{PREFIX}_{label}.log'
-        name = f'w34-sglang-mtp-oracle-{os.getpid()}-{steps}'
+        name = f'warp34-sglang-mtp-oracle-{os.getpid()}-{steps}'
         cmd = ['docker', 'run', '--rm', '--name', name, '--network', 'none',
                '--gpus', 'device=0', '--shm-size', '8g',
                '-e', 'CUDA_VISIBLE_DEVICES=0', '-e', 'HF_HUB_OFFLINE=1',

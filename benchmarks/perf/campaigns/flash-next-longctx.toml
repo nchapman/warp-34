@@ -16,7 +16,7 @@ repetitions = 3
 cases = ["cold-read-60k", "agent-120k", "agent-252k"]
 repetitions = 5
 [engine_defaults]
-engine = "warp-34"
+engine = "warp34"
 version = "66974d8; f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f"
 support = "unverified"
 cohort = "flash-next-ef554-capacity"
@@ -43,7 +43,7 @@ chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df
 weight_format = "HGPTQ-W4A16"
 quantization_details = "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms"
 cache_config = "TQ4 KV, 16384 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-flash-tp2-capacity"
@@ -59,7 +59,7 @@ chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df
 weight_format = "HGPTQ-W4A16"
 quantization_details = "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms"
 cache_config = "TQ4 KV, 16384 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "qfn-2x3090-capacity"
@@ -72,7 +72,7 @@ activation_dtype = "bfloat16"
 kv_format = "bfloat16"
 speculation = "mtp-k3"
 cache_config = "128GB reference profile; hot84; CPU offload30GB; mmap PLE; BF16 KV4429185024 bytes; context262144; max seq1; chunk4096; approximate QSA; OS cache not flushed"
-launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+launch_command = "cd /tmp/warp34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/warp34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=warp34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
 
 [[cases]]
 id = "cold-read-60k"

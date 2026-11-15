@@ -18,7 +18,7 @@
 | **LM Head Logits & GPU Sampler (`SamplerV1`)** | `FP16` GEMM output -> **`FP32` sampler logits** | `FP32` penalties, temperature, softmax, top-k/top-p, logprobs | Prevents ties/saturation during temperature scaling, Gumbel-max sampling, and logprob computation. |
 | **`TP=2` / `TP=4` Collectives** | Typed per payload (`FP16`, `BF16`, `FP32`, `INT32`) | `FP32` sum for `FP16`/`BF16`/`FP32`; exact `INT32` for token IDs | Never cast token IDs (`vocab_size = 248,320 > 65,504`) or counters through `FP16`. |
 
-## 2. Loader Dtype Enforcement Rules (`w34-host::loader`)
+## 2. Loader Dtype Enforcement Rules (`warp34-host::loader`)
 
 When loading any Safetensors checkpoint:
 1. **Target Model (`qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen4_exp`, `qwen4_exp_text`):**
@@ -27,4 +27,4 @@ When loading any Safetensors checkpoint:
    - Quantized weights (`qweight` / `weight_packed`, `scales` / `weight_scale`, `qzeros` / `weight_zero_point`, `g_idx`) are repacked once at load time into the unified **Marlin `W4A16` / `W8A16` tile layout** with `FP16` scales.
 2. **Drafter Model (`dflash2`):**
    - Inspects `torch_dtype` / tensor dtype in the checkpoint header.
-   - If the drafter checkpoint is `BF16` and max weight/scale dynamic range or `config.json` specifies `bfloat16` (mandatory for `Qwen3.5-4B-DFlash2`), weights and execution buffers remain native **`BF16` (`W34_DTYPE_BF16`)**. Target hidden-state taps (`FP16`) are converted `FP16 -> BF16` inside the fused target-tap projection kernel.
+   - If the drafter checkpoint is `BF16` and max weight/scale dynamic range or `config.json` specifies `bfloat16` (mandatory for `Qwen3.5-4B-DFlash2`), weights and execution buffers remain native **`BF16` (`WARP34_DTYPE_BF16`)**. Target hidden-state taps (`FP16`) are converted `FP16 -> BF16` inside the fused target-tap projection kernel.

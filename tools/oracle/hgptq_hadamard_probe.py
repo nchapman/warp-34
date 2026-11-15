@@ -4,10 +4,10 @@
 Build the standalone probe library (no engine weights required):
   /opt/cuda/bin/nvcc -std=c++17 -O3 --shared -Xcompiler -fPIC \
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
-    crates/w34-kernels/csrc/ops/op_hadamard.cu -o /tmp/w34_hadamard.so
+    crates/warp34-kernels/csrc/ops/op_hadamard.cu -o /tmp/warp34_hadamard.so
 Run on an idle card:
   CUDA_VISIBLE_DEVICES=0 python3 tools/oracle/hgptq_hadamard_probe.py \
-    --library /tmp/w34_hadamard.so
+    --library /tmp/warp34_hadamard.so
 
 Timings use CUDA graphs for both implementations and exclude Python launch
 latency. This is an op-level comparison, not an end-to-end HGPTQ benchmark.
@@ -35,7 +35,7 @@ def main():
     from vllm import _custom_ops as ops
 
     lib = ctypes.CDLL(args.library)
-    transform = lib.w34_block_hadamard_f16
+    transform = lib.warp34_block_hadamard_f16
     transform.argtypes = [ctypes.POINTER(Exec), ctypes.c_void_p, ctypes.c_void_p] + [ctypes.c_int] * 4
     transform.restype = ctypes.c_int
     torch.manual_seed(42)
@@ -70,7 +70,7 @@ def main():
                 def native():
                     rc = transform(ctypes.byref(ex), x.data_ptr(), out.data_ptr(), rows, k, padded_k, block)
                     if rc:
-                        raise RuntimeError(f"w34_block_hadamard_f16 returned {rc}")
+                        raise RuntimeError(f"warp34_block_hadamard_f16 returned {rc}")
                     return out
 
                 def donor():

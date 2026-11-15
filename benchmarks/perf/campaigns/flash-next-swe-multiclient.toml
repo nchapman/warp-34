@@ -43,16 +43,16 @@ request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-flash-tp2"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 4 MTP batch slots), QSA side caches, MambaRadixCache (18 GDN slots), target hot112/layer/rank, MTP hot192, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "warp34-flash-tp2-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 kv_format = "tq4"
 speculation = "dflash2"
@@ -62,20 +62,20 @@ draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827af
 draft_activation_dtype = "bfloat16"
 draft_block_size = 8
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 8 DFlash2 batch slots), QSA side caches, MambaRadixCache (13 GDN slots), target hot112/layer/rank, DFlash2 M=8, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "warp34-flash-tp2-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens), QSA side caches, MambaRadixCache (18 GDN slots), target hot112/layer/rank, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "warp34-flash-tp1"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 gpu_count = 1
 gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
@@ -83,11 +83,11 @@ parallelism = "single"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 4 MTP batch slots), QSA side caches, MambaRadixCache (20 GDN slots), target hot48/layer, MTP hot192, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "warp34-flash-tp1-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 gpu_count = 1
 gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
@@ -100,11 +100,11 @@ draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827af
 draft_activation_dtype = "bfloat16"
 draft_block_size = 8
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 8 DFlash2 batch slots), QSA side caches, MambaRadixCache (14 GDN slots), target hot48/layer, DFlash2 M=8, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "warp34-flash-tp1-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "6b2ec97"
 gpu_count = 1
 gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
@@ -112,7 +112,7 @@ parallelism = "single"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens), QSA side caches, MambaRadixCache (20 GDN slots), target hot48/layer, max_num_seqs 4, max_model_len 16384"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
 
 [[engines]]
 id = "qfn-2x3090-mtp3"
@@ -131,7 +131,7 @@ activation_dtype = "bfloat16"
 kv_format = "bfloat16"
 speculation = "mtp-k3"
 cache_config = "128GB profile: hot84, dynamic LRU/mixed VMM, UVA expert offload 30 GB, CPU PLE; BF16 KV 4429185024 bytes, max len 262144, max seqs 1, chunk4096; prefix caching enabled"
-launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18836 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+launch_command = "cd /tmp/warp34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/warp34-benchmark-models/flash-next PORT=18836 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=warp34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
 
 [[engines]]
 id = "qfn-3090-mtp3"
@@ -150,7 +150,7 @@ activation_dtype = "bfloat16"
 kv_format = "int8_per_token_head"
 speculation = "mtp-k3; filtered draft vocabulary"
 cache_config = "default 3090-64gb-128k profile: hot32; CPU arena auto; mmap PLE; int8 KV3050000000 bytes; max len135168; seq1; chunk8192"
-launch_command = "cd /tmp/w34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18836 GPU_DEVICE=1 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
+launch_command = "cd /tmp/warp34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/warp34-benchmark-models/flash-next PORT=18836 GPU_DEVICE=1 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=warp34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
 
 [[engines]]
 id = "strata-flash-tp1"
@@ -169,7 +169,7 @@ activation_dtype = "source-native mixed BF16/F32"
 kv_format = "fp16"
 speculation = "prompt-lookup-4"
 cache_config = "72GiB resident budget; mmap native GGUF; auto GPU expert cache; embedded IQ4_NL PLE; context 16384; prefill 512; conversation cache"
-launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m serve.server --engine strata --config /tmp/w34-strata-swe-16k.json --host 127.0.0.1 --port 18836 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+launch_command = "cd /tmp/warp34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m serve.server --engine strata --config /tmp/warp34-strata-swe-16k.json --host 127.0.0.1 --port 18836 --offline --no-api-key --no-fit-max-tokens --parallel 1"
 
 [[engines]]
 id = "strata-flash-tp2"
@@ -188,7 +188,7 @@ activation_dtype = "source-native mixed BF16/F32"
 kv_format = "fp16"
 speculation = "prompt-lookup-4"
 cache_config = "72GiB resident budget; mmap native GGUF; 2-GPU layer split; auto GPU expert cache; embedded IQ4_NL PLE; context 16384; prefill 512; conversation cache"
-launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH .venv/bin/python -m serve.server --engine strata --config /tmp/w34-strata-swe-16k.json --gpu 0,1 --host 127.0.0.1 --port 18836 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+launch_command = "cd /tmp/warp34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH .venv/bin/python -m serve.server --engine strata --config /tmp/warp34-strata-swe-16k.json --gpu 0,1 --host 127.0.0.1 --port 18836 --offline --no-api-key --no-fit-max-tokens --parallel 1"
 
 [[cases]]
 id = "smoke-warmup"

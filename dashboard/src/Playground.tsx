@@ -79,7 +79,7 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
         resolve(result);
         return;
       }
-      // Transcode WebP/GIF/BMP to PNG data URL so warp-34's native Rust PNG/JPEG decoder accepts it
+      // Transcode WebP/GIF/BMP to PNG data URL so warp34's native Rust PNG/JPEG decoder accepts it
       const img = new Image();
       img.onload = () => {
         const rawW = img.naturalWidth || img.width || 64;

@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from w34perf.soak import execute_soak
+from warp34perf.soak import execute_soak
 
 
 def configuration():
@@ -26,7 +26,7 @@ class WorkloadContracts(unittest.TestCase):
             cfg["cases"][0].update(arrival=arrival, rate_rps=4)
             with self.subTest(arrival=arrival), tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / "run"
-                with patch("w34perf.soak.authorization", side_effect=AssertionError("validation must precede setup")):
+                with patch("warp34perf.soak.authorization", side_effect=AssertionError("validation must precede setup")):
                     with self.assertRaisesRegex(ValueError, "closed"):
                         execute_soak(cfg, out, "fake", duration_s=1, min_completed=1, max_duration_s=2)
                 self.assertFalse(out.exists())
@@ -45,10 +45,10 @@ class WorkloadContracts(unittest.TestCase):
                     "first_output_ms": 1, "last_output_ms": 2, "e2e_ms": 3}
 
         with tempfile.TemporaryDirectory() as tmp, \
-                patch("w34perf.soak.stream", side_effect=stream), \
-                patch("w34perf.soak.time.monotonic", side_effect=lambda: now[0]), \
-                patch("w34perf.soak.provenance", return_value={}), \
-                patch("w34perf.soak.TelemetrySampler") as sampler:
+                patch("warp34perf.soak.stream", side_effect=stream), \
+                patch("warp34perf.soak.time.monotonic", side_effect=lambda: now[0]), \
+                patch("warp34perf.soak.provenance", return_value={}), \
+                patch("warp34perf.soak.TelemetrySampler") as sampler:
             sampler.return_value.sample.return_value = {"gpus": [], "pid_rss_kib": {}, "errors": []}
             out = Path(tmp) / "run"
             result = execute_soak(cfg, out, "fake", duration_s=1.5, min_completed=15,
@@ -68,7 +68,7 @@ class WorkloadContracts(unittest.TestCase):
                     self.assertEqual({p["messages"][1]["content"] for p in payloads}, {"first", "second"})
 
     def test_multi_trajectory_agent_replay_rotates_instances_and_validates_schema(self):
-        from w34perf.config import load as load_cfg
+        from warp34perf.config import load as load_cfg
 
         multi_fixture = {
             "source": "nvidia/Open-SWE-Traces@test",
@@ -103,7 +103,7 @@ timeout_s = 1
 warmup_requests = 0
 [[engines]]
 id = "fake"
-engine = "warp-34"
+engine = "warp34"
 version = "test"
 model = "fake"
 model_revision = "test"
@@ -112,7 +112,7 @@ kv_format = "tq4"
 parallelism = "single"
 speculation = "mtp-3"
 cache_config = "test"
-launch_command = "w34 serve"
+launch_command = "warp34 serve"
 gpu_count = 1
 base_url = "http://127.0.0.1:1/v1"
 [[cases]]
@@ -138,10 +138,10 @@ cache = "natural"
                         "first_output_ms": 1, "last_output_ms": 2, "e2e_ms": 3}
 
             out = tmp_path / "run"
-            with patch("w34perf.soak.stream", side_effect=stream), \
-                    patch("w34perf.soak.time.monotonic", side_effect=lambda: now[0]), \
-                    patch("w34perf.soak.provenance", return_value={}), \
-                    patch("w34perf.soak.TelemetrySampler") as sampler:
+            with patch("warp34perf.soak.stream", side_effect=stream), \
+                    patch("warp34perf.soak.time.monotonic", side_effect=lambda: now[0]), \
+                    patch("warp34perf.soak.provenance", return_value={}), \
+                    patch("warp34perf.soak.TelemetrySampler") as sampler:
                 sampler.return_value.sample.return_value = {"gpus": [], "pid_rss_kib": {}, "errors": []}
                 result = execute_soak(cfg, out, "fake", duration_s=1.0, min_completed=5,
                                       max_duration_s=5, sustained_s=10, drain_s=0)

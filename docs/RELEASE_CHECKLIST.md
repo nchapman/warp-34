@@ -44,7 +44,7 @@ python3 tools/prep_test_models.py --check
 python3 tools/prep_test_models.py --all --check
 
 # Actual CUDA release suite; helper-based missing prerequisites must fail.
-CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check
+CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check
 
 # Broader CPU integration coverage than the current hosted CI job.
 mise run test-cpu
@@ -55,12 +55,12 @@ mise run test-cpu
 Strict mode does **not** execute `#[ignore]` tests or guarantee that topology/VRAM-specific branches ran. List available tests, read their prerequisites, and run selected qualification cases explicitly. Examples (require appropriate real checkpoints and two sufficiently sized GPUs):
 
 ```sh
-CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 \
+CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 \
   cargo test --release --features cuda --test qwen4_flash_next \
   test_qwen4_flash_next_128tok_plain_mtp3_dflash2_exact_parity \
   -- --ignored --exact --test-threads=1 --nocapture
 
-CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 \
+CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 \
   cargo test --release --features cuda --test quant_formats \
   cached_hf_quantized_and_unquantized_checkpoints \
   -- --ignored --exact --test-threads=1 --nocapture
@@ -68,15 +68,15 @@ CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 \
 
 For TP4/NVLink, run the relevant `collectives_and_gdn_wy` cases and selected full-model parity on that hardware, recording **which transport and branches actually executed**. Two visible GPUs do not qualify four ranks; two PCIe cards do not qualify P2P/NVLink.
 
-Use the existing `benchmarks/perf/` campaign tooling and `tools/oracle/` drivers as starting points for G2/G3/G5. The new [`w34perf soak` mode](../benchmarks/perf/SOAK.md) enforces duration **and** successful-completion targets, sustained/burst admission, local disconnect injection, completion-progress and optional endpoint memory-growth gates, and a post-drain inference probe. Its checked-in coding campaign is synthetic/replay, not a production trace corpus; select approved representative fixtures and thresholds first. A passing short harness smoke is not G3 qualification, and image/grammar/Responses-cancel mixtures, internal ownership checks and supervisor recovery still require separate exercises. `mise run oracle-check` tests the Python tooling; it is not a live vLLM/SGLang parity run. `mise run vision-gates` and `mise run needle-gates` are opt-in GPU/model campaigns; inspect the commands and pins before executing. Existing short benchmark campaigns are not automatically the sustained G3 soak. Additional workload/failure drivers may be needed.
+Use the existing `benchmarks/perf/` campaign tooling and `tools/oracle/` drivers as starting points for G2/G3/G5. The new [`warp34perf soak` mode](../benchmarks/perf/SOAK.md) enforces duration **and** successful-completion targets, sustained/burst admission, local disconnect injection, completion-progress and optional endpoint memory-growth gates, and a post-drain inference probe. Its checked-in coding campaign is synthetic/replay, not a production trace corpus; select approved representative fixtures and thresholds first. A passing short harness smoke is not G3 qualification, and image/grammar/Responses-cancel mixtures, internal ownership checks and supervisor recovery still require separate exercises. `mise run oracle-check` tests the Python tooling; it is not a live vLLM/SGLang parity run. `mise run vision-gates` and `mise run needle-gates` are opt-in GPU/model campaigns; inspect the commands and pins before executing. Existing short benchmark campaigns are not automatically the sustained G3 soak. Additional workload/failure drivers may be needed.
 
 ## Fresh verification from this assessment
 
 - Source: `507661b0e1271e4f3757e824aa1fe1b7c3baf811`, 2026-11-09; this assessment changes documentation only.
 - Hardware: two RTX 3090 Ti GPUs; no compute processes reported before starting; approximately 24 GiB free per card.
 - `python3 tools/prep_test_models.py --check`: **PASS**, 15 tracked fixtures plus the four core snapshot entries. The 27B drafter prerequisite is config-only; this does not verify all optional real-model artifacts.
-- `CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`: **PASS**, exit 0 in 332.79 seconds. **476 Rust tests passed, 0 failed, 13 ignored** (49 test-result summaries, including doctests); 69 oracle-tooling, 91 performance-tooling and 18 dashboard tests passed. Formatting, both Clippy modes and rustdoc also passed. Driver `615.71.09`; two `24,564 MiB` cards, `PHB` topology.
-- Local raw log: `/tmp/w34-readiness-check-507661b.log`, SHA-256 `aee547d5a60fa7772bc40f88f2a5bffc61711ce2584f61c7a0f3115e2eea00c7`. This checked-in summary preserves the outcome, not the raw log; upload the log to durable release storage before using it as a release receipt. No printed `[SKIP]` lines were captured, but passing-test output is normally captured by Cargo: this is **not** proof that every conditional branch executed.
+- `CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`: **PASS**, exit 0 in 332.79 seconds. **476 Rust tests passed, 0 failed, 13 ignored** (49 test-result summaries, including doctests); 69 oracle-tooling, 91 performance-tooling and 18 dashboard tests passed. Formatting, both Clippy modes and rustdoc also passed. Driver `615.71.09`; two `24,564 MiB` cards, `PHB` topology.
+- Local raw log: `/tmp/warp34-readiness-check-507661b.log`, SHA-256 `aee547d5a60fa7772bc40f88f2a5bffc61711ce2584f61c7a0f3115e2eea00c7`. This checked-in summary preserves the outcome, not the raw log; upload the log to durable release storage before using it as a release receipt. No printed `[SKIP]` lines were captured, but passing-test output is normally captured by Cargo: this is **not** proof that every conditional branch executed.
 - Ignored cases: `bench_prefill_query_tiles`, `benchmark_flash_next_pool`, `canonical_checkpoint_host_store_tp1_and_ep2_agree`, `pinned_hgptq_dflash2_lossless_and_tp2`, `pinned_hgptq_moe_35b_text_vision_mtp_and_tp2`, `pinned_hgptq_text_graph_mtp_and_tp2`, `pinned_hgptq_vision_matches_vllm_and_tp2`, `benchmark_block_hadamard`, `cached_hf_quantized_and_unquantized_checkpoints`, `test_qwen4_exp_real_checkpoint_tp1_and_tp2`, `test_qwen4_flash_next_128tok_plain_mtp3_dflash2_exact_parity`, `test_qwen4_exp_reference_bench_suite`, and `benchmark_cached_qwen_constraint`. These include qualification tests, not just optional timing benchmarks.
 - Fresh ignored real-model/format qualification, external oracle, performance/quality campaign, sustained soak, container, Ada, NVLink and TP4 runs: **not performed in this assessment**.
 
@@ -85,13 +85,13 @@ Use the existing `benchmarks/perf/` campaign tooling and `tools/oracle/` drivers
 Source: the hardening changes committed with this receipt on `fix/production-lifecycle-hardening`, parent `bc2a3e5`. This supplements rather than replaces the documentation-only baseline above.
 
 - Same local two RTX 3090 Ti / driver 615.71.09 / PHB setup; GPUs idle before and after the campaign.
-- `CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`: **PASS**, exit 0, 346.83 seconds; **491 Rust tests passed, 0 failed, 13 ignored**, 69 oracle-tooling, 91 performance-tooling and 18 dashboard tests. Formatting, both Clippy modes and rustdoc passed. The ignored inventory above is unchanged. An earlier attempt failed the new test modules' placement lint; corrected before this rerun.
-- Full-check log: `/tmp/w34-lifecycle-hardening-check-final.log`, SHA-256 `7b875a4b965d4ec86db91a6a7575ca2f91916f77486ed373913002f0a62f6f85`.
+- `CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`: **PASS**, exit 0, 346.83 seconds; **491 Rust tests passed, 0 failed, 13 ignored**, 69 oracle-tooling, 91 performance-tooling and 18 dashboard tests. Formatting, both Clippy modes and rustdoc passed. The ignored inventory above is unchanged. An earlier attempt failed the new test modules' placement lint; corrected before this rerun.
+- Full-check log: `/tmp/warp34-lifecycle-hardening-check-final.log`, SHA-256 `7b875a4b965d4ec86db91a6a7575ca2f91916f77486ed373913002f0a62f6f85`.
 - Targeted live Responses cancellation/readiness and native sampled-terminal-grammar tests also passed independently. The source review reported no actionable findings.
 - `cargo build --release --features cuda` and three sequential benchmark smoke runs passed, using `CUDA_VISIBLE_DEVICES=0,1 CUDA_DISABLE_PTX_JIT=1` and the common command below (default TP1). Each reported radix/vision lossless parity, distinct-image cache isolation, eight active scheduler sequences and 256 total scheduler output tokens.
 
 ```sh
-./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
+./target/release/warp34 bench --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
 # Repeat with --speculative mtp --mtp-k 3
 # Repeat with --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
@@ -99,9 +99,9 @@ Source: the hardening changes committed with this receipt on `fix/production-lif
 
 | Mode | Decode tok/s (single run) | Local log | SHA-256 |
 |---|---:|---|---|
-| Plain | 211.68 | `/tmp/w34-lifecycle-bench-plain.log` | `238622b2cc07ff177380b94123abcab22c211b5ce0203c47ee26b70f4cfd7e3a` |
-| MTP-3 | 537.66 | `/tmp/w34-lifecycle-bench-mtp.log` | `b0c7649695f9568e58ba8c13dd994e27e580411b2a3c00da6a23a1444f53be5f` |
-| DFlash2 | 1427.58 | `/tmp/w34-lifecycle-bench-dflash2.log` | `51ee7c9b702e739ac431f228cfd235ce8b474480b24ceea2565d4bb3075dc95a` |
+| Plain | 211.68 | `/tmp/warp34-lifecycle-bench-plain.log` | `238622b2cc07ff177380b94123abcab22c211b5ce0203c47ee26b70f4cfd7e3a` |
+| MTP-3 | 537.66 | `/tmp/warp34-lifecycle-bench-mtp.log` | `b0c7649695f9568e58ba8c13dd994e27e580411b2a3c00da6a23a1444f53be5f` |
+| DFlash2 | 1427.58 | `/tmp/warp34-lifecycle-bench-dflash2.log` | `51ee7c9b702e739ac431f228cfd235ce8b474480b24ceea2565d4bb3075dc95a` |
 
 These are smoke results, not matched before/after, competitor, or sustained-load qualification. Logs remain local and need durable upload for release sign-off. Sampled stateful-grammar handoff, external hard-stop/restart rehearsal, and all previously open hardware/model/soak gates remain open. See [READINESS.md](READINESS.md#focused-lifecycle-hardening-follow-up) for scope and [SERVING.md](SERVING.md#readiness-shutdown-and-bounded-recovery) for the operational procedure.
 

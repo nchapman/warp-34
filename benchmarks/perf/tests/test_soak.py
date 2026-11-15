@@ -13,7 +13,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from w34perf import soak
+from warp34perf import soak
 
 
 def config():

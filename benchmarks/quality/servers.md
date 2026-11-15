@@ -12,7 +12,7 @@ wait for `/v1/models` to return `warp34-quality`, then run both tasks. Do not
 infer readiness solely from one server's log wording. Bind to localhost.
 
 These are integration checks, **not a matched quality or performance comparison**:
-warp-34 uses HGPTQ/TQ4; the donor checks use cyankiwi AWQ/native KV. MTP uses
+warp34 uses HGPTQ/TQ4; the donor checks use cyankiwi AWQ/native KV. MTP uses
 built-in target weights, not a separately chosen DFlash2 model. MTP flag syntax
 and implementation differ by server.
 
@@ -35,7 +35,7 @@ lock. No Docker-in-Docker or driver changes are required.
 For the donor commands below, `AWQ` is an absolute local snapshot path for
 `cyankiwi/Qwen3.8-27B-AWQ-INT4` revision
 `e3a700906e6a73ba4290b1873dc2ba8198527ab5`. This is **not** the HGPTQ checkpoint
-used by the initial warp-34 checks. The [README](README.md) gives warp-34's
+used by the initial warp34 checks. The [README](README.md) gives warp34's
 HGPTQ/MTP-3 command. Retain exact snapshot identities even though the API alias
 is shared.
 
@@ -85,7 +85,7 @@ CUDA_VISIBLE_DEVICES=0,1 SGLANG_MAMBA_CONV_DTYPE=float16 \
 ```
 
 `SGLANG_MAMBA_CONV_DTYPE=float16` keeps convolution-cache dtype consistent with
-the FP16 target; the SSM state remains FP32. Do not copy warp-34's TQ4 flags or
+the FP16 target; the SSM state remains FP32. Do not copy warp34's TQ4 flags or
 vLLM's `--language-model-only` into this command.
 
 ## Run the client

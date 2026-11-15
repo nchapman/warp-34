@@ -14,7 +14,7 @@ The initial **text-only** pressure run on one 24 GB RTX 3090 Ti used:
 
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
-CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/warp34 serve \
   --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline \
   --speculative mtp --mtp-k 3 --kv-format tq4 \
@@ -111,11 +111,11 @@ No engine changes or performance fixes were made in this capacity investigation.
 
 Local, not durable release artifacts:
 
-- `/tmp/w34-27b-mtp-capacity-64k/`: request SSE/usage journal, one-second GPU/RSS
+- `/tmp/warp34-27b-mtp-capacity-64k/`: request SSE/usage journal, one-second GPU/RSS
   samples, one-second server metrics, before/after summary.
-- `/tmp/w34-27b-mtp-capacity-40k/`: same evidence for the chosen candidate.
-- Probe scripts: `/tmp/w34-27b-capacity-probe.py` and
-  `/tmp/w34-27b-capacity-safe-probe.py`; console logs with matching names.
+- `/tmp/warp34-27b-mtp-capacity-40k/`: same evidence for the chosen candidate.
+- Probe scripts: `/tmp/warp34-27b-capacity-probe.py` and
+  `/tmp/warp34-27b-capacity-safe-probe.py`; console logs with matching names.
 - `summary.json` SHA-256, 64k:
   `4c868c61069a61c2e2a49394943bc5cff215c182d0a24a381caf60be9a2926e9`.
 - `summary.json` SHA-256, 40k:

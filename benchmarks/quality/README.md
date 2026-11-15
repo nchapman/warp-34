@@ -1,6 +1,6 @@
 # Quality regression evaluations — upstream lm-eval
 
-Run **EleutherAI lm-evaluation-harness directly** against warp-34's chat API.
+Run **EleutherAI lm-evaluation-harness directly** against warp34's chat API.
 No custom tasks, prompt rewrites, scoring, answer extraction, subset selection, model
 adapter, aggregate quality score, or evaluator fork. `lm-eval.yaml` is a native
 upstream **run configuration**, not a task definition. The tests here check that
@@ -13,12 +13,12 @@ across deployments, larger evaluations can support specific quality comparisons.
 Quality and performance runs are separate; do not run them concurrently on the
 same server/GPU. Full evaluations require an explicit decision, not this setup pass.
 
-Use the [automated FP16-KV suite](AUTOMATION.md) to run warp-34,
+Use the [automated FP16-KV suite](AUTOMATION.md) to run warp34,
 llama.cpp/Unsloth, vLLM and SGLang sequentially with one command. The checked-in
 runner manages server lifecycle and invokes the unchanged upstream CLI; it is
 not an evaluator adapter. Earlier [mixed-KV single-GPU checks](single-gpu.md),
 and [TP2 qualification](QUALIFICATION.md) remain historical records, not a baseline
-for new models. The active suite uses nchapman HGPTQ for warp-34 and cyankiwi AWQ
+for new models. The active suite uses nchapman HGPTQ for warp34 and cyankiwi AWQ
 for vLLM/SGLang. These quality recipes still need requalification; old results
 do not transfer. A separate [vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md)
 passed startup/short generation, not quality evaluation. [Updated TP2 recipes](servers.md)
@@ -96,7 +96,7 @@ export PATH="/opt/cuda/bin:/usr/local/cuda/bin:$PATH"
 # Initial pin: nchapman/Qwen3.8-27B-W4A16-HGPTQ
 # revision 1de743eedefdb7422e6b171174c7080204f5b005
 export MODEL=/absolute/path/to/pinned/model/snapshot
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model "$MODEL" --offline --tp 1 \
   --kv-format fp16 --kv-pages 256 --max-num-seqs 4 \
   --speculative mtp --mtp-k 3 \

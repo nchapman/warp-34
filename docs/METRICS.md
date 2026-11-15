@@ -1,6 +1,6 @@
 # Metrics and built-in dashboard
 
-`w34 serve` includes a read-only, warm-dark React dashboard at **`GET /`**.
+`warp34 serve` includes a read-only, warm-dark React dashboard at **`GET /`**.
 No external collector, CDN, Node runtime, or frontend files are needed at runtime:
 Vite's production assets are embedded in the Rust executable. Prometheus remains
 optional; use it for durable history, alerting, and fleet-wide aggregation.
@@ -35,20 +35,20 @@ are served from an embedded allowlist, never the filesystem.
 ## Metric meanings
 
 All counters reset with a process restart. Time measurements are monotonic seconds.
-Model configuration labels appear only on `w34_model_info`; labels on other families
+Model configuration labels appear only on `warp34_model_info`; labels on other families
 have fixed, bounded values. Use Prometheus target labels to distinguish servers.
 
 ### Work and outcomes
 
-- `w34_requests_total`: requests admitted to the worker ingress queue, across all
+- `warp34_requests_total`: requests admitted to the worker ingress queue, across all
   inference APIs. A decision API call can create more than one engine request.
-- `w34_active_requests` / `w34_waiting_requests`: scheduled unfinished requests vs
+- `warp34_active_requests` / `warp34_waiting_requests`: scheduled unfinished requests vs
   ingress plus scheduler waiting. These are actual lifecycle gauges, not estimates
   from peak load.
-- `w34_completed_requests_total`, `w34_cancelled_requests_total`,
-  `w34_failed_requests_total`: mutually exclusive terminal outcomes. Cancellation
+- `warp34_completed_requests_total`, `warp34_cancelled_requests_total`,
+  `warp34_failed_requests_total`: mutually exclusive terminal outcomes. Cancellation
   includes disconnected/slow consumers; failures include worker shutdown/panic.
-- `w34_http_responses_total{class="success|client_error|server_error"}`: inference
+- `warp34_http_responses_total{class="success|client_error|server_error"}`: inference
   HTTP response **headers**, including validation/admission errors before worker
   submission. A successful SSE header is not proof that generation later succeeded;
   consult worker outcomes too. Scrapes, dashboard assets, status, and token-count
@@ -56,13 +56,13 @@ have fixed, bounded values. Use Prometheus target labels to distinguish servers.
 
 ### Tokens and reuse
 
-- `w34_prompt_tokens_total`: prompt tokens submitted to the worker.
-- `w34_computed_prompt_tokens_total`: prompt tokens in successfully executed prefill
+- `warp34_prompt_tokens_total`: prompt tokens submitted to the worker.
+- `warp34_computed_prompt_tokens_total`: prompt tokens in successfully executed prefill
   chunks. This reflects work, not merely the declared input length.
-- `w34_cached_prompt_tokens_total`: prompt tokens actually restored on admission.
-- `w34_tokens_generated_total`: committed model output, including stop tokens,
+- `warp34_cached_prompt_tokens_total`: prompt tokens actually restored on admission.
+- `warp34_tokens_generated_total`: committed model output, including stop tokens,
   whether or not text reaches the client. Draft proposals are not counted here.
-- `w34_radix_cache_hit_rate`: lifetime restored/submitted prompt-token ratio.
+- `warp34_radix_cache_hit_rate`: lifetime restored/submitted prompt-token ratio.
   Prefer rates of the underlying counters for a rolling reuse ratio. It is not a
   request hit rate. Pending/cancelled prompts mean computed + cached need not equal
   submitted at an arbitrary snapshot.
@@ -76,10 +76,10 @@ backpressure after output publication are not part of TTFT.
 
 | Family | Observation |
 |---|---|
-| `w34_queue_seconds` | Enqueue → first scheduler admission |
-| `w34_ttft_seconds` | Enqueue → first committed model token; prefill-only requests excluded |
-| `w34_e2e_seconds` | Enqueue → terminal outcome, including cancellation/failure |
-| `w34_time_per_output_token_seconds` | Per-request `(last token time - first token time) / (generated tokens - 1)`, when at least two tokens exist |
+| `warp34_queue_seconds` | Enqueue → first scheduler admission |
+| `warp34_ttft_seconds` | Enqueue → first committed model token; prefill-only requests excluded |
+| `warp34_e2e_seconds` | Enqueue → terminal outcome, including cancellation/failure |
+| `warp34_time_per_output_token_seconds` | Per-request `(last token time - first token time) / (generated tokens - 1)`, when at least two tokens exist |
 
 Do not interpret per-output-token time as an observed interval between every SSE
 message. Speculation emits multiple tokens together; measuring rapid channel drains
@@ -88,7 +88,7 @@ explicitly named instead. It is not pure GPU kernel time either.
 
 ### Resource capacity
 
-`w34_pool_units{pool="kv|gdn",state="capacity|active|cached|free"}`:
+`warp34_pool_units{pool="kv|gdn",state="capacity|active|cached|free"}`:
 
 - KV units are logical **pages** (16 tokens/page); GDN units are **state slots**.
 - Counted once across tensor-parallel ranks, not summed as if each rank served
@@ -104,16 +104,16 @@ pressure can block new requests even while KV capacity remains available.
 
 ### Speculation and engine information
 
-- `w34_speculation_rounds_total`, `w34_speculation_accepted_tokens_total`: successful
+- `warp34_speculation_rounds_total`, `warp34_speculation_accepted_tokens_total`: successful
   per-request verification rounds and accepted drafts (excluding the bonus token).
-- `w34_speculation_draft_tokens_total`: actual draft rows included in successful
+- `warp34_speculation_draft_tokens_total`: actual draft rows included in successful
   verification, after budget, stop, constraint, and capacity trimming. This is not
   the configured maximum or discarded proposal work. JSON permits `null` for an
   unavailable denominator; the shipped MTP/DFlash paths publish the actual count.
 - `1 + accepted / rounds` is mean acceptance length (accepted drafts plus the normal
   bonus/anchor contribution), not a claim about wire-delivered tokens after stops.
-- `w34_model_info{model,tp_size,kv_format,speculation} 1`, `w34_uptime_seconds`,
-  and `w34_status{state="ready|unhealthy|stopping"}` provide bounded operational context.
+- `warp34_model_info{model,tp_size,kv_format,speculation} 1`, `warp34_uptime_seconds`,
+  and `warp34_status{state="ready|unhealthy|stopping"}` provide bounded operational context.
 
 ## Dashboard behavior
 
@@ -149,26 +149,26 @@ scrape_configs:
 
 ```promql
 # Aggregate generated output per second
-rate(w34_tokens_generated_total[1m])
+rate(warp34_tokens_generated_total[1m])
 
 # Engine TTFT p95
-histogram_quantile(0.95, sum by (le, instance) (rate(w34_ttft_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le, instance) (rate(warp34_ttft_seconds_bucket[5m])))
 
 # Token-weighted prefix reuse; no value when there are no prompt observations
-rate(w34_cached_prompt_tokens_total[5m])
-  / (rate(w34_cached_prompt_tokens_total[5m]) + rate(w34_computed_prompt_tokens_total[5m]))
+rate(warp34_cached_prompt_tokens_total[5m])
+  / (rate(warp34_cached_prompt_tokens_total[5m]) + rate(warp34_computed_prompt_tokens_total[5m]))
 
 # Active target KV occupancy (evictable cache is deliberately not pressure)
-w34_pool_units{pool="kv",state="active"}
-  / ignoring(state) w34_pool_units{pool="kv",state="capacity"}
+warp34_pool_units{pool="kv",state="active"}
+  / ignoring(state) warp34_pool_units{pool="kv",state="capacity"}
 ```
 
 ### Migration from the initial endpoint
 
 The original endpoint's request/token/cancellation names are retained where useful,
 but now count the common engine lifecycle rather than selected HTTP consumers.
-`w34_last_ttft_ms` and `w34_last_itl_ms` are removed in favor of seconds histograms.
-The legacy `w34_peak_active_requests` and internal `w34_decode_bucket_mask` remain
+`warp34_last_ttft_ms` and `warp34_last_itl_ms` are removed in favor of seconds histograms.
+The legacy `warp34_peak_active_requests` and internal `warp34_decode_bucket_mask` remain
 as compatibility diagnostics; prefer current concurrency gauges and external
 historical maxima for operational dashboards. Do not combine
 old and new token-accounting definitions in a single historical comparison without

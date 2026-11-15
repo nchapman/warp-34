@@ -1,7 +1,7 @@
 """Exact-bit FA2 production adapter probe (GPU0 only, no model engine).
 
 Usage: CUDA_VISIBLE_DEVICES=0 python tools/oracle/vision_fa2_probe.py \
-    --library /tmp/w34-vision-fa2.so --capture /tmp/w34-attn-investigation/native-attn.safetensors
+    --library /tmp/warp34-vision-fa2.so --capture /tmp/warp34-attn-investigation/native-attn.safetensors
 The shared library must contain op_vision_fa2.cu and op_vision.cu.
 """
 import argparse
@@ -29,10 +29,10 @@ def main():
     ap.add_argument("--capture", required=True)
     args = ap.parse_args()
     lib = C.CDLL(args.library)
-    fn = lib.w34_vision_fa2
+    fn = lib.warp34_vision_fa2
     fn.argtypes = [C.POINTER(Exec), C.c_void_p, C.c_void_p, C.c_void_p] + [C.c_int] * 4
     fn.restype = C.c_int
-    assert lib.w34_vision_fa2_prepare() == 0
+    assert lib.warp34_vision_fa2_prepare() == 0
 
     def check(q, k, v, cu, gold, label):
         q, k, v, gold = [x.reshape(-1, x.shape[-2], x.shape[-1]) for x in (q, k, v, gold)]
@@ -54,7 +54,7 @@ def main():
         # Exercise the real fused entrypoint with identity RoPE and no bias.
         # Inputs here are already post-RoPE; zero positions leave them unchanged.
         positions = torch.zeros((n, 2), device="cuda", dtype=torch.int32)
-        fused = lib.w34_vision_qkv_rope_attn_f16
+        fused = lib.warp34_vision_qkv_rope_attn_f16
         fused.argtypes = [C.POINTER(Exec)] + [C.c_void_p] * 5 + [C.c_int] * 4 + [C.c_float]
         assert fused(C.byref(ex), packed.data_ptr(), None, positions.data_ptr(), cu.data_ptr(), out.data_ptr(), n, cu.numel()-1, h, d, 10000.0) == 0
         torch.cuda.synchronize()
@@ -103,7 +103,7 @@ def main():
         out = torch.empty(n, h, d, device="cuda", dtype=torch.float16)
         scratch = torch.empty(n*h, device="cuda", dtype=torch.float32)
         ex = Exec(torch.cuda.current_stream().cuda_stream, scratch.data_ptr(), scratch.numel()*4)
-        fused = lib.w34_vision_qkv_rope_attn_f16
+        fused = lib.warp34_vision_qkv_rope_attn_f16
         assert fused(C.byref(ex), packed.data_ptr(), None, positions.data_ptr(), cu.data_ptr(), out.data_ptr(), n, 1, h, d, 10000.0) == 0
         torch.cuda.synchronize()
         assert torch.equal(packed.view(torch.int16), rotated.view(torch.int16)), f"D{d} nonzero axial RoPE"

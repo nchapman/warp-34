@@ -7,14 +7,14 @@ This is a black-box HTTP client, **not** an oracle, profiler, kernel microbench,
 or automatic benchmark-results claim.
 
 - **[Post-HGPTQ coverage audit and proposed refresh](COVERAGE_AUDIT.md)** — current gaps, checkpoint policy, and pod validation plan (not new results)
-- **[Where warp-34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
+- **[Where warp34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
 - [Completed campaign evidence and limitations](campaigns/completion-results.md)
 - **[Extended workload / soak runner](SOAK.md)** — duration + completion targets, sustained/burst replay, local disconnect injection, progress/resource gates and separate pass/fail receipts
 - [Single-GPU 10-minute 4/8 workload check](campaigns/soak-4b-10min.md) — memory trajectory, client latency and per-turn cache reuse; not long-duration qualification
 - [Plan and persistent task list](PLAN.md)
 - [Engine recipes, qualification, and KV matrix](engines.md)
 - [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases
-- [First 27B FP16 comparison](campaigns/27b-fp16-first.md) — warp-34, vLLM, SGLang
+- [First 27B FP16 comparison](campaigns/27b-fp16-first.md) — warp34, vLLM, SGLang
 
 ## Quick start
 
@@ -24,7 +24,7 @@ is performed by the suite):
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --kv-format fp16 --kv-pages 4096 --port 8000
 ```
@@ -33,12 +33,12 @@ In another terminal:
 
 ```sh
 cd benchmarks/perf
-python3 -m w34perf validate suite.toml
-python3 -m w34perf plan suite.toml                 # no network or GPU access
-python3 -m w34perf run suite.toml --engine warp34-1-fp16 \
+python3 -m warp34perf validate suite.toml
+python3 -m warp34perf plan suite.toml                 # no network or GPU access
+python3 -m warp34perf run suite.toml --engine warp34-1-fp16 \
   --case smoke --out results/warp34-fp16-smoke-001
-python3 -m w34perf report results/warp34-fp16-smoke-001 > /tmp/perf-report.md
-python3 -m w34perf report results/warp34-fp16-smoke-001 --format csv > /tmp/perf-report.csv
+python3 -m warp34perf report results/warp34-fp16-smoke-001 > /tmp/perf-report.md
+python3 -m warp34perf report results/warp34-fp16-smoke-001 --format csv > /tmp/perf-report.csv
 ```
 
 An existing output directory is never overwritten. Select several `--case`s or
@@ -63,7 +63,7 @@ The separate [`../quality/`](../quality/README.md) environment invokes pinned
 upstream `lm-eval` directly for full IFEval and GSM8K, without modifying tasks,
 prompts or scoring. It is independent of this suite's small functional quality
 fixtures and Python standard-library client. Native lm-eval results can be
-retained as evidence, but are not automatically interpreted by `w34perf`'s
+retained as evidence, but are not automatically interpreted by `warp34perf`'s
 fixture-specific quality gate or used to clear its publication blockers.
 
 ## Flash-Next HGPTQ refresh
@@ -73,7 +73,7 @@ all six profiles completed the full campaign (90 trials, 432 measured requests).
 These are working-harness checks, **not locked performance baselines**; incorporate
 ongoing engine improvements before locking numbers.
 
-`campaigns/flash-next-hgptq.toml` adds six warp-34 profiles: TP1/TP2 with plain
+`campaigns/flash-next-hgptq.toml` adds six warp34 profiles: TP1/TP2 with plain
 decode, MTP-k3, and quantized DFlash2. It pins the HGPTQ target and drafter
 independently, uses an 8K target KV pool (512 pages), and reuses the existing
 five Flash-Next workloads; no additional agentic fixtures are introduced.
@@ -85,10 +85,10 @@ Run one server at a time. Unknown provenance remains explicit,
 and offline validation does not qualify a serving profile.
 
 ```sh
-python3 -m w34perf plan campaigns/flash-next-hgptq.toml --preset quick
+python3 -m warp34perf plan campaigns/flash-next-hgptq.toml --preset quick
 ```
 
-Active cross-engine baselines compare warp-34 HGPTQ against cyankiwi
+Active cross-engine baselines compare warp34 HGPTQ against cyankiwi
  official-base AWQ on vLLM/SGLang: a practical comparison, not identical weights. Flash-Next's older quant is
 AutoRound W4A16 with FP8 PLE, not plain GPTQ. Keep historical campaigns intact;
 results from a different GPU/CPU/topology are not a controlled quant comparison.
@@ -100,15 +100,15 @@ work separately from historical results. The new campaign configurations are
 `campaigns/27b-completion.toml` and `campaigns/flash-next-serving.toml`.
 
 ```sh
-python3 -m w34perf plan campaigns/27b-completion.toml --preset quick
-python3 -m w34perf quality campaigns/27b-completion.toml \
+python3 -m warp34perf plan campaigns/27b-completion.toml --preset quick
+python3 -m warp34perf quality campaigns/27b-completion.toml \
   --engine warp34-tp1-fp16 --out results/quality-001.json
-python3 -m w34perf run campaigns/27b-completion.toml \
+python3 -m warp34perf run campaigns/27b-completion.toml \
   --engine warp34-tp1-fp16 --preset full --telemetry-interval 1 \
   --evidence results/quality-001.json --evidence /path/to/sanitized-startup.log \
   --out results/run-001
-python3 -m w34perf audit results > /tmp/historical-ledger.json
-python3 -m w34perf compare results/run-001 results/run-002 > /tmp/comparison.json
+python3 -m warp34perf audit results > /tmp/historical-ledger.json
+python3 -m warp34perf compare results/run-001 results/run-002 > /tmp/comparison.json
 ```
 
 `quick`, `full`, and `release` explicitly select campaign cases and repetitions;
@@ -128,7 +128,7 @@ failures. Quality results apply only to the exact fixture and deployment tested.
 Its pinned 27B reference-template calibration is retained in
 `qualification/27b-capacity-calibration.json` (32,340 / 127,540–127,541 /
 251,640–251,641 tokens). Reproduce offline from the repository root with the
-optional preparation tool (requires Transformers, **not** required by w34perf):
+optional preparation tool (requires Transformers, **not** required by warp34perf):
 
 ```sh
 python3 tools/perf_calibrate_quality.py /path/to/pinned/snapshot \
@@ -160,11 +160,11 @@ small speed differences. No energy claim is derived from nameplate power.
 Use the same filters for `plan` (offline) and `run`:
 
 ```sh
-python3 -m w34perf plan suite.toml --gpus 1
-python3 -m w34perf run suite.toml --engine warp34-1-fp16 --gpus 1 \
+python3 -m warp34perf plan suite.toml --gpus 1
+python3 -m warp34perf run suite.toml --engine warp34-1-fp16 --gpus 1 \
   --case smoke --out results/single-only-001
 # Exclusions can be repeated; other already-running selected endpoints still run.
-python3 -m w34perf plan suite.toml --gpus 2 --exclude-engine ninfer-2-experimental
+python3 -m warp34perf plan suite.toml --gpus 2 --exclude-engine ninfer-2-experimental
 ```
 
 Each deployment has `enabled = true` by default and `support = "unverified"`.
@@ -204,12 +204,12 @@ Hash a pinned snapshot (including tokenizer/template and optional sidecars), or
 a single GGUF/`.ninfer` file, independently of engine internals:
 
 ```sh
-python3 -m w34perf inventory /models/pinned-snapshot --out results/weights-001.json
-python3 -m w34perf verify results/weights-001.json
+python3 -m warp34perf inventory /models/pinned-snapshot --out results/weights-001.json
+python3 -m warp34perf verify results/weights-001.json
 # Relocated copies can be checked without changing the original inventory:
-python3 -m w34perf verify results/weights-001.json --root /other/pinned-snapshot
+python3 -m warp34perf verify results/weights-001.json --root /other/pinned-snapshot
 # Optional repeated relative-name globs deliberately narrow the inventory:
-python3 -m w34perf inventory /models/pinned-snapshot \
+python3 -m warp34perf inventory /models/pinned-snapshot \
   --include '*.safetensors' --include '*.json' --include '*.jinja' \
   --out results/selected-files-001.json
 ```
@@ -241,19 +241,19 @@ local hashes versus remote-advertised hashes and unresolved provenance.
 Create a new inventory for the pinned AWQ snapshot (do not reuse archived GPTQ hashes):
 
 ```sh
-python3 -m w34perf inventory /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --out results/27b-cyankiwi-awq.inventory.json
+python3 -m warp34perf inventory /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --out results/27b-cyankiwi-awq.inventory.json
 ```
 
 After starting a server, verify a **trusted** inventory and its indexed shard
 references, then compare the configured model ID to `/v1/models`:
 
 ```sh
-python3 -m w34perf preflight qualification/27b-one-card.toml \
+python3 -m warp34perf preflight qualification/27b-one-card.toml \
   --engine vllm27-1-fp16-awq \
   --inventory results/27b-cyankiwi-awq.inventory.json \
   --out results/vllm27-preflight-001.json
 # Add --root /other/pinned-snapshot if local artifact bytes were relocated.
-python3 -m w34perf run qualification/27b-one-card.toml \
+python3 -m warp34perf run qualification/27b-one-card.toml \
   --engine vllm27-1-fp16-awq --gpus 1 --out results/vllm27-probe-001
 ```
 
@@ -271,7 +271,7 @@ startup log and run bundle together. Inventory/root paths remain trusted inputs.
 
 The checked-in [one-card preset](qualification/27b-one-card.toml) pins the newer
 cyankiwi AWQ `e3a700906e6a73ba4290b1873dc2ba8198527ab5` for competitors
-and warp-34 HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for C1,
+and warp34 HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for C1,
 **offered C8**, four-turn agent replay and an added
 primed longer-prefill case, three repetitions and 64-token ceilings (32 for
 primed prefill). Earlier three-engine runs used only the original three cases;
@@ -287,7 +287,7 @@ for historical GPTQ startup failures and successful probes, not AWQ results. SGL
 **not relabeled as FP16**: the separate explicit-convolution FP16 run passes
 **48/48 measured requests over 12 trials**, including six added longer-prefill
 requests. Both variants have active-request limit 2, so offered C8 includes server
-queueing. Warp-34's built-in renderer is not the artifact's Jinja executor.
+queueing. Warp34's built-in renderer is not the artifact's Jinja executor.
 These are operational probes, not token-aligned or quality-qualified rankings.
 
 ## Configuration and extension
@@ -446,7 +446,7 @@ no automatic speedup/winner ranking across unqualified deployments.
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 -m w34perf validate suite.toml
+python3 -m warp34perf validate suite.toml
 # From repo root: mise run perf-check (also included in mise run check).
 ```
 

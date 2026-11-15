@@ -1,9 +1,9 @@
 # NVIDIA A100 (`sm_80`), RTX 30-Series (`sm_86`) & RTX 40-Series (`sm_89`) — Hardware Reference
 
 Every number an optimization decision might depend on, each with its source.
-`warp-34` builds a multi-architecture fatbinary (`sm_80` + `sm_86` + `sm_89` + PTX) by
+`warp34` builds a multi-architecture fatbinary (`sm_80` + `sm_86` + `sm_89` + PTX) by
 default and queries per-device hardware properties (`CudaDeviceProps` /
-`w34_device_props`) at startup so every NVIDIA A100 (`sm_80`, 108 SMs, 40 MiB L2,
+`warp34_device_props`) at startup so every NVIDIA A100 (`sm_80`, 108 SMs, 40 MiB L2,
 40/80 GiB HBM2e), GeForce RTX 30-series (`sm_86`, 28–84 SMs, 3–6 MiB L2), and
 RTX 40-series (`sm_89`, 24–142 SMs, 24–96 MiB L2) GPU runs natively without
 hardcoded SM or L2 constants. Primary optimization references are **1–2× NVIDIA A100
@@ -51,7 +51,7 @@ Sources are tagged inline:
 | Register file per SM | 64K × 32-bit (256 KB) | [WP][ATG] |
 | TDP | 450W stock — ran power-capped at 275W during early perf research; **both cards at stock 450 W since 2026-10-03** (ops, commit `ac9b9cd`; §8 measured: the cap does not bind); pre-lift IMMA/power ceilings in perf notes are conservative | [TPU][BOX] |
 | PCIe | Gen4 x16 card; **this box wires each card at x8** (2-GPU bifurcation) | [TPU][BOX] |
-| GPU0↔GPU1 | `nvidia-smi topo -m` = **PHB** (same host bridge) — **P2P is disabled on this box**: `cudaDeviceCanAccessPeer` = 0 both directions, `cudaDeviceEnablePeerAccess` → "peer access is not supported" (AMD Ryzen root complex). Cross-GPU traffic uses pinned-sysmem two-hop when P2P is unavailable and 1-hop NVLink VRAM when P2P is available (`crates/w34-host/src/cuda/collectives.rs` & `crates/w34-kernels/csrc/ops/op_collectives.cu`); contract in `docs/contracts/collectives.md` | measured 2026-10-04; P2P probe 2026-10-14 |
+| GPU0↔GPU1 | `nvidia-smi topo -m` = **PHB** (same host bridge) — **P2P is disabled on this box**: `cudaDeviceCanAccessPeer` = 0 both directions, `cudaDeviceEnablePeerAccess` → "peer access is not supported" (AMD Ryzen root complex). Cross-GPU traffic uses pinned-sysmem two-hop when P2P is unavailable and 1-hop NVLink VRAM when P2P is available (`crates/warp34-host/src/cuda/collectives.rs` & `crates/warp34-kernels/csrc/ops/op_collectives.cu`); contract in `docs/contracts/collectives.md` | measured 2026-10-04; P2P probe 2026-10-14 |
 | NVLink | **None.** 3090 Ti removed it (RTX 3090 had 2-way NVLink) | NVIDIA dev forums; note some vendor spec sheets still list "2-way NVLink" — template noise, the PCB has no NVLink fingers |
 | ECC | No | [BOX][TPU] |
 | Copy engines (`asyncEngineCount`) | 2 → H2D and D2H can overlap | [BOX] |
@@ -218,7 +218,7 @@ smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
   1950–1965 MHz at only 205–238 W. So §4 peak tables scale by 1950/1860
   (+4.8%) at these operating points, not down.
 - Real kernels mix pipes + DRAM and may draw more than any synthetic —
-  sustained clocks under actual GEMM/decode are verified via `w34 profile-diff`
+  sustained clocks under actual GEMM/decode are verified via `warp34 profile-diff`
   and `nsys` traces rather than assumed from synthetic loads.
 - GDDR6X junction temps run hot; `nvidia-smi` doesn't expose memory
   temperature on this driver — watch for memory-clock throttling during long
@@ -228,8 +228,8 @@ smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
 
 ## 9. Roofline mapping to our workloads
 
-`warp-34` executes Safetensors checkpoints in unified Marlin **`W4A16` / `W8A16`**
-tile layout (`docs/MODELS.md`, `crates/w34-kernels/csrc/ops/op_marlin.cu`). The
+`warp34` executes Safetensors checkpoints in unified Marlin **`W4A16` / `W8A16`**
+tile layout (`docs/MODELS.md`, `crates/warp34-kernels/csrc/ops/op_marlin.cu`). The
 GGUF `Q4_K_M` figures below are included as reference math for cross-engine
 roofline comparisons (`benchmarks/perf/`). Bandwidth model uses the **measured
 959.5 GB/s** read ceiling (§11; 95.2% of 1008 theory).
@@ -239,7 +239,7 @@ roofline comparisons (`benchmarks/perf/`). Bandwidth model uses the **measured
   - 9B `W4A16` / `Q4_K_M`: ~5.3–5.4 GB/token → ceiling ≈ 959.5/5.3 ≈ **181 tok/s**
     (weights only). Tensor cores idle.
   - 27B `W4A16` / `Q4_K_M` (production target): ~14.0–14.5 GB/token streamed →
-    ceiling ≈ **66–68 tok/s** at measured BW (`warp-34` achieves `54.5 tok/s` end-to-end on 1× 3090 Ti).
+    ceiling ≈ **66–68 tok/s** at measured BW (`warp34` achieves `54.5 tok/s` end-to-end on 1× 3090 Ti).
   - 0.8B `W4A16` / `Q4_K_M`: ~508 MB/token → ceiling ≈ **1890 tok/s** theory-bound —
     but at ~30 kernels/layer the measured 1.36 µs pipelined launch
     overhead (§11) dominates long before that: **CUDA graphs / kernel
@@ -398,12 +398,12 @@ nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,cloc
    - On 4090 (`l2_cache_bytes >= 32 MiB`), `op_marlin.cu` raises the wide-`N` (`N > 4096`) `M`-parallelism cap from `max_par = 16` (`M <= 1024`) to `max_par = 64` (`M <= 4096`) because the activation matrix `A` stays resident in the 72 MB L2 cache across all `N` tiles without re-reading `B` weights from HBM.
 2. **Per-SM limits are identical between `sm_86` and `sm_89`:**
    - Both architectures have `128 KB` unified L1/shared per SM, `101,376 B` (`99 KB`) max opt-in dynamic shared memory per block, `65,536` 32-bit registers per SM (`255` max per thread), `48` max warps (`1536` threads) per SM, and `16` max blocks per SM.
-   - All `sm_80+` PTX instructions used in `warp-34` (`cp.async`, `ldmatrix`, `mma.sync.aligned.m16n8k16`, `redux.sync`, `mbarrier`) assemble natively to both `sm_86` and `sm_89` with `0` register spills (`0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`).
+   - All `sm_80+` PTX instructions used in `warp34` (`cp.async`, `ldmatrix`, `mma.sync.aligned.m16n8k16`, `redux.sync`, `mbarrier`) assemble natively to both `sm_86` and `sm_89` with `0` register spills (`0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`).
 3. **Full 30-Series & 40-Series Lineup (Runtime `CudaDeviceProps` Scaling):**
    - **30-Series (`sm_86`):** RTX 3060 (28 SMs, 3 MB L2), RTX 3060 Ti (38 SMs, 4 MB L2), RTX 3070 / 3070 Ti (46–48 SMs, 4 MB L2), RTX 3080 / 3080 Ti (68–80 SMs, 5–6 MB L2), RTX 3090 (82 SMs, 6 MB L2), RTX 3090 Ti / RTX A6000 (84 SMs, 6 MB L2).
    - **40-Series (`sm_89`):** RTX 4060 / 4060 Ti (24–34 SMs, 24–32 MB L2), RTX 4070 / Super / Ti / Ti Super (46–66 SMs, 36–48 MB L2), RTX 4080 / Super (76–80 SMs, 64 MB L2), RTX 4090 D (114 SMs, 72 MB L2), RTX 4090 (128 SMs, 72 MB L2), RTX 6000 Ada / L40S (142 SMs, 96 MB L2).
    - **Dynamic runtime adaptation:**
-     - `w34_get_current_device_props` / `CudaDeviceProps` caches `compute_major`, `compute_minor`, `multi_processor_count`, `max_shared_mem_per_block_optin`, and `l2_cache_bytes` per device.
+     - `warp34_get_current_device_props` / `CudaDeviceProps` caches `compute_major`, `compute_minor`, `multi_processor_count`, `max_shared_mem_per_block_optin`, and `l2_cache_bytes` per device.
      - `op_collectives.cu` sizes `Signal` for `kMaxBlocks = 144` and clamps `tp2_block_cap` to `min(peer_sm_cap, cap)` so GPUs with `< 84` SMs (e.g. 82-SM RTX 3090, 80-SM RTX 4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than physical SMs, while 128-SM RTX 4090 and 142-SM L40S scale up to full SM count on large reductions.
      - `op_marlin.cu` and `model/rank.rs` size the Marlin tile-lock workspace to `sm_count * 64` ints, query the active device (`cudaGetDevice`), scale wide-`N` `max_par` continuously from `l2_cache_bytes / (384 KiB)` (`[8, 128]`), and keep `M <= 16` non-`enable_m_invariant_split_k` GEMMs on `blocks = mn_tiles` (1 slice/tile) so `< 64`-SM GPUs (`34`-SM 4060 Ti, `38`-SM 3060 Ti) preserve `TP=1 == TP=2` reduction invariance.
      - `op_gdn.cu` selects single-request recurrent prefill `ROWS` in `{4, 7, 8, 11}` by minimizing wave-quantized work `ceil(num_v_heads * v_tiles / sm_count) * ROWS` directly from the card's reported `sm_count` (independent of `batch->num_reqs` so multi-request batched prefill matches single-request prefill).
@@ -418,15 +418,15 @@ nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,cloc
    - **35B-A3B Sparse MoE `M=1` Decode (`op_moe.cu`):**
      - Adding `moe_topk_router_256_k8_f16_kernel` (`8` warps × `32` lanes = `256` experts in registers with warp-shuffle top-8 reduction, `1.73 us` vs `vLLM`'s `16.2 us` 2-stage router), plus `__launch_bounds__(128, 8)` (`64` regs/thread -> `8` blocks/SM = `32` warps/SM occupancy, `STACK:0 LOCAL:0`) and bitshift `w >> group_shift` in `moe_w4a16_gate_up_silu_f16_kernel` and `moe_w4a16_down_accum_f16_kernel<false, 32|64, 8>`, reduced 4090 `nsys` per-step MoE time by **`-11.4%`** on `35B TP=1` (`970.4 -> 859.5 us/step`) and **`-21.5%`** on `35B TP=2` (`719.2 -> 564.3 us/step`), lifting 4090 `35B-A3B` decode to **`242.4 tok/s`** (`TP=1`, `+6.1%`), **`308.4 tok/s`** (`TP=2`, `+9.7%`), and **`507.1 tok/s`** (`TP=2 MTP k=2`, `+6.5%`), and 3090 Ti `35B-A3B` decode to **`213.6 tok/s`** (`TP=1`, `+4.9%`), **`287.2 tok/s`** (`TP=2`, `+7.1%`), and **`466.4 tok/s`** (`TP=2 MTP k=2`).
    - **Persisting L2 Cache Window (`op_init.cu`, `model/rank.rs`):**
-     - On GPUs with `persisting_l2_max_bytes >= 16 MiB` (RTX 4090 reports `51,904,512 B` = `49.5 MiB`; RTX 3090 Ti reports `4,718,592 B` = `4.5 MiB`), `w34_stream_set_persisting_l2_window` pins a `16 MiB` persisting L2 window (`hitRatio = 1.0`, `hitProp = cudaAccessPropertyPersisting`, `missProp = cudaAccessPropertyNormal`) on `scratch_arena` so hot decode/verify ping-pong hidden states and QKV/MoE scratch buffers remain L2-resident across weight-streaming GEMMs without thrashing `M=512` prefill activations (`missProp = Streaming` with `36 MiB` degraded `35B` prefill `4706 -> 4417 tok/s`; `missProp = Normal` with `16 MiB` keeps `35B TP=2` prefill at `4868 tok/s`).
+     - On GPUs with `persisting_l2_max_bytes >= 16 MiB` (RTX 4090 reports `51,904,512 B` = `49.5 MiB`; RTX 3090 Ti reports `4,718,592 B` = `4.5 MiB`), `warp34_stream_set_persisting_l2_window` pins a `16 MiB` persisting L2 window (`hitRatio = 1.0`, `hitProp = cudaAccessPropertyPersisting`, `missProp = cudaAccessPropertyNormal`) on `scratch_arena` so hot decode/verify ping-pong hidden states and QKV/MoE scratch buffers remain L2-resident across weight-streaming GEMMs without thrashing `M=512` prefill activations (`missProp = Streaming` with `36 MiB` degraded `35B` prefill `4706 -> 4417 tok/s`; `missProp = Normal` with `16 MiB` keeps `35B TP=2` prefill at `4868 tok/s`).
    - **HGPTQ MoE `APPLY_HAD64` Occupancy Trap & `Flash-Next` `n_interm=640` Specialization (`op_moe.cu`):**
-     - Fusing `H_64` inside `moe_w4a16_gate_up_silu_f16_kernel<..., true>` (`M = 1..3`) and `moe_sparse_vec4_kernel<true, 64, true>` (`M = 4..7`) collapsed `grid.x` to `n_interm / 64` (`8` CTAs/pair = `64` CTAs on `35B TP=2`, `10` CTAs/pair = `~50` active CTAs on `Flash-Next TP=2` across `128` SMs), costing `44.64 µs` vs `6.69 µs` (`6.67×` slower) at `M = 1` and `48.85 µs` vs `22.35 µs` at `M = 4` (`83.14 µs` on `Flash-Next TP=2`). Running full-occupancy `APPLY_HAD64 = false` (`grid.x = n_interm / 4` or `n_interm / 16`) + L1/L2-resident `w34_block_hadamard_inplace_f16` (`~1.1 µs`) plus `<false, 80, 10>` (`n_interm = 640, top_k = 10`) lifted `35B-HGPTQ TP=2` decode `204.9 -> 293.1 tok/s` (`+43.1%`), `MTP-2` `436.3 -> 548.9 tok/s` (`+25.8%`), `MTP-3` `534.1 -> 601.1–614.0 tok/s`, and `Flash-Next-HGPTQ TP=2` decode `66.9 -> 90.1 tok/s` (`+34.7%`) / `MTP-3` `102.3 -> 118.7 tok/s` (`+16.0%`).
+     - Fusing `H_64` inside `moe_w4a16_gate_up_silu_f16_kernel<..., true>` (`M = 1..3`) and `moe_sparse_vec4_kernel<true, 64, true>` (`M = 4..7`) collapsed `grid.x` to `n_interm / 64` (`8` CTAs/pair = `64` CTAs on `35B TP=2`, `10` CTAs/pair = `~50` active CTAs on `Flash-Next TP=2` across `128` SMs), costing `44.64 µs` vs `6.69 µs` (`6.67×` slower) at `M = 1` and `48.85 µs` vs `22.35 µs` at `M = 4` (`83.14 µs` on `Flash-Next TP=2`). Running full-occupancy `APPLY_HAD64 = false` (`grid.x = n_interm / 4` or `n_interm / 16`) + L1/L2-resident `warp34_block_hadamard_inplace_f16` (`~1.1 µs`) plus `<false, 80, 10>` (`n_interm = 640, top_k = 10`) lifted `35B-HGPTQ TP=2` decode `204.9 -> 293.1 tok/s` (`+43.1%`), `MTP-2` `436.3 -> 548.9 tok/s` (`+25.8%`), `MTP-3` `534.1 -> 601.1–614.0 tok/s`, and `Flash-Next-HGPTQ TP=2` decode `66.9 -> 90.1 tok/s` (`+34.7%`) / `MTP-3` `102.3 -> 118.7 tok/s` (`+16.0%`).
    - **PCIe Gen 4 x16 Mapped-Sysmem SM-Store Bottleneck (`2.36 GB/s`) vs Copy-Engine DMA TX (`20.51 GB/s`) (`op_collectives.cu`, `collectives.rs`):**
      - On AMD EPYC hosts without `iommu=pt`, GPU SM stores (`st.global.v4.u32`) to mapped pinned host memory achieve only `2.36 GB/s` (`2,570 µs` per `M = 512` collective on `27B`), whereas Copy-Engine `cudaMemcpyAsync` D2H achieves `20.51 GB/s` and SM reads achieve `16.82 GB/s`. Using `st.global.wb.v4.u32` (write-back streaming store bypassing L2 read-allocate) for `< 64 KiB` (`9.9 µs` at `M = 1`) and Copy-Engine `cudaMemcpyAsync` TX + 2-barrier `uint4` SM RX for `>= 64 KiB` (`kDmaThresholdBytes = 65536`) across `f16`, `bf16`, `f32`, `residual_gemma_rms_norm_hadamard_f16`, and `hc_combine_tap_f16` cut `M = 512` collective time from `2,570 µs` to `443 µs` (`5.8×` faster) and `M = 8` from `46.4–64.6 µs` to `27.3–30.9 µs`, lifting `27B TP=2` prefill `1,181 -> 3,363 tok/s` (`2.82×`), `9B TP=2` prefill `3,572 -> 9,180 tok/s` (`2.57×`), `4B TP=2 DFlash2` decode `1,454.2 -> 1,645.5 tok/s` (`+13.2%`), and `27B-HGPTQ TP=2 DFlash2` decode `310.8 -> 333.6 tok/s` (`+7.3%`).
 
 ### 12.3 Measured 2× RTX 4090 (`sm_89`) vs 2× RTX 3090 Ti (`sm_86`) & `vLLM 0.31.0` / `SGLang v0.5.19` Oracles
 
-| Model & Config | `vLLM 0.31.0` / `SGLang v0.5.19` Oracle (`3090 Ti`) | `warp-34` `3090 Ti` (`sm_86`) Decode (`tok/s`) | `warp-34` `4090` (`sm_89`) Before (`tok/s`) | `warp-34` `4090` (`sm_89`) After (`tok/s`) | `warp-34` `4090` Prefill (`tok/s`) |
+| Model & Config | `vLLM 0.31.0` / `SGLang v0.5.19` Oracle (`3090 Ti`) | `warp34` `3090 Ti` (`sm_86`) Decode (`tok/s`) | `warp34` `4090` (`sm_89`) Before (`tok/s`) | `warp34` `4090` (`sm_89`) After (`tok/s`) | `warp34` `4090` Prefill (`tok/s`) |
 |---|---:|---:|---:|---:|---:|
 | `Qwen3.5-4B` (`TP=1`) | `169.3` (`vLLM`) | `223.9` | `224.8` | **`226.4`** | **`11,291.0`** |
 | `Qwen3.5-4B` (`TP=1`, `MTP k=2`) | — | `344.2` | `353.3` | **`356.7`** | `5,152.3` |

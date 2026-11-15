@@ -74,7 +74,7 @@ def main():
         "eos": 256,
         "cases": results,
     }
-    output = Path(__file__).resolve().parents[2] / "crates/w34-host/tests/fixtures/xgrammar_masks.json"
+    output = Path(__file__).resolve().parents[2] / "crates/warp34-host/tests/fixtures/xgrammar_masks.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n")
     print(output)

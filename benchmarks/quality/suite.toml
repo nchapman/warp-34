@@ -8,7 +8,7 @@ client_timeout = 86400
 [engines.warp]
 mode = "mtp3"
 revision = "1de743eedefdb7422e6b171174c7080204f5b005"
-command = ["${W34}", "serve", "--model", "${HGPTQ}", "--offline", "--tp", "1", "--kv-format", "fp16", "--kv-pages", "256", "--max-num-seqs", "4", "--speculative", "mtp", "--mtp-k", "3", "--served-model-name", "warp34-quality", "--host", "127.0.0.1", "--port", "{port}"]
+command = ["${WARP34}", "serve", "--model", "${HGPTQ}", "--offline", "--tp", "1", "--kv-format", "fp16", "--kv-pages", "256", "--max-num-seqs", "4", "--speculative", "mtp", "--mtp-k", "3", "--served-model-name", "warp34-quality", "--host", "127.0.0.1", "--port", "{port}"]
 
 [engines.vllm]
 mode = "mtp3"

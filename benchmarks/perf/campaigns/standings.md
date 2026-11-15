@@ -1,4 +1,4 @@
-# Where warp-34 stands: 27B and Flash Next
+# Where warp34 stands: 27B and Flash Next
 
 ## Bottom line
 
@@ -18,9 +18,9 @@ not proof of general model accuracy or speculative token parity.
 
 | Deployment | Single request tok/s | C8 aggregate tok/s | Agent replay tok/s |
 |---|---:|---:|---:|
-| warp-34 FP16 KV (post-fix) | 51.99 | 310.49 | 49.06 |
-| warp-34 FP16 KV (initial campaign) | 51.86 | 228.66 | 49.02 |
-| warp-34 TQ4 KV | 51.22 | 307.02 | 47.81 |
+| warp34 FP16 KV (post-fix) | 51.99 | 310.49 | 49.06 |
+| warp34 FP16 KV (initial campaign) | 51.86 | 228.66 | 49.02 |
+| warp34 TQ4 KV | 51.22 | 307.02 | 47.81 |
 | vLLM FP16 KV | 50.76 | 309.89 | 41.08 |
 | NInfer INT8 KV | 52.09 | 243.78 | 47.00 |
 | llama.cpp FP16 KV | 44.36 | 96.47 | 39.96 |
@@ -36,7 +36,7 @@ not proof of general model accuracy or speculative token parity.
 
 | Deployment | Single request tok/s | C8 aggregate tok/s | Agent replay tok/s |
 |---|---:|---:|---:|
-| warp-34 | 86.28 | 466.27 | 79.42 |
+| warp34 | 86.28 | 466.27 | 79.42 |
 | vLLM | 73.91 | 388.71 | 57.99 |
 | SGLang | 75.00 | 299.62 | 64.74 |
 
@@ -59,21 +59,21 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
 
 | Deployment | Short chat tok/s | ~6K-context code proxy tok/s | Strict agent replay |
 |---|---:|---:|---|
-| warp-34 TP1, target-only (post-fix) | 16.52 | 3.54 | 11.77 tok/s; complete (6/6 quality) |
-| warp-34 TP1, MTP3 (post-fix) | 33.56 | 21.90 | 29.78 tok/s; complete (6/6 quality) |
+| warp34 TP1, target-only (post-fix) | 16.52 | 3.54 | 11.77 tok/s; complete (6/6 quality) |
+| warp34 TP1, MTP3 (post-fix) | 33.56 | 21.90 | 29.78 tok/s; complete (6/6 quality) |
 | [one-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-3090), MTP3 | 30.82 | 21.23 | Failed: live tool call |
-| warp-34 TP2, target-only, 4096 pages (post-fix) | 48.26 | 4.63 | 34.38 tok/s; complete (6/6 quality) |
-| warp-34 TP2, MTP3, 4096 pages (post-fix) | 69.25 | 28.81 | 55.49 tok/s; complete (6/6 quality) |
+| warp34 TP2, target-only, 4096 pages (post-fix) | 48.26 | 4.63 | 34.38 tok/s; complete (6/6 quality) |
+| warp34 TP2, MTP3, 4096 pages (post-fix) | 69.25 | 28.81 | 55.49 tok/s; complete (6/6 quality) |
 | [two-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-2x3090), MTP3 | 56.20 | 28.20 | Failed: live tool call |
 | Strata TP1, lookup4 | 52.95 | 15.27 | 49.67 tok/s; quality caveat |
 
 - **Flash Next MTP HTTP serving (`warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3`) now passes all `6/6` quality checks (`arithmetic`, `json`, `code`, `needle-short-front`, `needle-medium-middle`, `needle-medium-end`) and completes 100% of HTTP benchmark trials with zero SSE errors.** Three interacting bugs were fixed:
   1. `serving_state_slots(max_num_seqs)` returned `4` for `--max-num-seqs 1`, leaving only `1` free `StateBundlePool` slot after allocating `3` request private slots (`running_slot`, `extra_slot_a`, `extra_slot_b`), whereas `step_scheduled_verify_round` with `MTP-3` (`k=3`) requires `3` verification state slots (`alloc_state_slot_from` failed with `no speculative verification state slots` on the first verify step of `json`). Enforcing `.map(|slots| slots.max(8))` guarantees at least 8 state slots for single-sequence serving.
-  2. `NativeProposer::restore` slow path (`crates/w34-host/src/proposer.rs`) staged host `memo.features` into `self.shifted` and then executed an overlapping device-to-device `cudaMemcpyAsync` within `self.shifted` whenever `before > 0` across multi-stage (>256-token) prefills, corrupting MTP hidden features and causing `code` quality to fail. Staging `memo.features` into `t.last_final_hidden_f16` eliminated the overlap.
+  2. `NativeProposer::restore` slow path (`crates/warp34-host/src/proposer.rs`) staged host `memo.features` into `self.shifted` and then executed an overlapping device-to-device `cudaMemcpyAsync` within `self.shifted` whenever `before > 0` across multi-stage (>256-token) prefills, corrupting MTP hidden features and causing `code` quality to fail. Staging `memo.features` into `t.last_final_hidden_f16` eliminated the overlap.
   3. `TokenBitmaskConstraint::is_terminal_eos()` truncation in `proposer.rs` and `engine_worker.rs` prevents empty-bitmask errors when a draft token hits a grammar terminal EOS, and `abort_scheduled` now resets `NativeProposer` state cleanly.
-- **Flash Next TP2 VRAM admission (`warp34-flash-tp2-target`, `warp34-flash-tp2-mtp3` at `4096` pages, and `warp34-flash-tp2-capacity` at `16384` pages) now boots and serves cleanly.** `plan_tiered_moe_hot_per_layer` (`crates/w34-host/src/model/rank.rs`) queries live post-weight `device.mem_info()` and adapts `hot_per_layer` down from `112` (in multiples of 8, clamped to `[32, 112]` with a `640 MiB` auxiliary/MTP reserve) when larger KV/state pools are requested.
-- **On 2× RTX 3090 Ti with MTP-3 (`warp34-flash-tp2-mtp3`, 4096 pages), `warp-34` sweeps 5/5 serving workloads over `qfn-2x3090-mtp3`: `69.25 tok/s` on `short-chat` (+23.2% over `56.20 tok/s`), `27.09 tok/s` on `prefill-context-r16` (+27.4% over `21.27 tok/s`), `28.81 tok/s` on `code-context-r64` (+2.2% over `28.20 tok/s`), `45.90 tok/s` (`94.8%` warm-prefix hit rate) on `prefix-primed-r16` (+123.7% over `20.52 tok/s`), and `55.49 tok/s` on `coding-agent-replay` (`8/8` passed vs failure), plus `68.2s` (`0.938 tok/s`, `1.471 tok/s` steady) vs `72.3s` (`0.885 tok/s`) on `cold-read-60k`.**
-- **On 1× RTX 3090 Ti with MTP-3 (`warp34-flash-tp1-mtp3`, 4096 pages), `warp-34` sweeps 5/5 serving workloads over `qfn-3090-mtp3`: `32.41–33.56 tok/s` on `short-chat` (+5.2%–8.9% over `30.82 tok/s`), `18.37–18.54 tok/s` on `prefill-context-r16` (+79.6% over `10.23 tok/s`), `21.51–21.90 tok/s` on `code-context-r64` (+1.3%–3.2% over `21.23 tok/s`), `28.67 tok/s` on `prefix-primed-r16` (+181.9% over `10.17 tok/s`), and `27.25–29.78 tok/s` on `coding-agent-replay` (`8/8` passed vs failure).**
+- **Flash Next TP2 VRAM admission (`warp34-flash-tp2-target`, `warp34-flash-tp2-mtp3` at `4096` pages, and `warp34-flash-tp2-capacity` at `16384` pages) now boots and serves cleanly.** `plan_tiered_moe_hot_per_layer` (`crates/warp34-host/src/model/rank.rs`) queries live post-weight `device.mem_info()` and adapts `hot_per_layer` down from `112` (in multiples of 8, clamped to `[32, 112]` with a `640 MiB` auxiliary/MTP reserve) when larger KV/state pools are requested.
+- **On 2× RTX 3090 Ti with MTP-3 (`warp34-flash-tp2-mtp3`, 4096 pages), `warp34` sweeps 5/5 serving workloads over `qfn-2x3090-mtp3`: `69.25 tok/s` on `short-chat` (+23.2% over `56.20 tok/s`), `27.09 tok/s` on `prefill-context-r16` (+27.4% over `21.27 tok/s`), `28.81 tok/s` on `code-context-r64` (+2.2% over `28.20 tok/s`), `45.90 tok/s` (`94.8%` warm-prefix hit rate) on `prefix-primed-r16` (+123.7% over `20.52 tok/s`), and `55.49 tok/s` on `coding-agent-replay` (`8/8` passed vs failure), plus `68.2s` (`0.938 tok/s`, `1.471 tok/s` steady) vs `72.3s` (`0.885 tok/s`) on `cold-read-60k`.**
+- **On 1× RTX 3090 Ti with MTP-3 (`warp34-flash-tp1-mtp3`, 4096 pages), `warp34` sweeps 5/5 serving workloads over `qfn-3090-mtp3`: `32.41–33.56 tok/s` on `short-chat` (+5.2%–8.9% over `30.82 tok/s`), `18.37–18.54 tok/s` on `prefill-context-r16` (+79.6% over `10.23 tok/s`), `21.51–21.90 tok/s` on `code-context-r64` (+1.3%–3.2% over `21.23 tok/s`), `28.67 tok/s` on `prefix-primed-r16` (+181.9% over `10.17 tok/s`), and `27.25–29.78 tok/s` on `coding-agent-replay` (`8/8` passed vs failure).**
 - **Flash Next QSA, PLE, MTP, and AVX-512 CPU+GPU hybrid MoE offload optimizations:**
   - Parallelized `qsa_select_blocks_f16_kernel` (warp-parallel block scoring + parallel radix/threshold top-k selection) and `qsa_sparse_paged_attn_f16_kernel` (6-Q-head GQAKV tile sharing + Split-K decode reduction in `op_qsa.cu`).
   - Added CUDA-Graph-safe CPU+GPU hybrid MoE cold-expert bridge (`op_moe_cpu_bridge.cu`) using 16-core AVX-512F/F16C (`__m512` 16-lane `u4b8` group evaluation, 4-row unrolled decode & tile kernels, L3-fitting contiguous `job_out` packing, and prompt-frequency-guided dynamic hot-slot promotion during `StreamedPrefill` Chunk 0 at zero extra PCIe cost).

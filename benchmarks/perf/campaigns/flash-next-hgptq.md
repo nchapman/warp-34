@@ -15,7 +15,7 @@ comparison or model-quality evaluation is included.
   350 W configured power limits; AMD EPYC 7R13, AVX2, 96 visible logical CPUs.
 - Container memory limit: 183,320,444,928 bytes (about 170.7 GiB); host-reported
   RAM is not the container allocation. Host memory is shared with other activity.
-- Engine source: `b7f5fdd`, release CUDA build with `W34_ARCH=sm_86`, CUDA 13.2,
+- Engine source: `b7f5fdd`, release CUDA build with `WARP34_ARCH=sm_86`, CUDA 13.2,
   Rust 1.99.1. Engine source was not modified for these measurements.
 - Target: `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` at
   `6ee06d2936b111f19eb5eb331044cb8b8b28562b`.
@@ -59,7 +59,7 @@ A separate raw SSE reproduction retained the exact TP2 error:
 CUDA error -10 in no speculative verification state slots
 ```
 
-The serving planner (`crates/w34-host/src/model/rank.rs`, `serving_state_slots`)
+The serving planner (`crates/warp34-host/src/model/rank.rs`, `serving_state_slots`)
 requests `max(8, 4 * max_num_seqs)` slots. Eight slots are insufficient for this
 DFlash2 workload; `proposer/scheduled.rs` fails while allocating verification
 slots after the first output token. This was a serving-capacity failure, not an

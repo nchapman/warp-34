@@ -25,9 +25,9 @@ compile_size = 64bit
 Resource usage:
  Common:
   GLOBAL:0
- Function _ZN11w34_sampler23sampler_step_f16_kernelEPK6__half:
+ Function _ZN14warp34_sampler23sampler_step_f16_kernelEPK6__half:
   REG:64 STACK:32 SHARED:28492 LOCAL:0 CONSTANT[0]:440 TEXTURE:0 SURFACE:0 SAMPLER:0
- Function _ZN3w3441tp2_all_reduce_hc_combine_tap_f16_kernelEPK6__half:
+ Function _ZN6warp3441tp2_all_reduce_hc_combine_tap_f16_kernelEPK6__half:
   REG:48 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:456 TEXTURE:0 SURFACE:0 SAMPLER:0
 
 Fatbin elf code:
@@ -40,9 +40,9 @@ compile_size = 64bit
 Resource usage:
  Common:
   GLOBAL:0
- Function _ZN11w34_sampler23sampler_step_f16_kernelEPK6__half:
+ Function _ZN14warp34_sampler23sampler_step_f16_kernelEPK6__half:
   REG:64 STACK:32 SHARED:28492 LOCAL:0 CONSTANT[0]:440 TEXTURE:0 SURFACE:0 SAMPLER:0
- Function _ZN3w3441tp2_all_reduce_hc_combine_tap_f16_kernelEPK6__half:
+ Function _ZN6warp3441tp2_all_reduce_hc_combine_tap_f16_kernelEPK6__half:
   REG:48 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:456 TEXTURE:0 SURFACE:0 SAMPLER:0
 """
 

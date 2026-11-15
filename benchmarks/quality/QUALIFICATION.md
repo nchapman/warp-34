@@ -16,8 +16,8 @@ rankings, or proof of speculative parity.
 
 | Server | Target | Decode | Evaluated documents | Result |
 |---|---|---|---:|---|
-| warp-34 `b7f5fdd` | Qwen3.8-27B HGPTQ | TP2/MTP-3/TQ4 | 10 + 10 | Passed |
-| warp-34 `b7f5fdd` | Qwen3.8-Flash-Next HGPTQ | TP2/MTP-3/TQ4 | 10 + 10 | Passed |
+| warp34 `b7f5fdd` | Qwen3.8-27B HGPTQ | TP2/MTP-3/TQ4 | 10 + 10 | Passed |
+| warp34 `b7f5fdd` | Qwen3.8-Flash-Next HGPTQ | TP2/MTP-3/TQ4 | 10 + 10 | Passed |
 | vLLM 0.31.0 | Qwen3.8-27B GPTQ | TP2/MTP-3/native KV | 10 + 10 | Passed |
 | SGLang 0.5.19 | Qwen3.8-27B GPTQ | TP2/native MTP, 3 steps/native KV | 10 + 10 | Passed |
 
@@ -43,7 +43,7 @@ GSM8K `740312add88f781978c0658806c59bc2815b9866`.
   541/1,319. Sample logs contain 10 distinct document IDs per task.
 - GSM8K's two filters produce **20 sample rows for 10 documents**. These are not
   duplicate inference calls or a custom scoring pipeline.
-- Each warp-34 deployment reports 20 completed requests, zero failed/cancelled
+- Each warp34 deployment reports 20 completed requests, zero failed/cancelled
   requests, and zero HTTP client/server errors.
 - vLLM reports 20 successful requests: 18 stop finishes, two length finishes,
   zero abort/error finishes. Token-budget finishes remain scored unchanged.
@@ -69,7 +69,7 @@ the successful client execution separately. The readiness detector was corrected
 for SGLang. These temporary supervisors are not the evaluation interface; use
 the direct CLI commands in [README.md](README.md) and [servers.md](servers.md).
 
-Startup/compilation can dominate these tiny checks: the 27B warp-34 check took
+Startup/compilation can dominate these tiny checks: the 27B warp34 check took
 about 65 seconds including startup, Flash-Next about 3.5 minutes, and SGLang about
 7 minutes including first startup/compilation. vLLM's direct client execution
 took about 64 seconds, excluding startup and the supervisor delay. These are

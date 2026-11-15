@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from w34perf.evidence import attach
+from warp34perf.evidence import attach
 
 
 class EvidenceTests(unittest.TestCase):
@@ -36,8 +36,8 @@ class EvidenceTests(unittest.TestCase):
             self.assertFalse((root / 'evidence').exists())
 
     def test_run_rejects_missing_evidence_or_inactive_pid_sampling_before_output(self):
-        from w34perf.config import load
-        from w34perf.runner import execute
+        from warp34perf.config import load
+        from warp34perf.runner import execute
         cfg = load(Path(__file__).resolve().parents[1] / 'suite.toml')
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'run'
@@ -49,8 +49,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_quality_results_are_profile_bound_and_failures_are_not_hidden(self):
         import json
-        from w34perf.config import digest
-        from w34perf.evidence import quality_status
+        from warp34perf.config import digest
+        from warp34perf.evidence import quality_status
         engine = {'id': 'test', 'version': 'one'}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,0 +1,631 @@
+//! OpenAI request validation and Axum HTTP/SSE serving.
+use axum::http::StatusCode;
+use core::fmt;
+
+pub use crate::chatml::{ChatMessage, format_chatml_prompt, format_chatml_prompt_with_options};
+#[cfg(feature = "cuda")]
+mod decision_http;
+#[cfg(feature = "cuda")]
+mod http;
+#[cfg(feature = "cuda")]
+pub use http::*;
+
+/// Deployment controls shared by the CLI, HTTP server, and engine ingress.
+/// Authentication is opt-in; secrets deliberately have no Debug implementation.
+#[derive(Clone)]
+pub struct ServeOptions {
+    pub api_key: Option<crate::api_auth::ApiKey>,
+    pub max_num_seqs: usize,
+    /// Optional total prompt + output admission ceiling, not a KV allocation size.
+    pub max_model_len: Option<usize>,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            max_num_seqs: crate::scheduler::SchedulerConfig::default().max_num_seqs,
+            max_model_len: None,
+        }
+    }
+}
+
+impl ServeOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        // The current decode graph IO and capture buckets support at most 16 requests.
+        if !(1..=16).contains(&self.max_num_seqs) {
+            return Err("--max-num-seqs must be 1..16".into());
+        }
+        if self.max_model_len == Some(0) {
+            return Err("--max-model-len must be positive".into());
+        }
+        Ok(())
+    }
+}
+
+/// Typed error seam between the engine worker thread and HTTP handlers.
+///
+/// Preserves failure categories from the producer so handlers return accurate
+/// HTTP status codes (`400`, `429`, `503`, `500`) instead of flattening
+/// client validation errors, overload, and panics into a generic `500`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerError {
+    /// Client-fixable invalid request (`400 Bad Request`).
+    InvalidRequest(String),
+    /// Transient server capacity exhaustion (`429 Too Many Requests`).
+    Overload(String),
+    /// Graceful worker shutdown (`503 Service Unavailable`).
+    WorkerStopped(String),
+    /// Fatal worker thread panic caught at the scheduler loop boundary (`500 Internal Server Error`).
+    WorkerPanicked(String),
+    /// Structured CUDA / kernel failure (`500 Internal Server Error`).
+    Cuda(crate::cuda::CudaError),
+    /// Internal execution or sampling invariant failure (`500 Internal Server Error`).
+    Internal(String),
+}
+
+impl WorkerError {
+    #[inline]
+    pub fn invalid_request(msg: impl Into<String>) -> Self {
+        Self::InvalidRequest(msg.into())
+    }
+
+    #[inline]
+    pub fn overload(msg: impl Into<String>) -> Self {
+        Self::Overload(msg.into())
+    }
+
+    #[inline]
+    pub fn worker_stopped(msg: impl Into<String>) -> Self {
+        Self::WorkerStopped(msg.into())
+    }
+
+    #[inline]
+    pub fn worker_panicked(msg: impl Into<String>) -> Self {
+        Self::WorkerPanicked(msg.into())
+    }
+
+    #[inline]
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal(msg.into())
+    }
+
+    /// Maps `op_sampler.cu` non-zero row statuses: `1` denotes an unsatisfiable
+    /// client bitmask (zero allowed tokens), `2` denotes non-finite logits, and
+    /// `3` denotes a row incorrectly dispatched to the fast-greedy kernel.
+    #[inline]
+    pub fn sampler_status(status: i32) -> Self {
+        if status == 1 {
+            Self::InvalidRequest("GPU sampler status 1: grammar bitmask allows zero tokens".into())
+        } else {
+            Self::Internal(format!("GPU sampler status {status}"))
+        }
+    }
+
+    #[inline]
+    pub const fn http_status(&self) -> StatusCode {
+        match self {
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Overload(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::WorkerStopped(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::WorkerPanicked(_) | Self::Cuda(_) | Self::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+
+    #[inline]
+    pub const fn openai_error_type(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest(_) => "invalid_request_error",
+            Self::Overload(_) => "rate_limit_error",
+            Self::WorkerStopped(_)
+            | Self::WorkerPanicked(_)
+            | Self::Cuda(_)
+            | Self::Internal(_) => "server_error",
+        }
+    }
+}
+
+impl fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(m)
+            | Self::Overload(m)
+            | Self::WorkerStopped(m)
+            | Self::Internal(m) => f.write_str(m),
+            Self::WorkerPanicked(m) => write!(f, "engine worker terminated after panic: {m}"),
+            Self::Cuda(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
+impl From<crate::cuda::CudaError> for WorkerError {
+    #[inline]
+    fn from(err: crate::cuda::CudaError) -> Self {
+        Self::Cuda(err)
+    }
+}
+
+impl From<WorkerError> for String {
+    #[inline]
+    fn from(err: WorkerError) -> Self {
+        err.to_string()
+    }
+}
+
+/// Endpoint-specific wire validation; chat retains its boolean logprobs contract.
+pub fn completion_sampling_params(
+    req: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<crate::parser::SamplingParams, String> {
+    if !req.is_object() {
+        return Err("completion request must be a JSON object".into());
+    }
+    let mut normalized = req.clone();
+    let count = match req.get("logprobs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|&n| n <= warp34_kernels::ffi::WARP34_MAX_TOP_LOGPROBS as u64)
+                .ok_or_else(|| {
+                    format!(
+                        "logprobs must be an integer in 0..={}",
+                        warp34_kernels::ffi::WARP34_MAX_TOP_LOGPROBS
+                    )
+                })?,
+        ),
+    };
+    // top_logprobs is a chat-only option, not an override for the integer count.
+    if req.get("top_logprobs").is_some_and(|v| !v.is_null()) {
+        return Err("top_logprobs is only supported for chat completions".into());
+    }
+    normalized["logprobs"] = serde_json::json!(count.is_some());
+    normalized["top_logprobs"] = serde_json::json!(count.unwrap_or(0));
+    native_sampling_params(&normalized, max_tokens)
+}
+
+/// Convert token records to the legacy parallel-array wire shape. Offsets are
+/// Unicode character positions in generated text (the prompt is not echoed).
+pub fn completion_logprobs(logs: &[serde_json::Value], offset: &mut usize) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let mut tokens = Vec::new();
+    let mut probabilities = Vec::new();
+    let mut alternatives = Vec::new();
+    let mut offsets = Vec::new();
+    for log in logs {
+        let token = log["token"].as_str().unwrap_or_default();
+        // Serving records carry positions from the response's incremental decoder.
+        // Single-token decoding can contain replacement characters for byte fragments.
+        if let Some(position) = log["_text_offset"].as_u64() {
+            offsets.push(position as usize);
+            *offset = position as usize;
+        } else {
+            // Compatibility for callers supplying already-decoded token records.
+            offsets.push(*offset);
+            *offset += token.chars().count();
+        }
+        tokens.push(token);
+        probabilities.push(log["logprob"].clone());
+        let mut top = serde_json::Map::new();
+        if let Some(entries) = log["top_logprobs"].as_array() {
+            for entry in entries {
+                if let Some(token) = entry["token"].as_str() {
+                    top.insert(token.to_owned(), entry["logprob"].clone());
+                }
+            }
+        }
+        alternatives.push(Value::Object(top));
+    }
+    json!({"tokens":tokens,"token_logprobs":probabilities,"top_logprobs":alternatives,"text_offset":offsets})
+}
+
+pub fn native_sampling_params(
+    req: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<crate::parser::SamplingParams, String> {
+    use crate::parser::SamplingParams;
+    if max_tokens == 0 || max_tokens > 4096 {
+        return Err("max_tokens must be in 1..=4096".into());
+    }
+    if req
+        .get("stop_token_ids")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|ids| ids.len() > 256)
+        || req
+            .get("logit_bias")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|bias| bias.len() > 256)
+    {
+        return Err("stop_token_ids and logit_bias are limited to 256 entries each".into());
+    }
+    let defaults = SamplingParams::default();
+    let number = |name: &str, default: f32| -> Result<f32, String> {
+        req.get(name).map_or(Ok(default), |v| {
+            v.as_f64()
+                .map(|x| x as f32)
+                .ok_or_else(|| format!("invalid {name}"))
+        })
+    };
+    let boolean = |name: &str| -> Result<bool, String> {
+        req.get(name).map_or(Ok(false), |v| {
+            v.as_bool().ok_or_else(|| format!("invalid {name}"))
+        })
+    };
+    let unsigned = |name: &str, default: u64| -> Result<u64, String> {
+        req.get(name).map_or(Ok(default), |v| {
+            v.as_u64().ok_or_else(|| format!("invalid {name}"))
+        })
+    };
+    let stop_strings = match req.get("stop") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) if a.len() <= 4 => a
+            .iter()
+            .map(|s| {
+                s.as_str()
+                    .map(str::to_owned)
+                    .ok_or("invalid stop string".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("stop must be a string or up to four strings".into()),
+    };
+    if stop_strings.iter().any(|s| s.is_empty() || s.len() > 4096) {
+        return Err("stop strings must contain 1..4096 bytes".into());
+    }
+    let stop_token_ids = match req.get("stop_token_ids") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .ok_or("invalid stop_token_ids")?
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .and_then(|i| i32::try_from(i).ok())
+                    .ok_or("invalid stop token".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut logit_bias = std::collections::BTreeMap::new();
+    if let Some(v) = req.get("logit_bias").filter(|v| !v.is_null()) {
+        for (key, value) in v.as_object().ok_or("invalid logit_bias")? {
+            logit_bias.insert(
+                key.parse::<i32>().map_err(|_| "invalid logit_bias token")?,
+                value.as_f64().ok_or("invalid logit_bias value")? as f32,
+            );
+        }
+    }
+    let params = SamplingParams {
+        temperature: number("temperature", defaults.temperature)?,
+        top_k: req.get("top_k").map_or(Ok(defaults.top_k), |v| {
+            v.as_i64()
+                .and_then(|x| i32::try_from(x).ok())
+                .ok_or("invalid top_k")
+        })?,
+        top_p: number("top_p", defaults.top_p)?,
+        min_p: number("min_p", defaults.min_p)?,
+        repetition_penalty: number("repetition_penalty", defaults.repetition_penalty)?,
+        frequency_penalty: number("frequency_penalty", defaults.frequency_penalty)?,
+        presence_penalty: number("presence_penalty", defaults.presence_penalty)?,
+        seed: unsigned("seed", defaults.seed)?,
+        max_tokens,
+        min_tokens: usize::try_from(unsigned("min_tokens", 0)?)
+            .map_err(|_| "invalid min_tokens")?,
+        ignore_eos: boolean("ignore_eos")?,
+        logprobs: boolean("logprobs")?,
+        top_logprobs: usize::try_from(unsigned("top_logprobs", 0)?)
+            .map_err(|_| "invalid top_logprobs")?,
+        logit_bias,
+        stop_strings,
+        stop_token_ids,
+        ..defaults
+    };
+    params.validate()?;
+    if params.min_tokens > max_tokens {
+        return Err("min_tokens exceeds max_tokens".into());
+    }
+    if params.top_logprobs > 0 && !params.logprobs {
+        return Err("top_logprobs requires logprobs=true".into());
+    }
+    Ok(params)
+}
+
+/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
+/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
+    let effort_thinking = match req.get("reasoning_effort").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str().ok_or("reasoning_effort must be a string")? {
+            "none" | "minimal" => Some(false),
+            "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
+            other => return Err(format!("unsupported reasoning_effort '{other}'")),
+        },
+    };
+    if let Some(kw) = req
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .filter(|v| !v.is_null())
+    {
+        return kw
+            .as_bool()
+            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".into());
+    }
+    Ok(effort_thinking.unwrap_or(true))
+}
+
+pub fn parse_openai_messages_multimodal(
+    messages: &serde_json::Value,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    parse_openai_messages_with_image_policy(messages, false)
+}
+
+pub fn parse_openai_messages_with_image_policy(
+    messages: &serde_json::Value,
+    allow_remote_images: bool,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    let arr = messages.as_array().ok_or("'messages' must be an array")?;
+    if arr.is_empty() {
+        return Err("'messages' must not be empty".into());
+    }
+    let image_count = arr
+        .iter()
+        .filter_map(|m| m.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|p| p.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
+        .count();
+    if image_count > crate::vision::MAX_IMAGES_PER_REQUEST {
+        return Err(format!(
+            "at most {} images are allowed per request",
+            crate::vision::MAX_IMAGES_PER_REQUEST
+        ));
+    }
+    let deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
+    let mut out = Vec::with_capacity(arr.len());
+    let mut images = Vec::new();
+    for (index, item) in arr.iter().enumerate() {
+        let raw_role = item
+            .get("role")
+            .and_then(|v| v.as_str())
+            .ok_or("message missing string 'role'")?;
+        let role = match raw_role {
+            "system" | "developer" => "system",
+            "user" | "assistant" | "tool" => raw_role,
+            other => return Err(format!("unsupported message role '{other}'")),
+        };
+        if role == "system" && index != 0 {
+            return Err("system message must be at the beginning".into());
+        }
+        let tool_calls = crate::chatml::parse_history_tools(item.get("tool_calls"))?;
+        if role != "assistant" && !tool_calls.is_empty() {
+            return Err("tool_calls are only valid on assistant messages".into());
+        }
+        let reasoning_content = item
+            .get("reasoning_content")
+            .or_else(|| item.get("reasoning"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let content = match item.get("content") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Array(parts)) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part.get("type").and_then(|v| v.as_str()).unwrap_or("text") {
+                        "text" => {
+                            if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                                text.push_str(s);
+                            }
+                        }
+                        "image_url" => {
+                            if role == "system" {
+                                return Err("system message cannot contain images".into());
+                            }
+                            let url = part
+                                .get("image_url")
+                                .and_then(|v| {
+                                    v.as_str().or_else(|| v.get("url").and_then(|v| v.as_str()))
+                                })
+                                .ok_or("image_url part missing 'url'")?;
+                            let (rgb, h, w) = crate::vision::parse_image_url_with_deadline(
+                                url,
+                                allow_remote_images,
+                                deadline,
+                            )
+                            .map_err(|e| format!("invalid image_url: {e}"))?;
+                            crate::vision::validate_image_aspect_ratio(h, w)
+                                .map_err(|e| format!("invalid image_url: {e}"))?;
+                            let prep = crate::vision::preprocess_rgb_image(
+                                &rgb,
+                                h,
+                                w,
+                                16,
+                                2,
+                                2,
+                                32 * 32,
+                                1024 * 1024,
+                            );
+                            text.push_str("<|vision_start|>");
+                            for _ in 0..prep.num_merged_tokens(2) {
+                                text.push_str("<|image_pad|>");
+                            }
+                            text.push_str("<|vision_end|>");
+                            images.push(prep);
+                        }
+                        other => {
+                            return Err(format!("unsupported message content part type '{other}'"));
+                        }
+                    }
+                }
+                Some(text)
+            }
+            _ => return Err("message 'content' must be string, array, or null".into()),
+        };
+        out.push(ChatMessage {
+            role: role.into(),
+            content,
+            reasoning_content,
+            tool_calls,
+        });
+    }
+    if !out.iter().any(|m| {
+        let c = m.content.as_deref().unwrap_or("").trim();
+        m.role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))
+    }) {
+        return Err("no user query found in messages".into());
+    }
+    Ok((out, images))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_sampling_params_validation() {
+        let valid_req = serde_json::json!({
+            "temperature": 0.7,
+            "max_tokens": 100,
+            "logprobs": 5
+        });
+        let params = completion_sampling_params(&valid_req, 100).unwrap();
+        assert_eq!(params.temperature, 0.7);
+        assert!(params.logprobs);
+        assert_eq!(params.top_logprobs, 5);
+
+        // Invalid: non-object
+        assert!(completion_sampling_params(&serde_json::json!("not an object"), 100).is_err());
+
+        // Invalid: logprobs exceeds WARP34_MAX_TOP_LOGPROBS
+        let oversized = serde_json::json!({
+            "logprobs": warp34_kernels::ffi::WARP34_MAX_TOP_LOGPROBS + 1
+        });
+        assert!(completion_sampling_params(&oversized, 100).is_err());
+
+        // Invalid: top_logprobs specified in legacy completion endpoint
+        let chat_opt = serde_json::json!({
+            "logprobs": 2,
+            "top_logprobs": 2
+        });
+        assert!(completion_sampling_params(&chat_opt, 100).is_err());
+    }
+
+    #[test]
+    fn test_completion_logprobs_wire_format() {
+        let logs = vec![
+            serde_json::json!({
+                "token": "Hello",
+                "logprob": -0.5,
+                "top_logprobs": [{"token": "Hello", "logprob": -0.5}, {"token": "Hi", "logprob": -1.2}]
+            }),
+            serde_json::json!({
+                "token": " world",
+                "logprob": -0.1,
+                "top_logprobs": [{"token": " world", "logprob": -0.1}]
+            }),
+        ];
+
+        let mut offset = 0;
+        let result = completion_logprobs(&logs, &mut offset);
+
+        assert_eq!(result["tokens"], serde_json::json!(["Hello", " world"]));
+        assert_eq!(result["token_logprobs"], serde_json::json!([-0.5, -0.1]));
+        assert_eq!(result["text_offset"], serde_json::json!([0, 5]));
+        assert_eq!(offset, 11); // "Hello world" has length 11
+    }
+
+    #[test]
+    fn test_native_sampling_params_bounds() {
+        // max_tokens = 0 must fail
+        assert!(native_sampling_params(&serde_json::json!({}), 0).is_err());
+        // max_tokens > 4096 must fail
+        assert!(native_sampling_params(&serde_json::json!({}), 5000).is_err());
+
+        // Valid request
+        let req = serde_json::json!({
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "seed": 42
+        });
+        let params = native_sampling_params(&req, 128).unwrap();
+        assert_eq!(params.temperature, 0.8);
+        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.seed, 42);
+    }
+
+    #[test]
+    fn test_resolve_chat_enable_thinking_and_developer_role() {
+        assert!(resolve_chat_enable_thinking(&serde_json::json!({})).unwrap());
+        assert!(
+            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "none"}))
+                .unwrap()
+        );
+        assert!(
+            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "minimal"}))
+                .unwrap()
+        );
+        for eff in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": eff}))
+                    .unwrap()
+            );
+        }
+        assert!(
+            resolve_chat_enable_thinking(&serde_json::json!({
+                "reasoning_effort": "none",
+                "chat_template_kwargs": {"enable_thinking": true}
+            }))
+            .unwrap()
+        );
+        assert!(
+            resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "bogus"}))
+                .is_err()
+        );
+
+        let (msgs, _) = parse_openai_messages_multimodal(&serde_json::json!([
+            {"role": "developer", "content": "Be strict."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello", "reasoning": "thought"}
+        ]))
+        .unwrap();
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[2].reasoning_content.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn test_worker_error_http_status_and_wire_classification() {
+        let bad = WorkerError::invalid_request("invalid tokens or request exceeds KV capacity");
+        assert_eq!(bad.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(bad.openai_error_type(), "invalid_request_error");
+
+        let overload = WorkerError::overload("engine admission capacity exceeded");
+        assert_eq!(overload.http_status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(overload.openai_error_type(), "rate_limit_error");
+
+        let stopped = WorkerError::worker_stopped("engine worker stopped");
+        assert_eq!(stopped.http_status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stopped.openai_error_type(), "server_error");
+
+        let panicked = WorkerError::worker_panicked("invariant failure");
+        assert_eq!(panicked.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(panicked.openai_error_type(), "server_error");
+        assert_eq!(
+            panicked.to_string(),
+            "engine worker terminated after panic: invariant failure"
+        );
+
+        let cuda = WorkerError::from(crate::cuda::CudaError::new(-10, "kernel launch"));
+        assert_eq!(cuda.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(cuda.openai_error_type(), "server_error");
+
+        assert_eq!(
+            WorkerError::sampler_status(1).http_status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WorkerError::sampler_status(2).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

@@ -53,7 +53,7 @@ def fetch_json(url: str, *, retries: int = 5) -> dict:
     delay = 1.0
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "warp-34-fixture-extractor/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "warp34-fixture-extractor/1.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.load(resp)
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):

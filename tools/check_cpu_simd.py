@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Static assembly & llvm-mca audit for w34-host CPU SIMD kernels.
+"""Static assembly & llvm-mca audit for warp34-host CPU SIMD kernels.
 
-Compiles `crates/w34-host/src/cuda/half.rs` and `crates/w34-host/src/moe_cpu_bridge/eval.rs`
+Compiles `crates/warp34-host/src/cuda/half.rs` and `crates/warp34-host/src/moe_cpu_bridge/eval.rs`
 with `rustc -C opt-level=3 --emit=asm` (~300 ms) and verifies:
   1. Zero unexpected `callq` instructions inside `#[target_feature]` kernels
      (catches intrinsics whose feature gate was omitted, e.g. `avx512dq`, or
@@ -28,8 +28,8 @@ import tempfile
 import time
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-HALF_RS = REPO_ROOT / "crates/w34-host/src/cuda/half.rs"
-EVAL_RS = REPO_ROOT / "crates/w34-host/src/moe_cpu_bridge/eval.rs"
+HALF_RS = REPO_ROOT / "crates/warp34-host/src/cuda/half.rs"
+EVAL_RS = REPO_ROOT / "crates/warp34-host/src/moe_cpu_bridge/eval.rs"
 
 PROBE_SOURCE = """
 #![allow(dead_code, private_interfaces)]

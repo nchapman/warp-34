@@ -1,19 +1,19 @@
 # Model acquisition
 
-`w34` accepts a local checkpoint directory or a Hugging Face repository ID:
+`warp34` accepts a local checkpoint directory or a Hugging Face repository ID:
 
 ```sh
 # Download on first use, then load the model. No Python/CLI dependency.
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ
+warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ
 
 # Reproducible deployment: use a full 40-character commit SHA.
-w34 serve --model username/modelname --revision <commit-sha>
+warp34 serve --model username/modelname --revision <commit-sha>
 
 # No network access or cache writes; also works with read-only cache mounts.
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline
+warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline
 
 # Local directories never contact the Hub.
-w34 generate --model /models/qwen --prompt 'Hello'
+warp34 generate --model /models/qwen --prompt 'Hello'
 ```
 
 Acquisition is shared by `generate`, `bench`, `greedy-diff`, `dump-diff`, `serve`,
@@ -41,8 +41,8 @@ remains the public API model name and the model identifier in benchmark reports.
 - The native client is pinned to Hugging Face's `hf-hub` 1.0.0, including its native
   Xet transfer support. It uses the standard `models--owner--repo/{blobs,refs,snapshots}`
   layout, interoperable with `hf download` / Python `huggingface_hub`.
-- warp-34 additionally records the required file list under each repository's
-  `.w34/<commit>.json`. This is bookkeeping, not another copy of model weights.
+- warp34 additionally records the required file list under each repository's
+  `.warp34/<commit>.json`. This is bookkeeping, not another copy of model weights.
   Offline startup checks every recorded file. Existing caches made by other tools
   without that manifest are accepted after checking configuration, tokenizer,
   available decision heads, Safetensors headers, and every indexed shard. Without
@@ -55,7 +55,7 @@ remains the public API model name and the model identifier in benchmark reports.
   availability.
 - An interrupted acquisition fails rather than returning a partial checkpoint.
   Retry the same command to reuse completed cached files. Disk and permission
-  errors are surfaced; warp-34 does not delete or garbage-collect existing cache
+  errors are surfaced; warp34 does not delete or garbage-collect existing cache
   entries. No promise of resuming every individual file at the last byte is made.
 
 ### DFlash2
@@ -63,7 +63,7 @@ remains the public API model name and the model identifier in benchmark reports.
 Target and draft repositories have **independent revisions**:
 
 ```sh
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
+warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --revision <target-commit> \
   --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 \
   --draft-revision <draft-commit>
@@ -89,8 +89,8 @@ weights and has no separate download or revision.
 | `HF_ENDPOINT` | Explicit Hub-compatible endpoint override; defaults to `https://huggingface.co` |
 
 Authentication, endpoint, and cache environment settings are resolved by
-`hf-hub` itself; warp-34 does not implement a second credential lookup or override
-the SDK's transport policy. warp-34 maps `--offline`/`HF_HUB_OFFLINE` to the SDK's
+`hf-hub` itself; warp34 does not implement a second credential lookup or override
+the SDK's transport policy. warp34 maps `--offline`/`HF_HUB_OFFLINE` to the SDK's
 `local_files_only` lookup and controls its own progress reporter.
 
 An existing `hf auth login` is recognized, but installing that CLI is **optional**:
@@ -138,7 +138,7 @@ execution.
 
 ## Library callers and tests
 
-`w34_host::hub::resolve_model` is the explicit acquisition API. The older
+`warp34_host::hub::resolve_model` is the explicit acquisition API. The older
 `loader::resolve_hf_model_dir` remains **cache-only** for library users and test
 fixtures; missing large GPU fixtures never automatically download during tests.
 Its cache root also respects the standard `HF_HOME`/`HF_HUB_CACHE` precedence.

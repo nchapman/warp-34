@@ -1,6 +1,6 @@
 # Structured outputs: XGrammar
 
-warp-34 uses **`xgrammar-rs = 0.2.8`**, the pure-Rust port of
+warp34 uses **`xgrammar-rs = 0.2.8`**, the pure-Rust port of
 [mlc-ai/XGrammar](https://github.com/mlc-ai/xgrammar), with the structured-output
 architecture of vLLM 0.31.0. There is no llguidance backend or fallback.
 
@@ -122,7 +122,7 @@ TP=2 MoE serving. The full GPU suite remains `mise run check`.
 An opt-in CPU benchmark uses a local Qwen tokenizer without downloads:
 
 ```sh
-W34_QWEN_TOKENIZER=/path/to/tokenizer.json \
+WARP34_QWEN_TOKENIZER=/path/to/tokenizer.json \
   cargo test --release --features cuda --test structured_constraints \
   benchmark_cached_qwen_constraint -- --ignored --nocapture
 ```

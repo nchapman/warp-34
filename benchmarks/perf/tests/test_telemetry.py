@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks/perf"))
-from w34perf.telemetry import TelemetrySampler
+from warp34perf.telemetry import TelemetrySampler
 
 
 GPU = "GPU-one, 10, 100, 25, 5, 1000, 900, 2000, 45, 120.5\n"
@@ -25,7 +25,7 @@ def proc_read(path):
 
 class TelemetryTests(unittest.TestCase):
     def test_validation_and_no_io_on_construction(self):
-        with patch("w34perf.telemetry.subprocess.run") as run:
+        with patch("warp34perf.telemetry.subprocess.run") as run:
             sampler = TelemetrySampler("unused")
             self.assertEqual(sampler.interval_s, 1)
             run.assert_not_called()
@@ -38,7 +38,7 @@ class TelemetryTests(unittest.TestCase):
                 TelemetrySampler("unused", pids=[pid])
 
     @patch("pathlib.Path.read_text", autospec=True, side_effect=proc_read)
-    @patch("w34perf.telemetry.subprocess.run")
+    @patch("warp34perf.telemetry.subprocess.run")
     def test_schema_and_explicit_pids(self, run, read):
         run.return_value = subprocess.CompletedProcess([], 0, GPU + GPU.replace("one", "two"), "")
         row = TelemetrySampler("unused", pids=[42, 99, 42], timeout_s=.3).sample()
@@ -64,7 +64,7 @@ class TelemetryTests(unittest.TestCase):
                     subprocess.TimeoutExpired("nvidia-smi", .1),
                     subprocess.CalledProcessError(1, "nvidia-smi", stderr="driver unavailable")]
         for failure in failures:
-            with self.subTest(failure=failure), patch("w34perf.telemetry.subprocess.run", side_effect=failure):
+            with self.subTest(failure=failure), patch("warp34perf.telemetry.subprocess.run", side_effect=failure):
                 row = TelemetrySampler("unused").sample()
                 self.assertIsNone(row["gpus"])
                 self.assertIsNone(row["host_meminfo_kib"])
@@ -73,7 +73,7 @@ class TelemetryTests(unittest.TestCase):
                 json.dumps(row, allow_nan=False)
 
     @patch("pathlib.Path.read_text", return_value="VmRSS: broken kB\n")
-    @patch("w34perf.telemetry.subprocess.run")
+    @patch("warp34perf.telemetry.subprocess.run")
     def test_partial_unavailable_and_malformed_values(self, run, read):
         run.return_value.stdout = GPU.replace("120.5", "[Not Supported]") + "bad,row\n" + GPU.replace("120.5", "nan")
         row = TelemetrySampler("unused", pids=[42]).sample()

@@ -37,7 +37,7 @@ These are project-level audit results, not six passing scores inherited by every
 
 ## Evidence ledger
 
-Paths beginning `tests/` in the register mean `crates/w34-host/tests/`; source paths begin `crates/w34-host/src/` unless stated otherwise. Test files establish executable coverage, not that every case ran in the latest check.
+Paths beginning `tests/` in the register mean `crates/warp34-host/tests/`; source paths begin `crates/warp34-host/src/` unless stated otherwise. Test files establish executable coverage, not that every case ran in the latest check.
 
 | Ref | Evidence | Interpretation |
 |---|---|---|
@@ -47,7 +47,7 @@ Paths beginning `tests/` in the register mean `crates/w34-host/tests/`; source p
 | E4 | [HGPTQ.md](HGPTQ.md), [MODELS.md](MODELS.md), [QWEN_FLASH_NEXT.md](QWEN_FLASH_NEXT.md) | Architecture, checkpoint, and format scope; combine with execution evidence rather than treating support documentation as a pass. |
 | E5 | [STRUCTURED_OUTPUTS.md](STRUCTURED_OUTPUTS.md), [GENERATIVE_APIS.md](GENERATIVE_APIS.md), [DECISION_MODELS.md](DECISION_MODELS.md), [SERVING.md](SERVING.md) | Public behavior contracts and limits; compatibility is with documented behavior, not the entirety of upstream APIs. |
 | E6 | [Performance campaigns](../benchmarks/perf/README.md), [quality qualification](../benchmarks/quality/QUALIFICATION.md), [automation](../benchmarks/quality/AUTOMATION.md) | Retained historical measurements/receipts. Small `lm-eval --limit` runs qualify tooling, not broad model quality. |
-| E7 | [.mise.toml](../.mise.toml), [test prerequisites](../tools/prep_test_models.py), [skip helpers](../crates/w34-host/tests/common/mod.rs), [CI](../.github/workflows/docker-image.yml) | `check` runs CUDA release tests; strict mode catches helper-based skips. Ignored tests, low-VRAM branches, and topology-specific branches still need explicit accounting. CPU oracle tests do not run live vLLM/SGLang comparisons. |
+| E7 | [.mise.toml](../.mise.toml), [test prerequisites](../tools/prep_test_models.py), [skip helpers](../crates/warp34-host/tests/common/mod.rs), [CI](../.github/workflows/docker-image.yml) | `check` runs CUDA release tests; strict mode catches helper-based skips. Ignored tests, low-VRAM branches, and topology-specific branches still need explicit accounting. CPU oracle tests do not run live vLLM/SGLang comparisons. |
 | E8 | [Packaging experiment](CUBLAS_PACKAGING_EXPERIMENT.md), [Dockerfile](../Dockerfile), E3 | Shared cuBLAS is the chosen default; older image sizes and Ada runs belong to their recorded binaries. |
 | E9 | Fresh assessment verification | Core `prep_test_models.py --check` passed on 2026-11-09 (15 tracked fixtures and four core snapshot entries). Strict two-3090-Ti `mise run check` result is recorded in the release checklist. No fresh external-oracle, Ada, TP4, container, or soak qualification is implied. |
 
@@ -73,7 +73,7 @@ Paths beginning `tests/` in the register mean `crates/w34-host/tests/`; source p
 | UI-01 | §4 embedded dashboard, CSP, cache headers and asset paths | B | `src/dashboard.rs::embedded_dashboard_and_assets_serve_without_filesystem`; `dashboard/`; E8 | Browser smoke against shipped image; metrics/dashboard are public at application level. Restrict at ingress if sensitive. G4/G6. |
 | VER-01 | §21 tensor/token/profile oracle framework | B | `tools/oracle/`; `tests/xgrammar_oracle.rs`; E1/E2/E6/E7 | Fresh matched-checkpoint oracle receipts; distinguish exact matches from adjudicated numerical divergence. G2/G5. |
 | PKG-01 | §22 Docker runtime, non-root user, shared CUDA libs, caches/healthcheck | B | `Dockerfile`; E3/E8 | Pull/run exact image digest, read-only/offline model-cache smoke, driver floor, shutdown/restart and upgrade rollback. G6. |
-| PKG-02 | §22 sm_86/sm_89 native fatbinary and runtime device properties | B | `crates/w34-kernels/build.rs`; `src/cuda.rs`; E3/E8 | Native-code smoke on both claimed architectures at release revision; PTX fallback separately if advertised. G1/G6. |
+| PKG-02 | §22 sm_86/sm_89 native fatbinary and runtime device properties | B | `crates/warp34-kernels/build.rs`; `src/cuda.rs`; E3/E8 | Native-code smoke on both claimed architectures at release revision; PTX fallback separately if advertised. G1/G6. |
 
 ### Request semantics — inventory §§5–6, 11, 20
 
@@ -170,7 +170,7 @@ These changes do not promote any row to A or close G0–G7 automatically. See [S
 
 ## Extended-workload execution support
 
-[`w34perf soak`](../benchmarks/perf/SOAK.md) now supplies a bounded driver for duration/completion targets, sustained/burst replay, local disconnect churn, completion-progress checks, optional endpoint RSS/GPU growth gates and a final inference probe. The checked-in coding workload is synthetic/replay; a short real-model smoke verifies the driver, **not G3 qualification**. Missing image/grammar/Responses-cancel coverage, server ownership conservation, production workload representativeness and external failure/recovery qualification remain explicit. See [STATE.md](STATE.md) for the smoke receipt and limitations; no readiness grades or gates are promoted by adding the harness.
+[`warp34perf soak`](../benchmarks/perf/SOAK.md) now supplies a bounded driver for duration/completion targets, sustained/burst replay, local disconnect churn, completion-progress checks, optional endpoint RSS/GPU growth gates and a final inference probe. The checked-in coding workload is synthetic/replay; a short real-model smoke verifies the driver, **not G3 qualification**. Missing image/grammar/Responses-cancel coverage, server ownership conservation, production workload representativeness and external failure/recovery qualification remain explicit. See [STATE.md](STATE.md) for the smoke receipt and limitations; no readiness grades or gates are promoted by adding the harness.
 
 ## Assessment maintenance
 

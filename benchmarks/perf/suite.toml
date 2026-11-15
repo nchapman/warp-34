@@ -26,18 +26,18 @@ speculation = "none"
 
 [[engines]]
 id = "warp34-1-fp16"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "fp16"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --kv-format fp16 --kv-pages 4096 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --kv-format fp16 --kv-pages 4096 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-2-tq4"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -45,60 +45,60 @@ gpu_count = 2
 parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --tp 2 --kv-format tq4 --kv-pages 4096 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --tp 2 --kv-format tq4 --kv-pages 4096 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-4b-tp1-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-4b-tp1-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "dflash2"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-27b-tp1-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-27b-tp1-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "dflash2"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-27b-tp2-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -107,12 +107,12 @@ parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-27b-tp2-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -121,24 +121,24 @@ parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "dflash2"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-35b-tp1-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-35b-tp2-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -147,36 +147,36 @@ parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-flash-tp1-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-flash-tp1-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "dflash2"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-flash-tp2-mtp3"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -185,12 +185,12 @@ parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "mtp-3"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-flash-tp2-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "unknown"
 model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
 base_url = "http://127.0.0.1:8000/v1"
@@ -199,7 +199,7 @@ parallelism = "tensor-2"
 weight_format = "HGPTQ-W4A16"
 kv_format = "tq4"
 speculation = "dflash2"
-launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/warp34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]

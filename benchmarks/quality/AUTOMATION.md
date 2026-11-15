@@ -1,7 +1,7 @@
 # Automated four-engine quality suite — FP16 KV
 
 `run_suite.py` is the checked-in process supervisor. `suite.toml` defines the
-27B deployments. It runs **warp-34 → vLLM → llama.cpp → SGLang**, one server at a
+27B deployments. It runs **warp34 → vLLM → llama.cpp → SGLang**, one server at a
 time on one GPU, invoking the **unmodified upstream lm-eval CLI** separately for
 IFEval and GSM8K. There is no custom prompt construction, answer extraction or
 scoring. The default is **10 examples per task per engine (80 evaluated requests)**.
@@ -11,7 +11,7 @@ scoring. The default is **10 examples per task per engine (80 evaluated requests
 Use Linux with Python 3.12, NVIDIA drivers/`nvidia-smi`, the
 [locked evaluator environment](README.md#install-an-isolated-environment), and
 separate installations of vLLM **0.31.0**, SGLang **0.5.19**, and llama.cpp
-**v0.9.0** (`cd959bae99ff4bed22bef2604f45241c09bbb8c8`). Build warp-34 with CUDA.
+**v0.9.0** (`cd959bae99ff4bed22bef2604f45241c09bbb8c8`). Build warp34 with CUDA.
 The runner does not install engines, download weights, or modify their sources.
 
 Set these paths once in the shell (or your own untracked environment file):
@@ -19,7 +19,7 @@ Set these paths once in the shell (or your own untracked environment file):
 ```sh
 export PATH="/opt/cuda/bin:/usr/local/cuda/bin:$PATH"
 export LM_EVAL="$PWD/benchmarks/quality/.venv/bin/lm-eval"
-export W34="$PWD/target/release/w34"
+export WARP34="$PWD/target/release/warp34"
 export VLLM=/absolute/path/to/vllm-venv/bin/vllm
 export SGLANG_PYTHON=/absolute/path/to/sglang-venv/bin/python
 export LLAMA_SERVER=/absolute/path/to/llama.cpp/build/bin/llama-server
@@ -41,7 +41,7 @@ vLLM and SGLang now use cyankiwi AWQ: compressed-tensors pack-quantized,
 4-bit asymmetric group32. Unquantized MTP weights are present. A separate
 [vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md) passed plain/MTP-3
 startup and short generation, but these **TP1 quality recipes remain unqualified**.
-New receipts are required; the historical GPTQ checks below do not qualify them. warp-34
+New receipts are required; the historical GPTQ checks below do not qualify them. warp34
 continues to use nchapman HGPTQ; deprecated nchapman GPTQ is not a substitute.
 
 The Unsloth directory must contain `Qwen3.8-27B-UD-Q4_K_XL.gguf` and
@@ -87,7 +87,7 @@ client request at a time, and the same native task/generation settings:
 
 | Engine | KV configuration | Decoding mode |
 |---|---|---|
-| warp-34 | `--kv-format fp16 --kv-pages 256` | MTP-3 |
+| warp34 | `--kv-format fp16 --kv-pages 256` | MTP-3 |
 | vLLM | `--dtype half --kv-cache-dtype float16` | MTP-3 |
 | llama.cpp | explicit `f16` K/V for both target and draft | Native MTP, max 3 draft tokens |
 | SGLang | `--dtype float16 --kv-cache-dtype auto` | **Plain**, explicitly configured |
@@ -97,7 +97,7 @@ SGLang's pinned version documents `auto` as the model dtype; with explicit
 fit the single 24GB GPU in the prior checks. The runner does **not** try MTP then
 silently fall back. Its plain mode is visible in the manifest and summary.
 
-Persistent recurrent SSM state is FP32: native warp-34 policy, explicit donor
+Persistent recurrent SSM state is FP32: native warp34 policy, explicit donor
 flags, and llama.cpp's hybrid recurrent allocation. This is separate from
 attention KV precision. Recurrent convolution storage/implementation is not
 identical across engines (llama.cpp uses FP32 recurrent buffers, whereas the
@@ -109,7 +109,7 @@ No second GPU, transformer-layer CPU offload, reduced context or lower-precision
 KV is introduced after a failure. llama.cpp uses `--fit off`, explicit all-layer
 offload, and verbose startup logs; its ordinary CPU-mapped model buffers remain
 visible. Inherited `LLAMA_ARG_*` variables are removed to prevent hidden overrides.
-TQ4 remains warp-34's production policy, but belongs in a separately labeled KV
+TQ4 remains warp34's production policy, but belongs in a separately labeled KV
 ablation, not this shared baseline. Historical mixed-KV outputs remain unchanged.
 
 ## Lifecycle, failures and evidence
@@ -157,7 +157,7 @@ was empty afterward. Local GPUs were not used.
 
 | Engine | IFEval strict prompt | GSM8K strict | GSM8K flexible |
 |---|---:|---:|---:|
-| warp-34, FP16 KV | 10/10 | 8/10 | 8/10 |
+| warp34, FP16 KV | 10/10 | 8/10 | 8/10 |
 | vLLM, FP16 KV | 9/10 | 8/10 | 9/10 |
 | llama.cpp / Unsloth, FP16 KV | 10/10 | 9/10 | 9/10 |
 | SGLang plain, FP16 KV | 9/10 | 8/10 | 9/10 |
@@ -173,7 +173,7 @@ CPU regression test; launch commands, task invocation and scoring did not change
 
 vLLM logged `kv_cache_dtype=float16`; SGLang logged allocated KV dtype
 `torch.float16`; llama.cpp logged F16 K/V in both target and draft contexts.
-warp-34 was launched with explicit `--kv-format fp16`. These are configuration
+warp34 was launched with explicit `--kv-format fp16`. These are configuration
 and startup checks, not tensor-level verification of every cache allocation.
 
 ## Tests

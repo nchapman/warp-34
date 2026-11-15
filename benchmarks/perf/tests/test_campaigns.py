@@ -5,10 +5,10 @@ import shlex
 from pathlib import Path
 import unittest
 
-from w34perf.config import load
-from w34perf.presets import apply_preset
-from w34perf.quality import _checks
-from w34perf.selection import select
+from warp34perf.config import load
+from warp34perf.presets import apply_preset
+from warp34perf.quality import _checks
+from warp34perf.selection import select
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,12 +30,12 @@ class CampaignTests(unittest.TestCase):
 
     def test_primary_suite_and_swe_multiclient_campaigns_cover_all_models_and_modes(self):
         suite = load(ROOT / 'suite.toml')
-        w34_engines = [e for e in suite['engines'] if e['engine'] == 'warp-34']
-        w34_models = {e['model'] for e in w34_engines}
+        warp34_engines = [e for e in suite['engines'] if e['engine'] == 'warp34']
+        warp34_models = {e['model'] for e in warp34_engines}
         for family in ('Qwen3.5-4B', 'Qwen3.8-27B', 'Qwen3.6-35B-A3B', 'Qwen3.8-Flash-Next'):
-            self.assertTrue(any(family in m for m in w34_models), f'missing {family} in suite.toml')
-        self.assertEqual({e['gpu_count'] for e in w34_engines}, {1, 2})
-        self.assertTrue({'none', 'mtp-3', 'dflash2'}.issubset({e['speculation'] for e in w34_engines}))
+            self.assertTrue(any(family in m for m in warp34_models), f'missing {family} in suite.toml')
+        self.assertEqual({e['gpu_count'] for e in warp34_engines}, {1, 2})
+        self.assertTrue({'none', 'mtp-3', 'dflash2'}.issubset({e['speculation'] for e in warp34_engines}))
         suite_cases = {c['id'] for c in suite['cases']}
         self.assertTrue({'swe-c4-shared', 'swe-c4-unique', 'swe-c8-burst'}.issubset(suite_cases))
 
@@ -47,9 +47,9 @@ class CampaignTests(unittest.TestCase):
         for name, modes in expected_modes.items():
             with self.subTest(campaign=name):
                 cfg = load(ROOT / 'campaigns' / (name + '.toml'))
-                w34 = [e for e in cfg['engines'] if e['engine'] == 'warp-34']
+                warp34 = [e for e in cfg['engines'] if e['engine'] == 'warp34']
                 for tp in (1, 2):
-                    tp_modes = {e['speculation'] for e in w34 if e['gpu_count'] == tp}
+                    tp_modes = {e['speculation'] for e in warp34 if e['gpu_count'] == tp}
                     self.assertEqual(tp_modes, modes, f'{name} TP={tp} modes mismatch')
                 cases = {c['id']: c for c in cfg['cases']}
                 self.assertEqual(set(cases), {'smoke-warmup', 'swe-c4-shared', 'swe-c4-unique', 'swe-c8-burst'})
@@ -116,7 +116,7 @@ class CampaignTests(unittest.TestCase):
                          {(tp, mode) for tp in (1, 2) for mode in ('none', 'mtp-k3', 'dflash2')})
         for engine in cfg['engines']:
             with self.subTest(engine=engine['id']):
-                self.assertEqual(engine['engine'], 'warp-34')
+                self.assertEqual(engine['engine'], 'warp34')
                 self.assertEqual(engine['version'], 'b7f5fdd')
                 self.assertEqual(engine['support'], 'supported')
                 self.assertEqual(engine['model'], target)
@@ -129,7 +129,7 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(engine['base_url'], 'http://127.0.0.1:18034/v1')
                 self.assertEqual(engine['kv_format'], 'tq4')
                 args = shlex.split(engine['launch_command'])
-                self.assertIn('/workspace/warp-34/target/release/w34', args)
+                self.assertIn('/workspace/warp34/target/release/warp34', args)
                 self.assertIn('--offline', args)
                 expected = {'--model': target, '--tp': str(engine['gpu_count']),
                             '--kv-format': 'tq4', '--kv-pages': '512',

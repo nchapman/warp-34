@@ -119,8 +119,8 @@ tokens (32.2%)**.
 Use the server launch in `soak-coding-27b.toml`. From `benchmarks/perf`:
 
 ```sh
-python3 -m w34perf soak campaigns/soak-coding-27b.toml \
-  --engine warp34-soak --out /tmp/w34-soak-27b-4x8-post-fix-10min \
+python3 -m warp34perf soak campaigns/soak-coding-27b.toml \
+  --engine warp34-soak --out /tmp/warp34-soak-27b-4x8-post-fix-10min \
   --duration-s 600 --min-completed 100 --max-duration-s 900 \
   --sustained-s 60 --burst-s 15 --burst-multiplier 2 \
   --cancel-every 10 --cancel-after-output-events 2 \
@@ -129,19 +129,19 @@ python3 -m w34perf soak campaigns/soak-coding-27b.toml \
   --max-rss-growth-mib 512 --max-gpu-growth-mib 256
 ```
 
-- Post-fix `soak_summary.json` (`/tmp/w34-soak-27b-4x8-post-fix-10min/soak_summary.json`)
+- Post-fix `soak_summary.json` (`/tmp/warp34-soak-27b-4x8-post-fix-10min/soak_summary.json`)
   SHA-256: `616c6aee0e6379dca07357f89c3cf9f5bc195dabce6b2ef7620b27b95ad8e1da`.
 - Post-fix `manifest.json` SHA-256:
   `5c0a921f2e54327c5cab2fd2973e97e033b7f2b0f4e63e0eac40c8d99c1d3588`.
-- Post-fix 1 Hz `/api/metrics` (`/tmp/w34-soak-27b-4x8-post-fix-server-metrics.jsonl`)
+- Post-fix 1 Hz `/api/metrics` (`/tmp/warp34-soak-27b-4x8-post-fix-server-metrics.jsonl`)
   SHA-256: `74b4cfb5ffbf338dfc230f757e527ade9835f3856998e46a5954252b4b01ce29`.
-- Post-fix pre/post idle pool receipt (`/tmp/w34-soak-27b-4x8-post-fix-idle-metrics.json`)
+- Post-fix pre/post idle pool receipt (`/tmp/warp34-soak-27b-4x8-post-fix-idle-metrics.json`)
   SHA-256: `4bd63ea34e07b03146951de8f72bb182ed0d18629890699b31f34a176f26da5f`.
-- Pre-fix (`0105610`) baseline `soak_summary.json` (`/tmp/w34-soak-27b-4x8-10min/soak_summary.json`)
+- Pre-fix (`0105610`) baseline `soak_summary.json` (`/tmp/warp34-soak-27b-4x8-10min/soak_summary.json`)
   SHA-256: `49d7b1dc0f4d24c22be5c654eebe31c39e4910c9bf519ff107635da961e5bab6`;
   pre-fix 1 Hz server metrics SHA-256:
   `b5c7618919a1ebb9ef9795d803ecb41bc5fd5246f979e7985ddf3a2fac82fc6e`.
 - Temporary `/tmp` raw artifacts are session-local verification evidence, not durable
-  release receipts. Strict `CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`
+  release receipts. Strict `CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`
   passed (**508 Rust tests, 0 failures, 13 ignored**), along with `mise run perf-check`
   (126 tests, 10 deployments / 13 cases valid), `mise run doc-check`, and `git diff --check`.

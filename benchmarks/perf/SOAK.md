@@ -1,6 +1,6 @@
 # Extended workload / soak runner
 
-`w34perf soak` extends the finite benchmark runner with repeated, bounded HTTP
+`warp34perf soak` extends the finite benchmark runner with repeated, bounded HTTP
 workload execution. It **does not launch or restart servers, execute tools, inject
 GPU faults, or approve a production release**. A passing receipt means the selected
 client-side checks passed for the recorded workload and policy.
@@ -36,7 +36,7 @@ example configuration, from the repository root on an otherwise idle GPU:
 
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 \
   --port 18834
@@ -53,8 +53,8 @@ are sensitive. Raw evidence grows with workload volume; provision disk space.
 From `benchmarks/perf`, against that already-running endpoint:
 
 ```sh
-python3 -m w34perf validate campaigns/soak-coding.toml
-python3 -m w34perf soak campaigns/soak-coding.toml \
+python3 -m warp34perf validate campaigns/soak-coding.toml
+python3 -m warp34perf soak campaigns/soak-coding.toml \
   --engine warp34-soak --out results/soak-smoke-001 \
   --duration-s 60 --min-completed 100 --max-duration-s 180 \
   --sustained-s 20 --burst-s 5 --cancel-every 10 \
@@ -78,7 +78,7 @@ Approve the workload, thresholds and hardware first. The repository's proposed
 ```sh
 # Set SERVER_PID and GPU_UUID explicitly for the actual local deployment.
 # Discover UUIDs with: nvidia-smi --query-gpu=index,uuid --format=csv
-python3 -m w34perf soak campaigns/soak-coding.toml \
+python3 -m warp34perf soak campaigns/soak-coding.toml \
   --engine warp34-soak --out results/soak-candidate-001 \
   --duration-s 28800 --min-completed 10000 --max-duration-s 36000 \
   --sustained-s 300 --burst-s 30 --burst-multiplier 2 \

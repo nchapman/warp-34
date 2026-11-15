@@ -1,6 +1,6 @@
 # Historical mixed-KV single-GPU 27B tooling checks
 
-**Historical evidence:** these completed checks used TQ4 for warp-34. The new
+**Historical evidence:** these completed checks used TQ4 for warp34. The new
 cross-engine baseline uses FP16 KV throughout; see [automation](AUTOMATION.md).
 Do not relabel the results below as FP16 results. Commands here preserve the
 original configurations **for historical reference only**, not active runnable
@@ -9,7 +9,7 @@ runs. Use [suite.toml](suite.toml) and [automation](AUTOMATION.md) for the activ
 HGPTQ/AWQ/GGUF recipes; those TP1 AWQ quality configurations remain unqualified.
 
 The historical configuration was **one 24GB RTX 3090, a 4K context,
-one active evaluation request, and 10 examples per task**, across warp-34,
+one active evaluation request, and 10 examples per task**, across warp34,
 llama.cpp, vLLM and SGLang. These are short workflow checks, not comparative
 quality scores or throughput measurements. The previous [TP2 recipes](servers.md)
 and [qualification evidence](QUALIFICATION.md) remain historical records.
@@ -28,7 +28,7 @@ correct. SGLang's successful run is explicitly **plain**, not MTP.
 
 | Engine | Successful mode | Observed GPU allocation |
 |---|---|---:|
-| warp-34 | MTP-3, TQ4 | 22,164 MiB (21.6 GiB) |
+| warp34 | MTP-3, TQ4 | 22,164 MiB (21.6 GiB) |
 | llama.cpp / Unsloth | Native MTP, max 3 draft tokens | 18,278 MiB (17.8 GiB) |
 | vLLM | MTP-3, 0.95 GPU utilization | 23,032 MiB (22.5 GiB) |
 | SGLang | Plain, 0.95 static memory fraction | 23,639 MiB (23.1 GiB) |
@@ -42,7 +42,7 @@ process list was empty. Local GPUs were not used.
 
 | Engine | Checkpoint | Exact revision |
 |---|---|---|
-| warp-34 (merged branch `9b04799`, engine tree `f6ab96e`) | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `1de743eedefdb7422e6b171174c7080204f5b005` |
+| warp34 (merged branch `9b04799`, engine tree `f6ab96e`) | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `1de743eedefdb7422e6b171174c7080204f5b005` |
 | vLLM 0.31.0 / SGLang 0.5.19 | `SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` | `e28c5f952bdd9abac6420ac3efad651b40d15eb5` |
 | llama.cpp v0.9.0 (`cd959bae99ff4bed22bef2604f45241c09bbb8c8`) | `unsloth/Qwen3.8-27B-GGUF` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` |
 
@@ -55,12 +55,12 @@ Quantization and KV policies differ by engine, so this is a practical migration
 configuration, not a matched-quant quality comparison. Preserve each engine's
 package freeze, command, artifact identity and logs as in the main README.
 
-## warp-34
+## warp34
 
 Set `HGPTQ` to the pinned local snapshot path above:
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model "$HGPTQ" --offline --tp 1 --kv-format tq4 --kv-pages 256 \
   --max-num-seqs 4 --speculative mtp --mtp-k 3 \
   --served-model-name warp34-quality --host 127.0.0.1 --port 18034
@@ -181,7 +181,7 @@ SHA-256 hashes; its offload-check command/log is retained separately. A lost SSH
 build-tracking session was recovered by stopping the orphaned build and resuming
 incrementally; no llama.cpp source modifications were made.
 
-warp-34 reports 20 completed requests and zero failures. vLLM reports 20 successes
+warp34 reports 20 completed requests and zero failures. vLLM reports 20 successes
 (18 stop, two length finishes; zero abort/error finishes). SGLang logs 21 HTTP-200
 chat calls: its one built-in startup warmup plus the 20 evaluation requests.
 llama.cpp logged 20 completed slots with `truncated=0`, no remaining processing

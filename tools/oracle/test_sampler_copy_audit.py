@@ -16,7 +16,7 @@ class SamplerCopyAudit(unittest.TestCase):
             conn.executescript('''
                 CREATE TABLE StringIds(id,value);
                 CREATE TABLE NVTX_EVENTS(text,textId,start,end,globalTid,endGlobalTid);
-                INSERT INTO NVTX_EVENTS VALUES('w34.sampler',NULL,100,200,16777217,NULL);
+                INSERT INTO NVTX_EVENTS VALUES('warp34.sampler',NULL,100,200,16777217,NULL);
                 CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME(start,end,globalTid,correlationId,returnValue);
                 INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES(120,130,16777217,7,0);
                 CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY(start,end,bytes,globalPid,correlationId,copyKind);

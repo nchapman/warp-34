@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/w34-kernels", "crates/w34-host"]
+members = ["crates/warp34-kernels", "crates/warp34-host"]
 
 [workspace.package]
 version = "0.1.0"

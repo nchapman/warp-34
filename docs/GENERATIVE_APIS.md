@@ -2,7 +2,7 @@
 
 ## 1. Objective & Donor Provenance
 
-This specification defines `warp-34`'s native support for first-tier agentic generative protocols alongside `/v1/chat/completions`:
+This specification defines `warp34`'s native support for first-tier agentic generative protocols alongside `/v1/chat/completions`:
 
 1. **OpenAI Responses API**:
    - `POST /v1/responses` (sync JSON & typed SSE stream)
@@ -22,9 +22,9 @@ This specification defines `warp-34`'s native support for first-tier agentic gen
 
 ---
 
-## 2. Internal Architecture & Shared Pipeline (`crates/w34-host/src/server/`)
+## 2. Internal Architecture & Shared Pipeline (`crates/warp34-host/src/server/`)
 
-All generative endpoints translate into `warp-34`'s single canonical prompt-preparation and execution spine so token counts, `MambaRadixCache` prefix reuse, `Qwen3Parser` incremental `<think>` / `<tool_call>` parsing, vision token expansion, and `TokenBitmaskConstraint` grammar enforcement behave identically across protocols:
+All generative endpoints translate into `warp34`'s single canonical prompt-preparation and execution spine so token counts, `MambaRadixCache` prefix reuse, `Qwen3Parser` incremental `<think>` / `<tool_call>` parsing, vision token expansion, and `TokenBitmaskConstraint` grammar enforcement behave identically across protocols:
 
 ```text
   POST /v1/chat/completions ──┐
@@ -41,9 +41,9 @@ All generative endpoints translate into `warp-34`'s single canonical prompt-prep
 ```
 
 ### Module Layout
-- `crates/w34-host/src/server.rs` & `crates/w34-host/src/server/http.rs` — Axum router registration, auth middleware (`Authorization: Bearer <token>` and Anthropic `x-api-key: <token>` accepted equivalently when `--api-key` is configured; `anthropic-version` and `anthropic-beta` headers tolerated), shared `PreparedPrompt` builder, `/v1/chat/completions`, `/v1/completions`, `*/input_tokens`, and `/tokenize` + `/detokenize`.
-- `crates/w34-host/src/responses_api.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (one mutex serializes stored entries and active cancellation, capacity 256), `previous_response_id` history stitching, sync JSON builder, `/v1/responses/{response_id}/cancel`, and 0-indexed `sequence_number` SSE state machine.
-- `crates/w34-host/src/anthropic_api.rs` — Anthropic Messages request/response types, `cch=` billing-header normalization, `thinking` / `tool_use` / `tool_result` / `image` block translation, sync JSON builder, typed Anthropic SSE state machine, `/v1/messages/count_tokens`, and Anthropic error envelopes.
+- `crates/warp34-host/src/server.rs` & `crates/warp34-host/src/server/http.rs` — Axum router registration, auth middleware (`Authorization: Bearer <token>` and Anthropic `x-api-key: <token>` accepted equivalently when `--api-key` is configured; `anthropic-version` and `anthropic-beta` headers tolerated), shared `PreparedPrompt` builder, `/v1/chat/completions`, `/v1/completions`, `*/input_tokens`, and `/tokenize` + `/detokenize`.
+- `crates/warp34-host/src/responses_api.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (one mutex serializes stored entries and active cancellation, capacity 256), `previous_response_id` history stitching, sync JSON builder, `/v1/responses/{response_id}/cancel`, and 0-indexed `sequence_number` SSE state machine.
+- `crates/warp34-host/src/anthropic_api.rs` — Anthropic Messages request/response types, `cch=` billing-header normalization, `thinking` / `tool_use` / `tool_result` / `image` block translation, sync JSON builder, typed Anthropic SSE state machine, `/v1/messages/count_tokens`, and Anthropic error envelopes.
 
 ### Invariants Preserved Across All Protocols
 1. **Stateful `tool_choice: "none"` safety invariant**: Whenever `tools` is non-empty and `tool_choice` resolves to `"none"`, `resolve_request_constraint()` attaches `TokenBitmaskConstraint::from_disallowed_tokens` banning `<tool_call>` token emission (`op_sampler.cu` fast masked greedy / full masked sampler), while keeping tool schemas rendered in the system prompt so `MambaRadixCache` prefixes remain byte-identical across turns toggling `tool_choice`.
@@ -175,7 +175,7 @@ Every SSE frame sets `event: <type>` and carries `"type": "<type>"` plus a stric
    - `response.completed` (with full `response` object including `output` and `usage`) on normal/tool stop,
    - `response.incomplete` (`status: "incomplete"`, `incomplete_details: {"reason": "max_output_tokens"}`) on `FinishReason::Length`, or
    - `response.failed` (`status: "failed"`, `error: {"code": "server_error", "message": "..."}`) on engine failure, or
-   - `response.cancelled` (`status: "cancelled"`) when an explicit cancel request wins before terminal publication. This is warp-34's cancellation event; clients must handle it rather than assume every upstream SDK recognizes this extension.
+   - `response.cancelled` (`status: "cancelled"`) when an explicit cancel request wins before terminal publication. This is warp34's cancellation event; clients must handle it rather than assume every upstream SDK recognizes this extension.
    - Stream closes cleanly after the terminal event (no `[DONE]` frame).
 
 ### 4.4 Cancellation and terminal publication
@@ -215,7 +215,7 @@ A cancelled result is the cancellation acknowledgment snapshot (`output: []`, `o
     {
       "type": "thinking",
       "thinking": "...",
-      "signature": "w34-thinking-v1"
+      "signature": "warp34-thinking-v1"
     },
     {
       "type": "text",
@@ -256,7 +256,7 @@ Every frame uses `event: <event_name>\ndata: <json>\n\n`:
    - **Thinking block** (opened lazily on first non-empty `reasoning_content` delta):
      - `event: content_block_start` -> `{"type":"content_block_start","index":i,"content_block":{"type":"thinking","thinking":""}}`
      - `event: content_block_delta` -> `{"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":"..."}}`
-     - Before closing: `event: content_block_delta` -> `{"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":"w34-thinking-v1"}}`
+     - Before closing: `event: content_block_delta` -> `{"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":"warp34-thinking-v1"}}`
      - `event: content_block_stop` -> `{"type":"content_block_stop","index":i}`
    - **Text block** (opened lazily on first non-empty `content` delta, closing any open thinking block first):
      - `event: content_block_start` -> `{"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}`

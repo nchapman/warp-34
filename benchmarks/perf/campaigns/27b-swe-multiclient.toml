@@ -1,5 +1,5 @@
 # Head-to-head multi-client realistic SWE serving campaign on Qwen3.8-27B
-# weights across warp-34 (HGPTQ), vLLM 0.31.0, and SGLang 0.5.19 (TP=1 and TP=2, 16 Ki context).
+# weights across warp34 (HGPTQ), vLLM 0.31.0, and SGLang 0.5.19 (TP=1 and TP=2, 16 Ki context).
 # Replays 6 intact single-instance trajectories (7–15 turns, ~519 -> 12,312 prompt tokens)
 # from nvidia/Open-SWE-Traces@4fa4c2ae9afc6b397bc50391d43450c79993c138.
 schema_version = 1
@@ -44,16 +44,16 @@ request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
 id = "warp34-27b-tp2-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 KV 8192 pages (131072 tokens) on 2x 3090 Ti TP=2, max-num-seqs 8, max-model-len 16384, plain"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "warp34-27b-tp1-plain"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
@@ -61,16 +61,16 @@ parallelism = "single"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 KV 4096 pages (65536 tokens) on 1x 3090 Ti TP=1, max-num-seqs 4, max-model-len 16384, plain"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "warp34-27b-tp2"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 KV 8192 pages (131072 tokens) on 2x 3090 Ti TP=2, max-num-seqs 8, max-model-len 16384, MTP-3"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "vllm-27b-tp2"
@@ -119,7 +119,7 @@ chat_template_sha256 = "unknown"
 weight_format = "AWQ-int4-g32"
 quantization_details = "cyankiwi AWQ, asymmetric INT4 group-32, compressed-tensors pack-quantized"
 cache_config = "FP16 KV TP2; context 16384; FP32 SSM; FP16 conv; radix; static .88; chunked-prefill 2048; max-running-requests 8; Mamba cache 32"
-launch_command = "docker run --rm --name w34-swe-sglang-tp2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834"
+launch_command = "docker run --rm --name warp34-swe-sglang-tp2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834"
 
 [[engines]]
 id = "sglang-27b-tp2-mtp"
@@ -135,7 +135,7 @@ weight_format = "AWQ-int4-g32"
 quantization_details = "cyankiwi AWQ, asymmetric INT4 group-32, compressed-tensors pack-quantized"
 speculation = "mtp"
 cache_config = "FP16 KV TP2; context 16384; FP32 SSM; FP16 conv; radix; EAGLE MTP steps=3 draft=4; static .88; chunked-prefill 2048; max-running-requests 8; Mamba cache 32"
-launch_command = "docker run --rm --name w34-swe-sglang-tp2-mtp --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5"
+launch_command = "docker run --rm --name warp34-swe-sglang-tp2-mtp --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5"
 
 [[engines]]
 id = "sglang-27b-tp2-dflash2"
@@ -151,20 +151,20 @@ weight_format = "AWQ-int4-g32"
 quantization_details = "cyankiwi AWQ, asymmetric INT4 group-32, compressed-tensors pack-quantized"
 speculation = "dflash2"
 cache_config = "FP16 KV TP2; context 16384; FP32 SSM; FP16 conv; radix; DFLASH draft=8 (incoai/Qwen3.8-27B-DFlash2); static .88; chunked-prefill 2048; max-running-requests 8; Mamba cache 32"
-launch_command = "docker run --rm --name w34-swe-sglang-tp2-dflash2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834 --speculative-algorithm DFLASH --speculative-num-draft-tokens 8 --speculative-draft-model-path /models/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
+launch_command = "docker run --rm --name warp34-swe-sglang-tp2-dflash2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 2 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834 --speculative-algorithm DFLASH --speculative-num-draft-tokens 8 --speculative-draft-model-path /models/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
 
 [[engines]]
 id = "warp34-27b-tp2-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 kv_format = "tq4"
 speculation = "dflash2-m8"
 cache_config = "TQ4 KV 8192 pages (131072 tokens) on 2x 3090 Ti TP=2, max-num-seqs 8, max-model-len 16384, DFlash2 (Qwen3.8-27B-DFlash2-W4A16-HGPTQ)"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "warp34-27b-tp1"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
@@ -172,11 +172,11 @@ parallelism = "single"
 kv_format = "tq4"
 speculation = "mtp-3"
 cache_config = "TQ4 KV 4096 pages (65536 tokens) on 1x 3090 Ti TP=1, max-num-seqs 4, max-model-len 16384, MTP-3"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "warp34-27b-tp1-dflash2"
-engine = "warp-34"
+engine = "warp34"
 version = "7bff273-dev"
 gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
@@ -184,7 +184,7 @@ parallelism = "single"
 kv_format = "tq4"
 speculation = "dflash2-m8"
 cache_config = "TQ4 KV 4096 pages (65536 tokens) on 1x 3090 Ti TP=1, max-num-seqs 4, max-model-len 16384, DFlash2 (Qwen3.8-27B-DFlash2-W4A16-HGPTQ)"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "vllm-27b-tp1"
@@ -223,7 +223,7 @@ chat_template_sha256 = "unknown"
 weight_format = "AWQ-int4-g32"
 quantization_details = "cyankiwi AWQ, asymmetric INT4 group-32, compressed-tensors pack-quantized"
 cache_config = "FP16 KV TP1; context 16384; FP32 SSM; FP16 conv; radix; static .92; chunked-prefill 2048; max-running-requests 4; Mamba cache 16"
-launch_command = "docker run --rm --name w34-swe-sglang-tp1 --gpus '\"device=0\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 1 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.92 --chunked-prefill-size 2048 --max-running-requests 4 --max-mamba-cache-size 16 --cuda-graph-bs-decode 1 2 4 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834"
+launch_command = "docker run --rm --name warp34-swe-sglang-tp1 --gpus '\"device=0\"' --shm-size 4g -p 127.0.0.1:18834:18834 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-27b-awq --dtype float16 --tp-size 1 --context-length 16384 --mamba-ssm-dtype float32 --mem-fraction-static 0.92 --chunked-prefill-size 2048 --max-running-requests 4 --max-mamba-cache-size 16 --cuda-graph-bs-decode 1 2 4 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18834"
 
 [[cases]]
 id = "smoke-warmup"

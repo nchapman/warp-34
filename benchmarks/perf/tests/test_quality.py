@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from w34perf.quality import qualify
+from warp34perf.quality import qualify
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/quality.json"
@@ -26,7 +26,7 @@ class QualityTests(unittest.TestCase):
                 for c in self.fixture["checks"]]
 
     def test_pass_evidence_and_no_overwrite(self):
-        with patch("w34perf.quality.stream", side_effect=self.answers()) as http:
+        with patch("warp34perf.quality.stream", side_effect=self.answers()) as http:
             report = qualify(ENGINE, FIXTURE, self.out, 12)
             self.assertEqual(report["status"], "passed")
             self.assertEqual(json.loads(self.out.read_text()), report)
@@ -48,7 +48,7 @@ class QualityTests(unittest.TestCase):
         answers[2]["finish_reason"] = "length"
         answers[3]["content"] = "Found: cobalt-otter-7183!"
         answers[4] = OSError("private credential")
-        with patch("w34perf.quality.stream", side_effect=answers):
+        with patch("warp34perf.quality.stream", side_effect=answers):
             report = qualify(ENGINE, FIXTURE, self.out)
         self.assertEqual(report["status"], "failed")
         self.assertEqual([c["status"] for c in report["checks"]],
@@ -57,7 +57,7 @@ class QualityTests(unittest.TestCase):
         self.assertNotIn("private credential", self.out.read_text())
 
     def test_validation_before_http(self):
-        with patch("w34perf.quality.stream") as http:
+        with patch("warp34perf.quality.stream") as http:
             for timeout in (True, 0, -1, float("nan"), float("inf"), "180"):
                 with self.assertRaises(ValueError):
                     qualify(ENGINE, FIXTURE, self.out, timeout)
@@ -72,7 +72,7 @@ class QualityTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
 
     def test_generated_context_is_repeatable_and_depth_diverse(self):
-        with patch("w34perf.quality.stream", side_effect=self.answers() * 2):
+        with patch("warp34perf.quality.stream", side_effect=self.answers() * 2):
             first = qualify(ENGINE, FIXTURE, self.out)
             second = qualify(ENGINE, FIXTURE, self.out.with_name("second.json"))
         self.assertEqual([c["request_sha256"] for c in first["checks"]],

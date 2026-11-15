@@ -110,4 +110,4 @@ efda6ce29ded5ead263a7e3747c923ccfbd4c228160a67832b80a56e94bd0530  open_swe_agent
 bc31dab01fda96255aa0fbc46fd348458842997c79fb3cb9151fdda98ef974bd  open_swe_cold_read_60k.json
 ```
 
-`w34perf` additionally stores a canonical-JSON fixture digest in each run's config.
+`warp34perf` additionally stores a canonical-JSON fixture digest in each run's config.

@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import patch
 import io
 
-from w34perf.__main__ import main
-from w34perf.artifacts import inventory, save_inventory, verify_inventory
+from warp34perf.__main__ import main
+from warp34perf.artifacts import inventory, save_inventory, verify_inventory
 
 
 class ArtifactTests(unittest.TestCase):

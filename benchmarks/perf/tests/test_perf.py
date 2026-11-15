@@ -8,12 +8,12 @@ import time
 import unittest
 from unittest.mock import patch
 
-from w34perf.config import digest, load
-from w34perf.metrics import distribution, summarize, tokens, tpot
-from w34perf.report import render
-from w34perf.runner import execute, Journal, run_trial
-from w34perf.transport import stream
-from w34perf.workloads import body, messages
+from warp34perf.config import digest, load
+from warp34perf.metrics import distribution, summarize, tokens, tpot
+from warp34perf.report import render
+from warp34perf.runner import execute, Journal, run_trial
+from warp34perf.transport import stream
+from warp34perf.workloads import body, messages
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,7 +100,7 @@ class ConfigTests(unittest.TestCase):
     def test_suite_has_all_five_engines_and_dual_card_profiles(self):
         cfg = load(ROOT / "suite.toml")
         self.assertEqual({e["engine"] for e in cfg["engines"]},
-                         {"warp-34", "vllm", "sglang", "llama.cpp", "ninfer-3090"})
+                         {"warp34", "vllm", "sglang", "llama.cpp", "ninfer-3090"})
         for name in {e["engine"] for e in cfg["engines"]}:
             self.assertEqual({e["gpu_count"] for e in cfg["engines"] if e["engine"] == name}, {1, 2})
 
@@ -241,7 +241,7 @@ class RunnerTests(unittest.TestCase):
         with FakeServer() as server, tempfile.TemporaryDirectory() as tmp:
             cfg["engines"][0].update(server.engine)
             out = Path(tmp) / "results"
-            with patch("w34perf.runner.provenance", return_value={"test": True}):
+            with patch("warp34perf.runner.provenance", return_value={"test": True}):
                 rows = execute(cfg, out)
             self.assertEqual(rows[0]["successful_requests"], 2)
             self.assertEqual(json.loads((out / "manifest.json").read_text())["status"], "complete")
@@ -264,7 +264,7 @@ class RunnerTests(unittest.TestCase):
             payloads.append(copy.deepcopy(payload))
             return result()
 
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream", side_effect=fake):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream", side_effect=fake):
             journal = Journal(Path(tmp) / "raw")
             try:
                 stats = run_trial(cfg["engines"][0], cfg["cases"][0], cfg["run"],
@@ -288,7 +288,7 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(overload_seen.wait(2), "scheduler never recorded overload")
             return result()
 
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream", side_effect=slow):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream", side_effect=slow):
             path = Path(tmp) / "raw"
             journal = Journal(path)
             original_put = journal.put
@@ -314,8 +314,8 @@ class RunnerTests(unittest.TestCase):
         cfg = self.config()
         cfg["cases"][0]["cache"] = "primed"
         cfg["run"]["warmup_requests"] = 1
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream", return_value=result()), \
-                patch("w34perf.runner.provenance", return_value={}):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream", return_value=result()), \
+                patch("warp34perf.runner.provenance", return_value={}):
             out = Path(tmp) / "run"
             rows = execute(cfg, out)
             requests = [json.loads(line) for line in (out / "requests.jsonl").read_text().splitlines()
@@ -331,8 +331,8 @@ class RunnerTests(unittest.TestCase):
         cfg = self.config()
         cfg["run"]["warmup_requests"] = 1
         bad = {**result(), "status": "timeout", "request_id": "x", "error": "timeout"}
-        with tempfile.TemporaryDirectory() as tmp, patch("w34perf.runner.stream", return_value=bad), \
-                patch("w34perf.runner.provenance", return_value={}):
+        with tempfile.TemporaryDirectory() as tmp, patch("warp34perf.runner.stream", return_value=bad), \
+                patch("warp34perf.runner.provenance", return_value={}):
             out = Path(tmp) / "run"
             with self.assertRaises(RuntimeError):
                 execute(cfg, out)
@@ -345,7 +345,7 @@ class RunnerTests(unittest.TestCase):
     def test_malformed_upstream_does_not_abort_the_campaign(self):
         cfg = self.config()
         with FakeServer("surrogate") as server, tempfile.TemporaryDirectory() as tmp, \
-                patch("w34perf.runner.provenance", return_value={}):
+                patch("warp34perf.runner.provenance", return_value={}):
             cfg["engines"][0].update(server.engine)
             rows = execute(cfg, Path(tmp) / "run")
             self.assertEqual(rows[0]["failed_requests"], 2)
@@ -379,8 +379,8 @@ repetitions = 1
 warmup_requests = 0
 
 [[engines]]
-id = "w34"
-engine = "warp-34"
+id = "warp34"
+engine = "warp34"
 gpu_count = 1
 base_url = "http://127.0.0.1:18034/v1"
 model = "qwen"
@@ -391,7 +391,7 @@ kv_format = "TQ4"
 parallelism = "TP=1"
 speculation = "none"
 cache_config = "radix"
-launch_command = "w34 serve"
+launch_command = "warp34 serve"
 
 [[cases]]
 id = "swe"
@@ -436,8 +436,8 @@ max_tokens = 32
                 }
                 return r
 
-            with patch("w34perf.runner.stream", side_effect=fake_stream), \
-                    patch("w34perf.runner.provenance", return_value={}):
+            with patch("warp34perf.runner.stream", side_effect=fake_stream), \
+                    patch("warp34perf.runner.provenance", return_value={}):
                 out = tmp_dir / "out"
                 rows = execute(cfg, out)
                 md, _ = render(out)
@@ -458,7 +458,7 @@ max_tokens = 32
             self.assertGreater(row["cold_prefill_tokens_s"]["p50"], 3900.0)
             self.assertIn("## Long-context & prefix-cache breakdown", md)
             self.assertIn("## Agent replay per-step latency", md)
-            self.assertIn("| w34 | swe | 1 | 1/1 | 9000.00 | 8192.00 | 808.00 | 250.00 |", md)
+            self.assertIn("| warp34 | swe | 1 | 1/1 | 9000.00 | 8192.00 | 808.00 | 250.00 |", md)
             self.assertIn("25384", md)
 
     def test_decision_case_executes_systemone_and_scores_accuracy(self):
@@ -494,8 +494,8 @@ timeout_s = 10
 max_inflight = 4
 seed = 34
 [[engines]]
-id = "w34-glide"
-engine = "warp-34"
+id = "warp34-glide"
+engine = "warp34"
 support = "supported"
 gpu_count = 1
 base_url = "http://127.0.0.1:18034/v1"
@@ -507,7 +507,7 @@ kv_format = "fp16"
 parallelism = "single"
 speculation = "none"
 cache_config = "test"
-launch_command = "w34 serve"
+launch_command = "warp34 serve"
 [[cases]]
 id = "jev-p2"
 kind = "decision"
@@ -558,8 +558,8 @@ cache = "unique"
                     "e2e_ms": 4.2,
                 }
 
-            with patch("w34perf.runner.decision", side_effect=fake_decision), \
-                    patch("w34perf.runner.provenance", return_value={}):
+            with patch("warp34perf.runner.decision", side_effect=fake_decision), \
+                    patch("warp34perf.runner.provenance", return_value={}):
                 out = tmp_dir / "out"
                 rows = execute(cfg, out)
 

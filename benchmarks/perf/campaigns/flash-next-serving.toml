@@ -32,7 +32,7 @@ request_overrides = {temperature = 0, chat_template_kwargs = {enable_thinking = 
 
 [[engines]]
 id = "warp34-flash-tp1-target"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -51,11 +51,11 @@ conv_state_dtype = "float16"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 KV, 4096 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-flash-tp1-mtp3"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -74,11 +74,11 @@ conv_state_dtype = "float16"
 kv_format = "tq4"
 speculation = "mtp-k3"
 cache_config = "TQ4 KV, 4096 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
 
 [[engines]]
 id = "warp34-flash-tp2-target"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -97,11 +97,11 @@ conv_state_dtype = "float16"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 KV, 4096 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-flash-tp2-mtp3"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -120,7 +120,7 @@ conv_state_dtype = "float16"
 kv_format = "tq4"
 speculation = "mtp-k3"
 cache_config = "TQ4 KV, 4096 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
 
 [[engines]]
 id = "qfn-2x3090-mtp3"
@@ -135,7 +135,7 @@ conv_state_dtype = "runtime default; verify"
 kv_format = "bfloat16"
 speculation = "mtp-k3"
 cache_config = "128GB profile: hot84, dynamic LRU/mixed VMM, UVA expert offload 30 GB, CPU PLE; BF16 KV 4429185024 bytes, max len 262144, max seqs 1, chunk4096; prefix caching enabled, retention1600; approximate QSA; custom all-reduce disabled; loader may rely on swap"
-launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+launch_command = "cd /tmp/warp34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/warp34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=warp34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
 
 [[engines]]
 id = "qfn-3090-mtp3"
@@ -149,7 +149,7 @@ activation_dtype = "bfloat16"
 kv_format = "int8_per_token_head"
 speculation = "mtp-k3; filtered draft vocabulary"
 cache_config = "default 3090-64gb-128k profile scaled by host memory: hot32; CPU arena auto; mmap PLE; int8 KV3050000000 bytes; max len135168; seq1; chunk8192; approximate QSA; memory limit auto minus8GiB; OS cache not flushed"
-launch_command = "cd /tmp/w34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 GPU_DEVICE=0 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
+launch_command = "cd /tmp/warp34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/warp34-benchmark-models/flash-next PORT=18034 GPU_DEVICE=0 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=warp34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
 
 [[engines]]
 id = "ninfer-flash-unverified"
@@ -187,7 +187,7 @@ activation_dtype = "source-native mixed BF16/F32"
 kv_format = "fp16"
 speculation = "none"
 cache_config = "72GiB resident budget; mmap native GGUF; auto GPU expert cache; embedded IQ4_NL PLE; context8192; parallel1 FIFO; no MTP; OS cache not flushed"
-launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp-34/benchmarks/perf/campaigns/strata-flash-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+launch_command = "cd /tmp/warp34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp34/benchmarks/perf/campaigns/strata-flash-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
 
 [[engines]]
 id = "strata-flash-tp1-lookup4"
@@ -210,11 +210,11 @@ activation_dtype = "source-native mixed BF16/F32"
 kv_format = "fp16"
 speculation = "prompt lookup; verify window4; no MTP drafter"
 cache_config = "72GiB resident budget; mmap native GGUF; auto GPU expert cache; embedded IQ4_NL PLE; context8192; prefill512; parallel1 FIFO; OS cache not flushed"
-launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp-34/benchmarks/perf/campaigns/strata-flash-lookup-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+launch_command = "cd /tmp/warp34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp34/benchmarks/perf/campaigns/strata-flash-lookup-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
 
 [[engines]]
 id = "warp34-flash-tp2-target-8k"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -232,11 +232,11 @@ activation_dtype = "float16"
 kv_format = "tq4"
 speculation = "none"
 cache_config = "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-flash-tp2-mtp3-8k"
-engine = "warp-34"
+engine = "warp34"
 cohort = "flash-next-hgptq-serving"
 model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
 source_model_revision = "unknown"
@@ -254,7 +254,7 @@ activation_dtype = "float16"
 kv_format = "tq4"
 speculation = "mtp-k3"
 cache_config = "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
 
 # Repetitions of fixture context are NOT calibrated token buckets.
 [[cases]]

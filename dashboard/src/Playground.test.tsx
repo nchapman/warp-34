@@ -608,7 +608,7 @@ describe("Playground UI integration", () => {
     expect(
       screen.getByRole("heading", { name: "API Playground" }),
     ).toBeVisible();
-    expect(document.title).toBe("warp-34 · Playground");
+    expect(document.title).toBe("warp34 · Playground");
     expect((screen.getByLabelText("ENDPOINT") as HTMLSelectElement).value).toBe(
       "decisions",
     );
@@ -622,12 +622,12 @@ describe("Playground UI integration", () => {
 
     fireEvent.click(screen.getByRole("link", { name: "Connect" }));
     expect(window.location.pathname).toBe("/connect");
-    expect(document.title).toBe("warp-34 · Connect");
+    expect(document.title).toBe("warp34 · Connect");
 
     window.history.replaceState(null, "", "/");
     fireEvent(window, new PopStateEvent("popstate"));
     expect(screen.getByRole("heading", { name: "Overview" })).toBeVisible();
-    expect(document.title).toBe("warp-34 · Overview");
+    expect(document.title).toBe("warp34 · Overview");
   });
 
   it("uploads an image file onto a user turn, renders thumbnail preview, and removes it", async () => {

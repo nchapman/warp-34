@@ -67,8 +67,8 @@ Launch the server using the command recorded in the TOML. From `benchmarks/perf`
 with the actual server PID and UUID substituted:
 
 ```sh
-python3 -m w34perf soak campaigns/soak-coding-27b-single-client.toml \
-  --engine warp34-soak --out /tmp/w34-soak-27b-192k-10min \
+python3 -m warp34perf soak campaigns/soak-coding-27b-single-client.toml \
+  --engine warp34-soak --out /tmp/warp34-soak-27b-192k-10min \
   --duration-s 600 --min-completed 100 --max-duration-s 900 \
   --sustained-s 60 --burst-s 15 --burst-multiplier 1 \
   --cancel-every 10 --cancel-after-output-events 2 \
@@ -78,7 +78,7 @@ python3 -m w34perf soak campaigns/soak-coding-27b-single-client.toml \
 ```
 
 The output directory must not exist. Local evidence:
-`/tmp/w34-soak-27b-192k-10min/`; runner log at the matching `.log` path.
+`/tmp/warp34-soak-27b-192k-10min/`; runner log at the matching `.log` path.
 All four `SHA256SUMS.json` inventory entries were independently verified.
 Summary SHA-256: `206d966c70c75aea73db71d2216006e506992312c649aca9c48281a8a50b42c0`.
 These temporary artifacts are not durable release receipts.

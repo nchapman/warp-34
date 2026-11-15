@@ -19,7 +19,7 @@ def main():
         _fields_ = [("stream", C.c_uint64), ("scratch", C.c_uint64), ("size", C.c_size_t)]
 
     lib = C.CDLL(args.library)
-    fn = lib.w34_vision_bias_gelu_f16
+    fn = lib.warp34_vision_bias_gelu_f16
     fn.argtypes = [C.POINTER(Exec)] + [C.c_void_p] * 3 + [C.c_int] * 3
     fn.restype = C.c_int
     bits = torch.arange(65536, device="cuda").to(torch.uint16)

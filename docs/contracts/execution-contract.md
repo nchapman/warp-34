@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Every model step in `warp-34` — prefill chunk, prefix-hit suffix prefill, `M=1` decode, batched decode, `MTP` `1+k` verify, and `DFlash2` `M=8` (`27B`) / `M=16` (`4B`) verify — executes through a single unified token-budget forward spine (`Qwen3_5Model::forward`).
+Every model step in `warp34` — prefill chunk, prefix-hit suffix prefill, `M=1` decode, batched decode, `MTP` `1+k` verify, and `DFlash2` `M=8` (`27B`) / `M=16` (`4B`) verify — executes through a single unified token-budget forward spine (`Qwen3_5Model::forward`).
 
 ## 2. Flattened Token-Budget Batch Layout
 
@@ -51,7 +51,7 @@ To support `DFlash2` and `MTP` without dynamic graph branching or extra forward 
   - `layer_to_slot: [i8; 64]`: maps layer index `l` to tap buffer plane `0..num_tap_layers`.
 - Output buffer layout: `tap_buffer: [num_tap_layers, N_max, hidden_size]` (`FP16`), written only for `valid_token_mask[t] == 1`.
 
-## 5. CUDA Graph Families & Valid-Row Isolation (`crates/w34-host/src/model/graphs.rs`)
+## 5. CUDA Graph Families & Valid-Row Isolation (`crates/warp34-host/src/model/graphs.rs`)
 
 `Qwen3_5ModelRank` captures four distinct CUDA Graph families keyed by execution shape and attention context regime (`long_ctx = !uses_qsa() && seq_after > 1024`):
 

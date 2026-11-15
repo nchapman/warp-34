@@ -1,19 +1,19 @@
 # Serving deployment controls
 
-`w34 serve` targets one Qwen model on one or two GPUs, not a general-purpose model
+`warp34 serve` targets one Qwen model on one or two GPUs, not a general-purpose model
 gateway. Defaults remain loopback (`127.0.0.1:8000`), **no authentication**, 16 active
 sequences, automatic KV capacity, and the existing scheduler tuning.
 
 ```sh
-# Export W34_API_KEY securely through your deployment's secret manager first.
-CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+# Export WARP34_API_KEY securely through your deployment's secret manager first.
+CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
   --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --served-model-name coding-model \
-  --api-key-env W34_API_KEY \
+  --api-key-env WARP34_API_KEY \
   --max-num-seqs 4 --kv-pages 512 --max-model-len 8192
 
 curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Authorization: Bearer $W34_API_KEY" \
+  -H "Authorization: Bearer $WARP34_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"coding-model","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
@@ -50,8 +50,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   per-user authorization system. Restart to rotate the key; stored Responses are
   in-memory and do not survive restart.
 
-For Docker, pass `-e W34_API_KEY` before the image name and
-`--api-key-env W34_API_KEY` after `serve` to forward an already-exported secret.
+For Docker, pass `-e WARP34_API_KEY` before the image name and
+`--api-key-env WARP34_API_KEY` after `serve` to forward an already-exported secret.
 
 ## Model identity
 
