@@ -513,7 +513,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut oracle_path: Option<String> = None;
     let mut preset_key: Option<String> = None;
     let mut warp34_prof_path: Option<String> = None;
-    let mut prof_rounds = 128usize;
+    let mut prof_rounds = if sub == "bench-image" {
+        3usize
+    } else {
+        128usize
+    };
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut enable_thinking = true;

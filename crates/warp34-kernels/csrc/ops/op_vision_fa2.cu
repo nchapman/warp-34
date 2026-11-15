@@ -7,7 +7,7 @@ namespace warp34_vision_fa2_detail {
 using D64 = Flash_fwd_kernel_traits<64,128,128,4,false,false,cutlass::half_t>;
 using D72 = Flash_fwd_kernel_traits<96,128,64,4,false,false,cutlass::half_t>;
 using D128Causal = Flash_fwd_kernel_traits<128,64,64,4,false,false,cutlass::half_t>;
-using D128Full = Flash_fwd_kernel_traits<128,128,32,4,false,false,cutlass::half_t>;
+using D128Full = Flash_fwd_kernel_traits<128,64,64,4,false,false,cutlass::half_t>;
 // Varlen forces even-MN=false, D64/D128 have even-K=true, logical D72 does not.
 // Directly use the donor entrypoint, avoiding its error-swallowing stub wrapper.
 template<class T, bool IsCausal, bool EvenK> cudaError_t prepare() {

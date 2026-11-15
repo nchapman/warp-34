@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaStream, DeviceArena, DeviceBuffer, Result, check_rc,
-    f16_to_f32_slice, f32_to_f16_slice,
+    f16_to_f32_slice, f32_to_f16_slice, prepare_execution_plan,
 };
 use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
 use crate::model::{LinearProj, MARLIN_TILE_K_W4, MARLIN_TILE_N, RawLinearHost};
@@ -101,6 +101,7 @@ impl Qwen3VlConditioningEncoder {
         device_id: i32,
         stream: &CudaStream,
     ) -> Result<Self> {
+        prepare_execution_plan(device_id)?;
         let _dev = CudaDevice::set_current(device_id)?;
         let vision = if let Some(ref vcfg) = cfg.vision_config {
             Qwen3VisionEncoder::try_load(&archive, vcfg, quant, device_id, stream)?
@@ -680,30 +681,55 @@ impl Qwen3VlConditioningEncoder {
                 seq_len,
             )?;
 
-            check_rc(
-                // SAFETY: `d_gate_up` spans `seq_len * 2 * interm * 2` bytes and `d_mlp_interm` spans `seq_len * interm * 2` bytes.
-                unsafe {
-                    ffi::warp34_silu_and_mul_f16(
-                        &ex,
-                        d_gate_up as *const c_void,
-                        d_mlp_interm as *mut c_void,
-                        core::ptr::null(),
-                        seq_len as i32,
-                        interm as i32,
-                    )
-                },
-                "warp34_silu_and_mul_f16(Qwen3-VL)",
-            )?;
-
-            layer.down_proj.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_mlp_interm,
-                d_proj_out,
-                seq_len,
-            )?;
+            if layer.down_proj.can_fuse_h64_from_producer() && (interm & 63) == 0 {
+                check_rc(
+                    // SAFETY: `d_gate_up` spans `seq_len * 2 * interm * 2` bytes and `d_mlp_interm` spans `seq_len * interm * 2` bytes.
+                    unsafe {
+                        ffi::warp34_silu_and_mul_hadamard_f16(
+                            &ex,
+                            d_gate_up as *const c_void,
+                            d_mlp_interm as *mut c_void,
+                            core::ptr::null(),
+                            seq_len as i32,
+                            interm as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_hadamard_f16(Qwen3-VL)",
+                )?;
+                layer.down_proj.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_mlp_interm,
+                    d_proj_out,
+                    seq_len,
+                )?;
+            } else {
+                check_rc(
+                    // SAFETY: `d_gate_up` spans `seq_len * 2 * interm * 2` bytes and `d_mlp_interm` spans `seq_len * interm * 2` bytes.
+                    unsafe {
+                        ffi::warp34_silu_and_mul_f16(
+                            &ex,
+                            d_gate_up as *const c_void,
+                            d_mlp_interm as *mut c_void,
+                            core::ptr::null(),
+                            seq_len as i32,
+                            interm as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_f16(Qwen3-VL)",
+                )?;
+                layer.down_proj.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_mlp_interm,
+                    d_proj_out,
+                    seq_len,
+                )?;
+            }
 
             check_rc(
                 // SAFETY: `d_residual` and `d_proj_out` are disjoint 16-byte-aligned buffers of `seq_len * hidden` FP16 elements.

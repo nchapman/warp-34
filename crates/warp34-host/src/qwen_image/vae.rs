@@ -18,12 +18,12 @@ use warp34_kernels::ffi;
 
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaStream, DeviceBuffer, Result, check_rc, f16_to_f32,
-    f32_to_f16,
+    f32_to_f16, prepare_execution_plan,
 };
 use crate::loader::SafetensorsArchive;
 use crate::qwen_image::QwenImage21VaeConfig;
 
-const MAX_IM2COL_ELEMS: usize = 32 * 1024 * 1024; // 64 MiB FP16 workspace cap per strip
+const MAX_IM2COL_ELEMS: usize = 192 * 1024 * 1024; // 384 MiB FP16 workspace cap per strip
 
 /// Spatial tiling configuration for `AutoencoderKLQwenImage21`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +210,9 @@ struct VaeConv2dGpu {
     k_h: usize,
     k_w: usize,
     pad_top: usize,
+    pad_bottom: usize,
     pad_left: usize,
+    pad_right: usize,
     stride_h: usize,
     stride_w: usize,
 }
@@ -231,6 +233,29 @@ impl VaeConv2dGpu {
         device_id: i32,
         stream: &CudaStream,
     ) -> Result<Self> {
+        Self::load_asymmetric_pad(
+            archive, prefix, in_c, out_c, k_h, k_w, pad_top, pad_top, pad_left, pad_left, stride_h,
+            stride_w, device_id, stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_asymmetric_pad(
+        archive: &SafetensorsArchive,
+        prefix: &str,
+        in_c: usize,
+        out_c: usize,
+        k_h: usize,
+        k_w: usize,
+        pad_top: usize,
+        pad_bottom: usize,
+        pad_left: usize,
+        pad_right: usize,
+        stride_h: usize,
+        stride_w: usize,
+        device_id: i32,
+        stream: &CudaStream,
+    ) -> Result<Self> {
         let w_host = load_tensor_f16(archive, &format!("{prefix}.weight"))?;
         let b_host = load_tensor_f16(archive, &format!("{prefix}.bias"))?;
         if w_host.len() != out_c * in_c * k_h * k_w || b_host.len() != out_c {
@@ -244,7 +269,9 @@ impl VaeConv2dGpu {
             k_h,
             k_w,
             pad_top,
+            pad_bottom,
             pad_left,
+            pad_right,
             stride_h,
             stride_w,
         })
@@ -448,7 +475,6 @@ struct VaeUpBlockGpu {
     out_dim: usize,
     factor_t: usize,
     factor_s: usize,
-    up_flag: bool,
     resnets: Vec<VaeResnetBlockGpu>,
     upsampler_conv: Option<VaeConv2dGpu>,
 }
@@ -537,7 +563,8 @@ impl QwenImage21VaeWeightsGpu {
                 cur_dim = out_dim;
             }
             let downsampler_conv = if down_flag {
-                Some(VaeConv2dGpu::load(
+                // Matches `nn.Sequential(nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(..., 3, stride=2, padding=0))`.
+                Some(VaeConv2dGpu::load_asymmetric_pad(
                     archive,
                     &pfx(&format!("encoder.down_blocks.{i}.downsampler.resample.1")),
                     out_dim,
@@ -545,7 +572,9 @@ impl QwenImage21VaeWeightsGpu {
                     3,
                     3,
                     0,
+                    1,
                     0,
+                    1,
                     2,
                     2,
                     device_id,
@@ -694,7 +723,6 @@ impl QwenImage21VaeWeightsGpu {
                 out_dim,
                 factor_t: if temp_up { 2 } else { 1 },
                 factor_s: if up_flag { 2 } else { 1 },
-                up_flag,
                 resnets,
                 upsampler_conv,
             });
@@ -750,6 +778,7 @@ pub struct QwenImage21VaeEngine {
     buf_b: DeviceBuffer,
     buf_c: DeviceBuffer,
     buf_d: DeviceBuffer,
+    buf_e: DeviceBuffer,
     qkv_ws: DeviceBuffer,
     scores_ws: DeviceBuffer,
     probs_ws: DeviceBuffer,
@@ -759,6 +788,7 @@ impl QwenImage21VaeEngine {
     /// Creates a new `QwenImage21VaeEngine` on `weights.device_id`.
     pub fn new(weights: QwenImage21VaeWeightsGpu) -> Result<Self> {
         let device_id = weights.device_id;
+        prepare_execution_plan(device_id)?;
         let stream = CudaStream::new(device_id)?;
         let cublas = CublasHandle::new(&stream)?;
         Ok(Self {
@@ -771,6 +801,7 @@ impl QwenImage21VaeEngine {
             buf_b: DeviceBuffer::alloc(device_id, 16)?,
             buf_c: DeviceBuffer::alloc(device_id, 16)?,
             buf_d: DeviceBuffer::alloc(device_id, 16)?,
+            buf_e: DeviceBuffer::alloc(device_id, 16)?,
             qkv_ws: DeviceBuffer::alloc(device_id, 16)?,
             scores_ws: DeviceBuffer::alloc(device_id, 16)?,
             probs_ws: DeviceBuffer::alloc(device_id, 16)?,
@@ -828,13 +859,11 @@ impl QwenImage21VaeEngine {
         clamp_pm1: bool,
     ) -> Result<(usize, usize)> {
         let h_numer = h_in
-            .checked_add(2 * conv.pad_top)
-            .and_then(|v| v.checked_add(conv.stride_h - 1))
+            .checked_add(conv.pad_top + conv.pad_bottom)
             .and_then(|v| v.checked_sub(conv.k_h))
             .ok_or_else(|| CudaError::new(-10, "conv2d h_in smaller than kernel or overflow"))?;
         let w_numer = w_in
-            .checked_add(2 * conv.pad_left)
-            .and_then(|v| v.checked_add(conv.stride_w - 1))
+            .checked_add(conv.pad_left + conv.pad_right)
             .and_then(|v| v.checked_sub(conv.k_w))
             .ok_or_else(|| CudaError::new(-10, "conv2d w_in smaller than kernel or overflow"))?;
         let h_out = h_numer / conv.stride_h + 1;
@@ -846,7 +875,9 @@ impl QwenImage21VaeEngine {
         if conv.k_h == 1
             && conv.k_w == 1
             && conv.pad_top == 0
+            && conv.pad_bottom == 0
             && conv.pad_left == 0
+            && conv.pad_right == 0
             && conv.stride_h == 1
             && conv.stride_w == 1
         {
@@ -1408,6 +1439,7 @@ impl QwenImage21VaeEngine {
         z_tile_f16: &[u16],
         latent_h: usize,
         latent_w: usize,
+        clamp_final: bool,
     ) -> Result<Vec<u16>> {
         let _dev = CudaDevice::set_current(self.weights.device_id)?;
         let cfg = &self.weights.cfg;
@@ -1421,6 +1453,7 @@ impl QwenImage21VaeEngine {
         Self::ensure_buf_u16(&mut self.buf_b, max_elems)?;
         Self::ensure_buf_u16(&mut self.buf_c, max_elems)?;
         Self::ensure_buf_u16(&mut self.buf_d, max_elems)?;
+        Self::ensure_buf_u16(&mut self.buf_e, max_elems)?;
 
         check_rc(
             // SAFETY: `buf_a` holds at least `z_tile_f16.len() * 2` bytes, and `z_tile_f16` is live.
@@ -1463,7 +1496,7 @@ impl QwenImage21VaeEngine {
             false,
         )?;
 
-        // MidBlock: resnet0 -> attn0 -> resnet1 on buf_b
+        // MidBlock: resnet0 (buf_b -> buf_e) -> attn0 (buf_e -> buf_a) -> resnet1 (buf_a -> buf_b) — zero D2D copies!
         Self::run_resnet(
             &ex,
             &self.cublas,
@@ -1472,7 +1505,7 @@ impl QwenImage21VaeEngine {
             self.buf_b.ptr as *const c_void,
             self.buf_c.ptr,
             self.buf_d.ptr,
-            self.buf_b.ptr,
+            self.buf_e.ptr,
             cur_h,
             cur_w,
         )?;
@@ -1484,7 +1517,7 @@ impl QwenImage21VaeEngine {
             &mut self.scores_ws,
             &mut self.probs_ws,
             &self.weights.dec_mid_block.attn0,
-            self.buf_b.ptr as *const c_void,
+            self.buf_e.ptr as *const c_void,
             self.buf_c.ptr,
             self.buf_a.ptr,
             cur_h,
@@ -1503,44 +1536,47 @@ impl QwenImage21VaeEngine {
             cur_w,
         )?;
 
+        // Ping-pong across `buf_a`, `buf_b`, `buf_e` so neither `block_skip` nor `run_resnet` ever needs a D2D copy!
+        let mut cur_ptr = self.buf_b.ptr;
         for block in &self.weights.dec_up_blocks {
-            if block.up_flag {
-                let in_bytes = block.in_dim * cur_h * cur_w * 2;
-                check_rc(
-                    // SAFETY: `buf_a` and `buf_b` both hold at least `in_bytes` bytes on device.
-                    unsafe {
-                        ffi::warp34_memcpy_d2d_async(
-                            self.buf_a.ptr,
-                            self.buf_b.ptr as *const c_void,
-                            in_bytes,
-                            self.stream.handle,
-                        )
-                    },
-                    "warp34_memcpy_d2d_async(dec_up_block)",
-                )?;
-            }
-            for res in &block.resnets {
+            let skip_ptr = cur_ptr;
+            // Choose two ping-pong buffers disjoint from `skip_ptr` (when `up_flag` needs `skip_ptr` intact until `dup_up`).
+            let (mut pp0, mut pp1) = if core::ptr::eq(skip_ptr, self.buf_a.ptr) {
+                (self.buf_b.ptr, self.buf_e.ptr)
+            } else if core::ptr::eq(skip_ptr, self.buf_b.ptr) {
+                (self.buf_e.ptr, self.buf_a.ptr)
+            } else {
+                (self.buf_a.ptr, self.buf_b.ptr)
+            };
+            let mut r_in = cur_ptr;
+            for (r_idx, res) in block.resnets.iter().enumerate() {
+                let r_out = if r_idx == 0 { pp0 } else { pp1 };
                 Self::run_resnet(
                     &ex,
                     &self.cublas,
                     &mut self.im2col_ws,
                     res,
-                    self.buf_b.ptr as *const c_void,
+                    r_in as *const c_void,
                     self.buf_c.ptr,
                     self.buf_d.ptr,
-                    self.buf_b.ptr,
+                    r_out,
                     cur_h,
                     cur_w,
                 )?;
+                r_in = r_out;
+                if r_idx >= 1 {
+                    core::mem::swap(&mut pp0, &mut pp1);
+                }
             }
+            cur_ptr = r_in;
             if let Some(up_conv) = &block.upsampler_conv {
-                // 2x nearest upsample: buf_b -> buf_c
+                // 2x nearest upsample: cur_ptr -> buf_c
                 check_rc(
-                    // SAFETY: `buf_b` and `buf_c` are valid device allocations sized for `max_elems`.
+                    // SAFETY: `cur_ptr` and `buf_c` are valid device allocations sized for `max_elems`.
                     unsafe {
                         ffi::warp34_qwen_image_vae_upsample2d_nearest2x_f16(
                             &ex,
-                            self.buf_b.ptr as *const c_void,
+                            cur_ptr as *const c_void,
                             self.buf_c.ptr,
                             block.out_dim as i32,
                             cur_h as i32,
@@ -1561,15 +1597,20 @@ impl QwenImage21VaeEngine {
                     cur_w * 2,
                     false,
                 )?;
-                // DupUp3D(buf_a) + buf_d -> buf_b
+                // DupUp3D(skip_ptr) + buf_d -> cur_ptr (disjoint from `skip_ptr` since `resnets` has >= 1 block!)
+                let dup_out = if core::ptr::eq(cur_ptr, skip_ptr) {
+                    pp1
+                } else {
+                    cur_ptr
+                };
                 check_rc(
-                    // SAFETY: `buf_a`, `buf_d`, and `buf_b` are valid device allocations sized for `max_elems`.
+                    // SAFETY: `skip_ptr`, `buf_d`, and `dup_out` are disjoint valid device allocations sized for `max_elems`.
                     unsafe {
                         ffi::warp34_qwen_image_vae_dup_up_f16(
                             &ex,
-                            self.buf_a.ptr as *const c_void,
+                            skip_ptr as *const c_void,
                             self.buf_d.ptr as *const c_void,
-                            self.buf_b.ptr,
+                            dup_out,
                             block.in_dim as i32,
                             block.out_dim as i32,
                             cur_h as i32,
@@ -1580,6 +1621,7 @@ impl QwenImage21VaeEngine {
                     },
                     "warp34_qwen_image_vae_dup_up_f16",
                 )?;
+                cur_ptr = dup_out;
                 cur_h = next_h;
                 cur_w = next_w;
             }
@@ -1589,11 +1631,11 @@ impl QwenImage21VaeEngine {
         let last_dim = self.weights.dec_conv_out.in_c;
         let spatial = cur_h * cur_w;
         check_rc(
-            // SAFETY: `buf_b`, `dec_norm_out_gamma`, and `buf_c` are valid device allocations.
+            // SAFETY: `cur_ptr`, `dec_norm_out_gamma`, and `buf_c` are valid device allocations.
             unsafe {
                 ffi::warp34_qwen_image_vae_rms_norm_f16(
                     &ex,
-                    self.buf_b.ptr as *const c_void,
+                    cur_ptr as *const c_void,
                     self.weights.dec_norm_out_gamma.ptr as *const c_void,
                     self.buf_c.ptr,
                     last_dim as i32,
@@ -1603,7 +1645,7 @@ impl QwenImage21VaeEngine {
             },
             "dec norm_out+silu",
         )?;
-        // conv_out + clamp([-1, 1]) -> buf_a
+        // conv_out + optional clamp([-1, 1]) -> buf_a
         Self::run_conv2d(
             &ex,
             &self.cublas,
@@ -1614,7 +1656,7 @@ impl QwenImage21VaeEngine {
             self.buf_a.ptr,
             cur_h,
             cur_w,
-            true,
+            clamp_final,
         )?;
 
         let out_elems = cfg.out_channels * spatial;
@@ -1716,7 +1758,7 @@ impl QwenImage21VaeEngine {
         if self.tiling.enabled && (latent_w > tile_latent_min_w || latent_h > tile_latent_min_h) {
             return self.tiled_decode(z_f16, latent_h, latent_w);
         }
-        self.decode_single_tile(z_f16, latent_h, latent_w)
+        self.decode_single_tile(z_f16, latent_h, latent_w, true)
     }
 
     /// Denormalizes `[z_dim, latent_h, latent_w]` latents by `z * latents_std + latents_mean`
@@ -1869,7 +1911,7 @@ impl QwenImage21VaeEngine {
                 let cur_lw = (latent_w - j).min(tile_lat_min_w);
                 let sub =
                     extract_chw_subtile(z_f16, z_dim, latent_h, latent_w, i, j, cur_lh, cur_lw);
-                let dec_sub = self.decode_single_tile(&sub, cur_lh, cur_lw)?;
+                let dec_sub = self.decode_single_tile(&sub, cur_lh, cur_lw, false)?;
                 row.push((dec_sub, cur_lh * scale, cur_lw * scale));
                 j += tile_lat_stride_w;
             }
@@ -1877,7 +1919,7 @@ impl QwenImage21VaeEngine {
             i += tile_lat_stride_h;
         }
 
-        Ok(stitch_blended_tiles(
+        let mut stitched = stitch_blended_tiles(
             &mut rows,
             out_c,
             sample_h,
@@ -1886,7 +1928,11 @@ impl QwenImage21VaeEngine {
             tile_sample_stride_w,
             blend_h,
             blend_w,
-        ))
+        );
+        for v in &mut stitched {
+            *v = f32_to_f16(f16_to_f32(*v).clamp(-1.0, 1.0));
+        }
+        Ok(stitched)
     }
 }
 

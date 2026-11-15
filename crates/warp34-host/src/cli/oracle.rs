@@ -707,19 +707,31 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         cfg_scale,
         seed,
         rgba_output,
+        use_cuda_graph,
         compare_tp2,
         golden_path,
         ..
     } = options;
     let condition_images =
         crate::cli::commands::load_cli_condition_images(&image_urls, allow_remote_images)?;
-    let (width, height, default_res) =
-        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
-    let resolution = if image_width.is_some() || image_height.is_some() {
-        default_res
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let golden_loaded = if let Some(ref golden) = golden_path {
+        let bytes = std::fs::read(golden)
+            .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
+        let dyn_img = image::load_from_memory(&bytes)
+            .map_err(|e| format!("failed to decode golden image '{golden}': {e}"))?;
+        let has_alpha = dyn_img.color().has_alpha();
+        let (gw, gh) = (dyn_img.width(), dyn_img.height());
+        let pixels = if rgba_output || has_alpha {
+            dyn_img.to_rgba8().into_raw()
+        } else {
+            dyn_img.to_rgb8().into_raw()
+        };
+        Some((gw, gh, has_alpha, pixels))
     } else {
-        output_resolution
+        None
     };
+    let want_rgba = rgba_output || golden_loaded.as_ref().is_some_and(|(_, _, a, _)| *a);
     let effective_tp = if compare_tp2 { 1 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
@@ -738,15 +750,16 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         prompt,
         negative_prompt,
         condition_images,
-        width: Some(width),
-        height: Some(height),
-        output_resolution: resolution,
+        width,
+        height,
+        output_resolution,
         num_inference_steps: Some(steps),
         sigmas: None,
         true_cfg_scale: cfg_scale,
         seed,
         initial_latents_chw_f16: None,
-        rgba_output: rgba_output || golden_path.is_some(),
+        rgba_output: want_rgba,
+        use_cuda_graph,
     };
     let res = engine.generate(&req).map_err(|e| e.to_string())?;
     if compare_tp2 {
@@ -769,11 +782,14 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         }
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some(ref golden) = golden_path {
-        let bytes = std::fs::read(golden)
-            .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
-        let ref_img = crate::server::decode_condition_image_bytes(&bytes)?;
-        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, &ref_img.rgba)?;
+    if let (Some(golden), Some((gw, gh, _, ref_pixels))) = (&golden_path, &golden_loaded) {
+        if res.width != *gw || res.height != *gh {
+            return Err(format!(
+                "dump-diff output dimensions {}x{} do not match golden '{golden}' dimensions {gw}x{gh}",
+                res.width, res.height
+            ));
+        }
+        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, ref_pixels)?;
         println!(
             "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} golden={golden} psnr={psnr:.2}dB max_px_diff={max_diff} total_ms={:.2}",
             engine.tp_size(),

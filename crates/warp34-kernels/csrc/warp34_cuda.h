@@ -407,6 +407,10 @@ size_t warp34_tp2_signal_bytes(void);
 int warp34_tp2_all_reduce_f16(const warp34_exec* ex, const void* local_in, void* out,
                            void* stage0, void* stage1,
                            void* sig0, void* sig1, int rank, int num_elems);
+int warp34_tp2_all_reduce_pipelined_f16(
+    const warp34_exec* ex, const void* local_in, void* out,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_elems,
+    uintptr_t dma_stream, uintptr_t ev_ready, const uintptr_t* ev_tx_done, int max_chunks);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* tap_dst_bf16,
@@ -954,10 +958,24 @@ int warp34_qwen_image_adaln_modulate_f16(
     const warp34_exec* ex, const void* x, const void* modulation,
     const uint8_t* target_token_mask, void* out,
     int num_tokens, int hidden_size, int mod_stride, int scale_col_offset, float eps);
+int warp34_qwen_image_adaln_modulate_ex_f16(
+    const warp34_exec* ex, const void* x, const void* modulation,
+    const uint8_t* target_token_mask, void* out,
+    int num_tokens, int hidden_size, int mod_stride, int scale_col_offset, float eps, int apply_had64);
 int warp34_qwen_image_gated_residual_f16(
     const warp34_exec* ex, void* residual, const void* branch_out,
     const void* modulation, const uint8_t* target_token_mask,
     int num_tokens, int hidden_size, int mod_stride, int gate_col_offset);
+int warp34_qwen_image_fused_gated_residual_adaln_f16(
+    const warp34_exec* ex, void* residual, const void* branch_out,
+    const void* gate_modulation, const uint8_t* gate_target_mask,
+    int gate_mod_stride, int gate_col_offset,
+    const void* scale_modulation, const uint8_t* scale_target_mask,
+    int scale_mod_stride, int scale_col_offset,
+    void* norm_out, int num_tokens, int hidden_size, float eps, int apply_had64);
+int warp34_qwen_image_euler_cfg_step_f16(
+    const warp34_exec* ex, void* sample_f16, const void* cond_pred_f16,
+    const void* uncond_pred_f16, float true_cfg_scale, float dt, int64_t n_elems);
 int warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
     const warp34_exec* ex, const void* q_in, const void* k_in,
     const void* norm_q_w, const void* norm_k_w,

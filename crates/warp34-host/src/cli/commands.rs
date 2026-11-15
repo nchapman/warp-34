@@ -122,17 +122,12 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         cfg_scale,
         seed,
         rgba_output,
+        use_cuda_graph,
         out_json,
         ..
     } = options;
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
-    let (width, height, default_res) =
-        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
-    let resolution = if image_width.is_some() || image_height.is_some() {
-        default_res
-    } else {
-        output_resolution
-    };
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
         tp,
@@ -150,15 +145,16 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         prompt,
         negative_prompt,
         condition_images,
-        width: Some(width),
-        height: Some(height),
-        output_resolution: resolution,
+        width,
+        height,
+        output_resolution,
         num_inference_steps: Some(steps),
         sigmas: None,
         true_cfg_scale: cfg_scale,
         seed,
         initial_latents_chw_f16: None,
         rgba_output,
+        use_cuda_graph,
     };
     let res = engine.generate(&req).map_err(|e| e.to_string())?;
     let out_path = out_json.unwrap_or_else(|| "out.png".to_string());
@@ -197,18 +193,13 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
         cfg_scale,
         seed,
         rgba_output,
+        use_cuda_graph,
         prof_rounds,
         out_json,
         ..
     } = options;
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
-    let (width, height, default_res) =
-        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
-    let resolution = if image_width.is_some() || image_height.is_some() {
-        default_res
-    } else {
-        output_resolution
-    };
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
         tp,
@@ -222,24 +213,21 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
             .map(|s| s.len().max(1))
             .unwrap_or(40)
     });
-    let rounds = if prof_rounds == 128 {
-        3
-    } else {
-        prof_rounds.max(1)
-    };
+    let rounds = prof_rounds.max(1);
     let req = crate::qwen_image::QwenImage21GenerationRequest {
         prompt,
         negative_prompt,
         condition_images,
-        width: Some(width),
-        height: Some(height),
-        output_resolution: resolution,
+        width,
+        height,
+        output_resolution,
         num_inference_steps: Some(steps),
         sigmas: None,
         true_cfg_scale: cfg_scale,
         seed,
         initial_latents_chw_f16: None,
         rgba_output,
+        use_cuda_graph,
     };
     // Warmup pass
     let _ = engine.generate(&req).map_err(|e| e.to_string())?;
@@ -936,6 +924,7 @@ pub(crate) fn run_serve(
         let state = crate::server::QwenImage21ServerState::from_loader_with_options(
             model,
             allow_remote_images,
+            use_cuda_graph,
             serve.options,
             move || {
                 crate::qwen_image::QwenImage21PipelineEngine::load(

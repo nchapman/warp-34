@@ -31,7 +31,9 @@ use crate::qwen_image::{
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 #[cfg(feature = "cuda")]
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+#[cfg(feature = "cuda")]
+use std::time::{Duration, Instant};
 #[cfg(feature = "cuda")]
 use warp34_kernels::ffi;
 
@@ -175,8 +177,8 @@ pub struct QwenImage21KvCacheGpu {
     pub layer_v: Vec<DeviceBuffer>,
     pub d_cos_target: Option<DeviceBuffer>,
     pub d_sin_target: Option<DeviceBuffer>,
-    cached_graph: Option<(usize, usize, CudaGraph)>,
-    graph_warmed_geom: Option<(usize, usize)>,
+    cached_graph: Option<(usize, usize, u64, CudaGraph)>,
+    graph_warmed_geom: Option<(usize, usize, u64)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -315,8 +317,146 @@ struct QwenImage21BlockGpu {
 }
 
 #[cfg(feature = "cuda")]
+impl QwenImage21BlockGpu {
+    #[inline]
+    fn qkv_can_fuse_h64(&self, inner_dim: usize) -> bool {
+        (inner_dim & 63) == 0
+            && self.to_q.can_fuse_h64_from_producer()
+            && self.to_k.can_fuse_h64_from_producer()
+            && self.to_v.can_fuse_h64_from_producer()
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Tp2GateState {
+    generation: u64,
+    arrived: u8,
+    min_val: u8,
+    last_agreed: u8,
+    aborted: bool,
+}
+
+#[cfg(feature = "cuda")]
+struct Tp2CaptureGate {
+    state: Mutex<Tp2GateState>,
+    cvar: Condvar,
+}
+
+#[cfg(feature = "cuda")]
+struct Tp2GateStepGuard<'a> {
+    gate: &'a Tp2CaptureGate,
+    armed: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Tp2GateStepGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Tp2GateStepGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.aborted = true;
+            self.gate.cvar.notify_all();
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Tp2CaptureGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Tp2GateState {
+                generation: 0,
+                arrived: 0,
+                min_val: u8::MAX,
+                last_agreed: 0,
+                aborted: false,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn reset(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.generation = 0;
+        st.arrived = 0;
+        st.min_val = u8::MAX;
+        st.last_agreed = 0;
+        st.aborted = false;
+    }
+
+    fn enter_step(&self) -> Tp2GateStepGuard<'_> {
+        Tp2GateStepGuard {
+            gate: self,
+            armed: true,
+        }
+    }
+
+    fn agree_min_u8(&self, local_val: u8) -> Result<u8> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.aborted {
+            return Err(CudaError::new(
+                -10,
+                "peer TP=2 rank aborted before rendezvous",
+            ));
+        }
+        let my_gen = st.generation;
+        st.min_val = st.min_val.min(local_val);
+        st.arrived += 1;
+        if st.arrived >= 2 {
+            let agreed = st.min_val;
+            st.last_agreed = agreed;
+            st.generation = st.generation.wrapping_add(1);
+            st.arrived = 0;
+            st.min_val = u8::MAX;
+            self.cvar.notify_all();
+            return Ok(agreed);
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while st.generation == my_gen && !st.aborted {
+            let now = Instant::now();
+            if now >= deadline {
+                st.aborted = true;
+                self.cvar.notify_all();
+                return Err(CudaError::new(
+                    -10,
+                    "TP=2 capture gate rendezvous timed out",
+                ));
+            }
+            let (next_st, timeout) = self
+                .cvar
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            st = next_st;
+            if timeout.timed_out() && st.generation == my_gen && !st.aborted {
+                st.aborted = true;
+                self.cvar.notify_all();
+                return Err(CudaError::new(
+                    -10,
+                    "TP=2 capture gate rendezvous timed out",
+                ));
+            }
+        }
+        if st.aborted && st.generation == my_gen {
+            return Err(CudaError::new(
+                -10,
+                "peer TP=2 rank aborted during rendezvous",
+            ));
+        }
+        Ok(st.last_agreed)
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[derive(Default)]
 struct QwenImage21Workspace {
+    alloc_epoch: u64,
     marlin_ws: Option<DeviceBuffer>,
     exec_scratch: Option<DeviceBuffer>,
     d_img_in: Option<DeviceBuffer>,
@@ -330,6 +470,7 @@ struct QwenImage21Workspace {
     d_cos_full: Option<DeviceBuffer>,
     d_sin_full: Option<DeviceBuffer>,
     d_timesteps: Option<DeviceBuffer>,
+    d_step_timesteps: Option<DeviceBuffer>,
     d_t_sin: Option<DeviceBuffer>,
     d_temb_mid: Option<DeviceBuffer>,
     d_temb: Option<DeviceBuffer>,
@@ -346,18 +487,22 @@ struct QwenImage21Workspace {
     d_gate_up: Option<DeviceBuffer>,
     d_mlp_interm: Option<DeviceBuffer>,
     d_out: Option<DeviceBuffer>,
+    d_latents: Option<DeviceBuffer>,
+    d_cond_pred: Option<DeviceBuffer>,
 }
 
 #[cfg(feature = "cuda")]
 impl QwenImage21Workspace {
     fn ensure_buf(
         slot: &mut Option<DeviceBuffer>,
+        alloc_epoch: &mut u64,
         device_id: i32,
         min_bytes: usize,
     ) -> Result<u64> {
         let need = min_bytes.max(16);
         if slot.as_ref().is_none_or(|b| b.len_bytes < need) {
             *slot = Some(DeviceBuffer::alloc(device_id, need)?);
+            *alloc_epoch = alloc_epoch.wrapping_add(1);
         }
         Ok(slot.as_ref().unwrap().addr())
     }
@@ -435,6 +580,7 @@ impl QwenImage21TransformerEngine {
             ));
         }
 
+        prepare_execution_plan(device_id)?;
         let _dev = CudaDevice::set_current(device_id)?;
         let inner_dim = cfg.inner_dim();
         let head_dim = cfg.attention_head_dim;
@@ -746,11 +892,70 @@ impl QwenImage21TransformerEngine {
         vlm_img_mask: &[bool],
         img_shapes: &[(usize, usize, usize)],
         timestep: f32,
+        kv_cache: Option<&mut QwenImage21KvCacheGpu>,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        allreduce_fn: Option<F>,
+    ) -> Result<QwenImage21ExtractOutput>
+    where
+        F: FnMut(u64, usize, &CudaStream) -> Result<()>,
+    {
+        let mut ws_guard = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let (total_seq_len, prefix_len, target_tokens, d_out) = self.forward_extract_device_inner(
+            &mut ws_guard,
+            cond_latents_f16,
+            Some(target_latents_f16),
+            0,
+            encoder_hidden_f16,
+            vlm_img_mask,
+            img_shapes,
+            timestep,
+            kv_cache,
+            cublas,
+            stream,
+            allreduce_fn,
+        )?;
+        let out_dim = self.cfg.out_channels * self.cfg.patch_size * self.cfg.patch_size;
+        let mut full_output_f16 = vec![0u16; total_seq_len * out_dim];
+        check_rc(
+            // SAFETY: `full_output_f16` and `d_out` both span `total_seq_len * out_dim * 2` bytes.
+            unsafe {
+                ffi::warp34_memcpy_d2h_async(
+                    full_output_f16.as_mut_ptr() as *mut c_void,
+                    d_out as *const c_void,
+                    full_output_f16.len() * 2,
+                    stream.handle,
+                )
+            },
+            "QwenImage21 extract output D2H",
+        )?;
+        stream.synchronize()?;
+
+        let target_output_f16 = full_output_f16[prefix_len * out_dim..].to_vec();
+        Ok(QwenImage21ExtractOutput {
+            full_output_f16,
+            target_output_f16,
+            prefix_len,
+            target_tokens,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    fn forward_extract_device_inner<F>(
+        &self,
+        ws: &mut QwenImage21Workspace,
+        cond_latents_f16: &[u16],
+        target_latents_host_f16: Option<&[u16]>,
+        d_target_latents_in: u64,
+        encoder_hidden_f16: &[u16],
+        vlm_img_mask: &[bool],
+        img_shapes: &[(usize, usize, usize)],
+        timestep: f32,
         mut kv_cache: Option<&mut QwenImage21KvCacheGpu>,
         cublas: &CublasHandle,
         stream: &CudaStream,
         mut allreduce_fn: Option<F>,
-    ) -> Result<QwenImage21ExtractOutput>
+    ) -> Result<(usize, usize, usize, u64)>
     where
         F: FnMut(u64, usize, &CudaStream) -> Result<()>,
     {
@@ -775,6 +980,13 @@ impl QwenImage21TransformerEngine {
         let target_tokens = tf * th * tw;
         let img_tokens = cond_tokens + target_tokens;
 
+        if !target_tokens.is_multiple_of(IMG_TOKENS_PER_SLOT) {
+            return Err(CudaError::with_detail(
+                -10,
+                "target_tokens must be a multiple of IMG_TOKENS_PER_SLOT (4)",
+                target_tokens.to_string(),
+            ));
+        }
         if cond_latents_f16.len() != cond_tokens * in_dim {
             return Err(CudaError::with_detail(
                 -10,
@@ -786,14 +998,16 @@ impl QwenImage21TransformerEngine {
                 ),
             ));
         }
-        if target_latents_f16.len() != target_tokens * in_dim {
+        if let Some(tgt_host) = target_latents_host_f16
+            && tgt_host.len() != target_tokens * in_dim
+        {
             return Err(CudaError::with_detail(
                 -10,
                 "target_latents_f16 length mismatch",
                 format!(
                     "expected {} ({target_tokens} * {in_dim}), got {}",
                     target_tokens * in_dim,
-                    target_latents_f16.len()
+                    tgt_host.len()
                 ),
             ));
         }
@@ -873,10 +1087,6 @@ impl QwenImage21TransformerEngine {
             .map(|&b| u8::from(b))
             .collect();
 
-        let mut img_all_f16 = Vec::with_capacity(img_tokens * in_dim);
-        img_all_f16.extend_from_slice(cond_latents_f16);
-        img_all_f16.extend_from_slice(target_latents_f16);
-
         if let Some(ref mut cache) = kv_cache {
             let half_head = self.cfg.attention_head_dim / 2;
             let cos_tgt = &cos_full[prefix_len * half_head..];
@@ -888,11 +1098,15 @@ impl QwenImage21TransformerEngine {
             .multi_processor_count
             .max(1) as usize;
         let lse_scratch_bytes = total_seq_len * self.heads_local * std::mem::size_of::<f32>();
-        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let marlin_ws_addr = {
             let need = marlin_ws_ints * 4;
             let init_zero = ws.marlin_ws.as_ref().is_none_or(|b| b.len_bytes < need);
-            let addr = QwenImage21Workspace::ensure_buf(&mut ws.marlin_ws, self.device_id, need)?;
+            let addr = QwenImage21Workspace::ensure_buf(
+                &mut ws.marlin_ws,
+                &mut ws.alloc_epoch,
+                self.device_id,
+                need,
+            )?;
             if init_zero {
                 ws.marlin_ws.as_ref().unwrap().zero_async(stream)?;
             }
@@ -919,6 +1133,7 @@ impl QwenImage21TransformerEngine {
         let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
+            &mut ws.alloc_epoch,
             self.device_id,
             exec_scratch_bytes,
         )?;
@@ -937,144 +1152,199 @@ impl QwenImage21TransformerEngine {
 
         let d_img_in = QwenImage21Workspace::ensure_buf(
             &mut ws.d_img_in,
+            &mut ws.alloc_epoch,
             self.device_id,
-            img_all_f16.len() * 2,
+            img_tokens * in_dim * 2,
         )?;
         let d_img_proj = QwenImage21Workspace::ensure_buf(
             &mut ws.d_img_proj,
+            &mut ws.alloc_epoch,
             self.device_id,
             img_tokens * inner_dim * 2,
         )?;
         let d_enc_in = QwenImage21Workspace::ensure_buf(
             &mut ws.d_enc_in,
+            &mut ws.alloc_epoch,
             self.device_id,
             encoder_hidden_f16.len() * 2,
         )?;
         let d_txt_norm = QwenImage21Workspace::ensure_buf(
             &mut ws.d_txt_norm,
+            &mut ws.alloc_epoch,
             self.device_id,
             txt_seq_len * ctx_dim * 2,
         )?;
         let d_txt_mid = QwenImage21Workspace::ensure_buf(
             &mut ws.d_txt_mid,
+            &mut ws.alloc_epoch,
             self.device_id,
             txt_seq_len * inner_dim * 2,
         )?;
         let d_txt_proj = QwenImage21Workspace::ensure_buf(
             &mut ws.d_txt_proj,
+            &mut ws.alloc_epoch,
             self.device_id,
             txt_seq_len * inner_dim * 2,
         )?;
         let d_row_map = QwenImage21Workspace::ensure_buf(
             &mut ws.d_row_map,
+            &mut ws.alloc_epoch,
             self.device_id,
             joint_row_map.len() * 4,
         )?;
         let d_target_mask = QwenImage21Workspace::ensure_buf(
             &mut ws.d_target_mask,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_mask_u8.len(),
         )?;
         let d_cos_full = QwenImage21Workspace::ensure_buf(
             &mut ws.d_cos_full,
+            &mut ws.alloc_epoch,
             self.device_id,
             cos_full.len() * 4,
         )?;
         let d_sin_full = QwenImage21Workspace::ensure_buf(
             &mut ws.d_sin_full,
+            &mut ws.alloc_epoch,
             self.device_id,
             sin_full.len() * 4,
         )?;
         let d_timesteps = QwenImage21Workspace::ensure_buf(
             &mut ws.d_timesteps,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * 4,
         )?;
         let d_t_sin = QwenImage21Workspace::ensure_buf(
             &mut ws.d_t_sin,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * 256 * 2,
         )?;
         let d_temb_mid = QwenImage21Workspace::ensure_buf(
             &mut ws.d_temb_mid,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * inner_dim * 2,
         )?;
         let d_temb = QwenImage21Workspace::ensure_buf(
             &mut ws.d_temb,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * inner_dim * 2,
         )?;
         let d_temb_silu = QwenImage21Workspace::ensure_buf(
             &mut ws.d_temb_silu,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * inner_dim * 2,
         )?;
         let d_modulation = QwenImage21Workspace::ensure_buf(
             &mut ws.d_modulation,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * 4 * inner_dim * 2,
         )?;
         let d_norm_out_scale = QwenImage21Workspace::ensure_buf(
             &mut ws.d_norm_out_scale,
+            &mut ws.alloc_epoch,
             self.device_id,
             num_mod_rows * inner_dim * 2,
         )?;
         let d_joint = QwenImage21Workspace::ensure_buf(
             &mut ws.d_joint,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * inner_dim * 2,
         )?;
         let d_norm = QwenImage21Workspace::ensure_buf(
             &mut ws.d_norm,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * inner_dim * 2,
         )?;
         let d_q = QwenImage21Workspace::ensure_buf(
             &mut ws.d_q,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * self.qkv_dim_local * 2,
         )?;
         let d_k = QwenImage21Workspace::ensure_buf(
             &mut ws.d_k,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * self.qkv_dim_local * 2,
         )?;
         let d_v = QwenImage21Workspace::ensure_buf(
             &mut ws.d_v,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * self.qkv_dim_local * 2,
         )?;
         let d_attn_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_attn_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * self.qkv_dim_local * 2,
         )?;
         let d_branch_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_branch_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * inner_dim * 2,
         )?;
         let d_gate_up = QwenImage21Workspace::ensure_buf(
             &mut ws.d_gate_up,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * 2 * self.mlp_local * 2,
         )?;
         let d_mlp_interm = QwenImage21Workspace::ensure_buf(
             &mut ws.d_mlp_interm,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * self.mlp_local * 2,
         )?;
         let d_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             total_seq_len * out_dim * 2,
         )?;
 
-        ws.d_img_in
-            .as_ref()
-            .unwrap()
-            .copy_from_host(&img_all_f16, stream)?;
+        if let Some(tgt_host) = target_latents_host_f16 {
+            let mut img_all_f16 = Vec::with_capacity(img_tokens * in_dim);
+            img_all_f16.extend_from_slice(cond_latents_f16);
+            img_all_f16.extend_from_slice(tgt_host);
+            ws.d_img_in
+                .as_ref()
+                .unwrap()
+                .copy_from_host(&img_all_f16, stream)?;
+        } else {
+            if !cond_latents_f16.is_empty() {
+                ws.d_img_in
+                    .as_ref()
+                    .unwrap()
+                    .copy_from_host(cond_latents_f16, stream)?;
+            }
+            if target_tokens > 0 {
+                let cond_bytes = cond_tokens * in_dim * 2;
+                let tgt_bytes = target_tokens * in_dim * 2;
+                check_rc(
+                    // SAFETY: `d_img_in + cond_bytes` and `d_target_latents_in` both span `tgt_bytes` bytes on `self.device_id`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2d_async(
+                            (d_img_in + cond_bytes as u64) as *mut c_void,
+                            d_target_latents_in as *const c_void,
+                            tgt_bytes,
+                            stream.handle,
+                        )
+                    },
+                    "QwenImage21 extract target latents D2D",
+                )?;
+            }
+        }
         ws.d_enc_in
             .as_ref()
             .unwrap()
@@ -1201,13 +1471,15 @@ impl QwenImage21TransformerEngine {
             core::ptr::null()
         };
         let cache_write_len = if kv_cache.is_some() { prefix_len } else { 0 };
+        let proj_out_h64 = self.proj_out.can_fuse_h64_from_producer() && (inner_dim & 63) == 0;
 
-        // 3. Transformer blocks
-        for (layer_idx, block) in self.blocks.iter().enumerate() {
+        // 3. Transformer blocks (fused AdaLN + H_64 + gated_residual across all blocks)
+        if let Some(first_block) = self.blocks.first() {
+            let first_qkv_h64 = first_block.qkv_can_fuse_h64(inner_dim);
             check_rc(
                 // SAFETY: `d_joint` and `d_norm` span `total_seq_len * inner_dim * 2` bytes; `d_modulation` has stride `4 * inner_dim`.
                 unsafe {
-                    ffi::warp34_qwen_image_adaln_modulate_f16(
+                    ffi::warp34_qwen_image_adaln_modulate_ex_f16(
                         &ex,
                         d_joint as *const c_void,
                         d_modulation as *const c_void,
@@ -1218,30 +1490,50 @@ impl QwenImage21TransformerEngine {
                         (4 * inner_dim) as i32,
                         0,
                         eps,
+                        i32::from(first_qkv_h64),
                     )
                 },
-                "warp34_qwen_image_adaln_modulate_f16(img_norm1)",
+                "warp34_qwen_image_adaln_modulate_ex_f16(img_norm1[0])",
             )?;
+        } else {
+            check_rc(
+                // SAFETY: `d_joint` and `d_norm` span `total_seq_len * inner_dim * 2` bytes; `d_norm_out_scale` has stride `inner_dim`.
+                unsafe {
+                    ffi::warp34_qwen_image_adaln_modulate_ex_f16(
+                        &ex,
+                        d_joint as *const c_void,
+                        d_norm_out_scale as *const c_void,
+                        mask_ptr,
+                        d_norm as *mut c_void,
+                        total_seq_len as i32,
+                        inner_dim as i32,
+                        inner_dim as i32,
+                        0,
+                        eps,
+                        i32::from(proj_out_h64),
+                    )
+                },
+                "warp34_qwen_image_adaln_modulate_ex_f16(empty norm_out)",
+            )?;
+        }
 
-            let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
-                && block.to_k.can_fuse_h64_from_producer()
-                && block.to_v.can_fuse_h64_from_producer();
-            block.to_q.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_q,
-                total_seq_len,
-            )?;
-            if qkv_share_h64 {
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            if block.qkv_can_fuse_h64(inner_dim) {
+                block.to_q.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_q,
+                    total_seq_len,
+                )?;
                 block.to_k.forward_prerotated(
                     &ex,
                     cublas,
                     marlin_ws_addr,
                     marlin_ws_ints,
-                    ex.scratch_ptr,
+                    d_norm,
                     d_k,
                     total_seq_len,
                 )?;
@@ -1250,29 +1542,62 @@ impl QwenImage21TransformerEngine {
                     cublas,
                     marlin_ws_addr,
                     marlin_ws_ints,
-                    ex.scratch_ptr,
+                    d_norm,
                     d_v,
                     total_seq_len,
                 )?;
             } else {
-                block.to_k.forward(
+                let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
+                    && block.to_k.can_fuse_h64_from_producer()
+                    && block.to_v.can_fuse_h64_from_producer();
+                block.to_q.forward(
                     &ex,
                     cublas,
                     marlin_ws_addr,
                     marlin_ws_ints,
                     d_norm,
-                    d_k,
+                    d_q,
                     total_seq_len,
                 )?;
-                block.to_v.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_norm,
-                    d_v,
-                    total_seq_len,
-                )?;
+                if qkv_share_h64 {
+                    block.to_k.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        ex.scratch_ptr,
+                        d_k,
+                        total_seq_len,
+                    )?;
+                    block.to_v.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        ex.scratch_ptr,
+                        d_v,
+                        total_seq_len,
+                    )?;
+                } else {
+                    block.to_k.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_k,
+                        total_seq_len,
+                    )?;
+                    block.to_v.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_v,
+                        total_seq_len,
+                    )?;
+                }
             }
 
             let cache_k_ptr = kv_cache
@@ -1387,151 +1712,188 @@ impl QwenImage21TransformerEngine {
                 ar(d_branch_out, total_seq_len * inner_dim, stream)?;
             }
 
+            let mlp_gu_h64 =
+                block.mlp_gate_up.can_fuse_h64_from_producer() && (inner_dim & 63) == 0;
             check_rc(
-                // SAFETY: `d_joint` and `d_branch_out` span `total_seq_len * inner_dim * 2` bytes; `gate1` is at offset `inner_dim`.
+                // SAFETY: `d_joint`, `d_branch_out`, and `d_norm` span `total_seq_len * inner_dim * 2` bytes;
+                // `gate1` is at `inner_dim` and `scale2` is at `2 * inner_dim` in `d_modulation`.
                 unsafe {
-                    ffi::warp34_qwen_image_gated_residual_f16(
+                    ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
                         &ex,
                         d_joint as *mut c_void,
                         d_branch_out as *const c_void,
                         d_modulation as *const c_void,
                         mask_ptr,
-                        total_seq_len as i32,
-                        inner_dim as i32,
                         (4 * inner_dim) as i32,
                         inner_dim as i32,
-                    )
-                },
-                "warp34_qwen_image_gated_residual_f16(attn)",
-            )?;
-
-            check_rc(
-                // SAFETY: `d_joint` and `d_norm` span `total_seq_len * inner_dim * 2` bytes; `scale2` is at offset `2 * inner_dim`.
-                unsafe {
-                    ffi::warp34_qwen_image_adaln_modulate_f16(
-                        &ex,
-                        d_joint as *const c_void,
                         d_modulation as *const c_void,
                         mask_ptr,
+                        (4 * inner_dim) as i32,
+                        (2 * inner_dim) as i32,
                         d_norm as *mut c_void,
                         total_seq_len as i32,
                         inner_dim as i32,
-                        (4 * inner_dim) as i32,
-                        (2 * inner_dim) as i32,
                         eps,
+                        i32::from(mlp_gu_h64),
                     )
                 },
-                "warp34_qwen_image_adaln_modulate_f16(img_norm2)",
+                "warp34_qwen_image_fused_gated_residual_adaln_f16(extract attn->mlp)",
             )?;
 
-            block.mlp_gate_up.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_gate_up,
-                total_seq_len,
-            )?;
-            check_rc(
-                // SAFETY: `d_gate_up` spans `total_seq_len * 2 * mlp_local * 2` bytes; `d_mlp_interm` spans `total_seq_len * mlp_local * 2` bytes.
-                unsafe {
-                    ffi::warp34_silu_and_mul_f16(
-                        &ex,
-                        d_gate_up as *const c_void,
-                        d_mlp_interm as *mut c_void,
-                        core::ptr::null(),
-                        total_seq_len as i32,
-                        self.mlp_local as i32,
-                    )
-                },
-                "warp34_silu_and_mul_f16(QwenImage21 MLP)",
-            )?;
-            block.mlp_out.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_mlp_interm,
-                d_branch_out,
-                total_seq_len,
-            )?;
+            if mlp_gu_h64 {
+                block.mlp_gate_up.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_gate_up,
+                    total_seq_len,
+                )?;
+            } else {
+                block.mlp_gate_up.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_gate_up,
+                    total_seq_len,
+                )?;
+            }
+
+            if block.mlp_out.can_fuse_h64_from_producer() && (self.mlp_local & 63) == 0 {
+                check_rc(
+                    // SAFETY: `d_gate_up` spans `total_seq_len * 2 * mlp_local * 2` bytes; `d_mlp_interm` spans `total_seq_len * mlp_local * 2` bytes.
+                    unsafe {
+                        ffi::warp34_silu_and_mul_hadamard_f16(
+                            &ex,
+                            d_gate_up as *const c_void,
+                            d_mlp_interm as *mut c_void,
+                            core::ptr::null(),
+                            total_seq_len as i32,
+                            self.mlp_local as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_hadamard_f16(QwenImage21 MLP)",
+                )?;
+                block.mlp_out.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_mlp_interm,
+                    d_branch_out,
+                    total_seq_len,
+                )?;
+            } else {
+                check_rc(
+                    // SAFETY: `d_gate_up` spans `total_seq_len * 2 * mlp_local * 2` bytes; `d_mlp_interm` spans `total_seq_len * mlp_local * 2` bytes.
+                    unsafe {
+                        ffi::warp34_silu_and_mul_f16(
+                            &ex,
+                            d_gate_up as *const c_void,
+                            d_mlp_interm as *mut c_void,
+                            core::ptr::null(),
+                            total_seq_len as i32,
+                            self.mlp_local as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_f16(QwenImage21 MLP)",
+                )?;
+                block.mlp_out.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_mlp_interm,
+                    d_branch_out,
+                    total_seq_len,
+                )?;
+            }
             if self.tp_size > 1
                 && let Some(ref mut ar) = allreduce_fn
             {
                 ar(d_branch_out, total_seq_len * inner_dim, stream)?;
             }
 
-            check_rc(
-                // SAFETY: `d_joint` and `d_branch_out` span `total_seq_len * inner_dim * 2` bytes; `gate2` is at offset `3 * inner_dim`.
-                unsafe {
-                    ffi::warp34_qwen_image_gated_residual_f16(
-                        &ex,
-                        d_joint as *mut c_void,
-                        d_branch_out as *const c_void,
-                        d_modulation as *const c_void,
-                        mask_ptr,
-                        total_seq_len as i32,
-                        inner_dim as i32,
-                        (4 * inner_dim) as i32,
-                        (3 * inner_dim) as i32,
-                    )
-                },
-                "warp34_qwen_image_gated_residual_f16(mlp)",
-            )?;
+            if let Some(next_block) = self.blocks.get(layer_idx + 1) {
+                let next_qkv_h64 = next_block.qkv_can_fuse_h64(inner_dim);
+                check_rc(
+                    // SAFETY: fuses `gate2` (`3 * inner_dim`) residual update with next block's `scale1` (`0`) AdaLN.
+                    unsafe {
+                        ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
+                            &ex,
+                            d_joint as *mut c_void,
+                            d_branch_out as *const c_void,
+                            d_modulation as *const c_void,
+                            mask_ptr,
+                            (4 * inner_dim) as i32,
+                            (3 * inner_dim) as i32,
+                            d_modulation as *const c_void,
+                            mask_ptr,
+                            (4 * inner_dim) as i32,
+                            0,
+                            d_norm as *mut c_void,
+                            total_seq_len as i32,
+                            inner_dim as i32,
+                            eps,
+                            i32::from(next_qkv_h64),
+                        )
+                    },
+                    "warp34_qwen_image_fused_gated_residual_adaln_f16(extract mlp->next_attn)",
+                )?;
+            } else {
+                check_rc(
+                    // SAFETY: fuses final block `gate2` (`3 * inner_dim`) residual update with `norm_out` (`d_norm_out_scale`).
+                    unsafe {
+                        ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
+                            &ex,
+                            d_joint as *mut c_void,
+                            d_branch_out as *const c_void,
+                            d_modulation as *const c_void,
+                            mask_ptr,
+                            (4 * inner_dim) as i32,
+                            (3 * inner_dim) as i32,
+                            d_norm_out_scale as *const c_void,
+                            mask_ptr,
+                            inner_dim as i32,
+                            0,
+                            d_norm as *mut c_void,
+                            total_seq_len as i32,
+                            inner_dim as i32,
+                            eps,
+                            i32::from(proj_out_h64),
+                        )
+                    },
+                    "warp34_qwen_image_fused_gated_residual_adaln_f16(extract mlp->norm_out)",
+                )?;
+            }
         }
 
-        // 4. Final norm_out + proj_out
-        check_rc(
-            // SAFETY: `d_joint` and `d_norm` span `total_seq_len * inner_dim * 2` bytes; `d_norm_out_scale` has stride `inner_dim`.
-            unsafe {
-                ffi::warp34_qwen_image_adaln_modulate_f16(
-                    &ex,
-                    d_joint as *const c_void,
-                    d_norm_out_scale as *const c_void,
-                    mask_ptr,
-                    d_norm as *mut c_void,
-                    total_seq_len as i32,
-                    inner_dim as i32,
-                    inner_dim as i32,
-                    0,
-                    eps,
-                )
-            },
-            "warp34_qwen_image_adaln_modulate_f16(norm_out)",
-        )?;
-        self.proj_out.forward(
-            &ex,
-            cublas,
-            marlin_ws_addr,
-            marlin_ws_ints,
-            d_norm,
-            d_out,
-            total_seq_len,
-        )?;
-
-        let mut full_output_f16 = vec![0u16; total_seq_len * out_dim];
-        check_rc(
-            // SAFETY: `full_output_f16` and `d_out` both span `total_seq_len * out_dim * 2` bytes.
-            unsafe {
-                ffi::warp34_memcpy_d2h_async(
-                    full_output_f16.as_mut_ptr() as *mut c_void,
-                    d_out as *const c_void,
-                    full_output_f16.len() * 2,
-                    stream.handle,
-                )
-            },
-            "QwenImage21 extract output D2H",
-        )?;
-        stream.synchronize()?;
-
-        let target_output_f16 = full_output_f16[prefix_len * out_dim..].to_vec();
-        Ok(QwenImage21ExtractOutput {
-            full_output_f16,
-            target_output_f16,
-            prefix_len,
-            target_tokens,
-        })
+        // 4. Final proj_out (`d_norm` is already normalized + modulated + optionally H_64-rotated)
+        if proj_out_h64 {
+            self.proj_out.forward_prerotated(
+                &ex,
+                cublas,
+                marlin_ws_addr,
+                marlin_ws_ints,
+                d_norm,
+                d_out,
+                total_seq_len,
+            )?;
+        } else {
+            self.proj_out.forward(
+                &ex,
+                cublas,
+                marlin_ws_addr,
+                marlin_ws_ints,
+                d_norm,
+                d_out,
+                total_seq_len,
+            )?;
+        }
+        Ok((total_seq_len, prefix_len, target_tokens, d_out))
     }
 
     /// Runs a `"cached"` target-only denoising step (`kv_cache_mode = "cached"`) against `kv_cache`,
@@ -1566,11 +1928,89 @@ impl QwenImage21TransformerEngine {
         use_cuda_graph: bool,
         cublas: &CublasHandle,
         stream: &CudaStream,
-        mut allreduce_fn: Option<F>,
+        allreduce_fn: Option<F>,
     ) -> Result<Vec<u16>>
     where
         F: FnMut(u64, usize, &CudaStream) -> Result<()>,
     {
+        self.forward_cached_with_allreduce_gated(
+            target_latents_f16,
+            timestep,
+            kv_cache,
+            use_cuda_graph,
+            cublas,
+            stream,
+            allreduce_fn,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cached_with_allreduce_gated<F>(
+        &self,
+        target_latents_f16: &[u16],
+        timestep: f32,
+        kv_cache: &mut QwenImage21KvCacheGpu,
+        use_cuda_graph: bool,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        allreduce_fn: Option<F>,
+        capture_gate: Option<&Tp2CaptureGate>,
+    ) -> Result<Vec<u16>>
+    where
+        F: FnMut(u64, usize, &CudaStream) -> Result<()>,
+    {
+        let mut ws_guard = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let d_out = self.forward_cached_device_inner(
+            &mut ws_guard,
+            Some(target_latents_f16),
+            0,
+            Some(timestep),
+            0,
+            kv_cache,
+            use_cuda_graph,
+            cublas,
+            stream,
+            allreduce_fn,
+            capture_gate,
+        )?;
+        let out_dim = self.cfg.out_channels * self.cfg.patch_size * self.cfg.patch_size;
+        let mut target_output_f16 = vec![0u16; kv_cache.target_tokens * out_dim];
+        check_rc(
+            // SAFETY: `target_output_f16` and `d_out` both span `target_tokens * out_dim * 2` bytes.
+            unsafe {
+                ffi::warp34_memcpy_d2h_async(
+                    target_output_f16.as_mut_ptr() as *mut c_void,
+                    d_out as *const c_void,
+                    target_output_f16.len() * 2,
+                    stream.handle,
+                )
+            },
+            "QwenImage21 cached output D2H",
+        )?;
+        stream.synchronize()?;
+        Ok(target_output_f16)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    fn forward_cached_device_inner<F>(
+        &self,
+        ws: &mut QwenImage21Workspace,
+        target_latents_host_f16: Option<&[u16]>,
+        d_target_latents_in: u64,
+        timestep_host: Option<f32>,
+        d_timestep_in: u64,
+        kv_cache: &mut QwenImage21KvCacheGpu,
+        use_cuda_graph: bool,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        mut allreduce_fn: Option<F>,
+        capture_gate: Option<&Tp2CaptureGate>,
+    ) -> Result<u64>
+    where
+        F: FnMut(u64, usize, &CudaStream) -> Result<()>,
+    {
+        let mut gate_guard = capture_gate.map(Tp2CaptureGate::enter_step);
         let _dev = CudaDevice::set_current(self.device_id)?;
         let prefix_len = kv_cache.prefix_len;
         let target_tokens = kv_cache.target_tokens;
@@ -1580,14 +2020,19 @@ impl QwenImage21TransformerEngine {
         let inner_dim = self.cfg.inner_dim();
         let eps = self.cfg.eps;
 
-        if target_tokens == 0 || target_latents_f16.len() != target_tokens * in_dim {
+        if target_tokens == 0 {
+            return Err(CudaError::new(-10, "forward_cached target_tokens == 0"));
+        }
+        if let Some(tgt_host) = target_latents_host_f16
+            && tgt_host.len() != target_tokens * in_dim
+        {
             return Err(CudaError::with_detail(
                 -10,
                 "forward_cached target_latents_f16 length mismatch",
                 format!(
                     "expected {} ({target_tokens} * {in_dim}), got {}",
                     target_tokens * in_dim,
-                    target_latents_f16.len()
+                    tgt_host.len()
                 ),
             ));
         }
@@ -1607,11 +2052,15 @@ impl QwenImage21TransformerEngine {
             .multi_processor_count
             .max(1) as usize;
         let lse_scratch_bytes = total_kv_tokens * self.heads_local * std::mem::size_of::<f32>();
-        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let marlin_ws_addr = {
             let need = marlin_ws_ints * 4;
             let init_zero = ws.marlin_ws.as_ref().is_none_or(|b| b.len_bytes < need);
-            let addr = QwenImage21Workspace::ensure_buf(&mut ws.marlin_ws, self.device_id, need)?;
+            let addr = QwenImage21Workspace::ensure_buf(
+                &mut ws.marlin_ws,
+                &mut ws.alloc_epoch,
+                self.device_id,
+                need,
+            )?;
             if init_zero {
                 ws.marlin_ws.as_ref().unwrap().zero_async(stream)?;
             }
@@ -1638,91 +2087,158 @@ impl QwenImage21TransformerEngine {
         let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
+            &mut ws.alloc_epoch,
             self.device_id,
             exec_scratch_bytes,
         )?;
         let ex = stream.exec(exec_scratch_addr, exec_scratch_bytes);
 
+        let tgt_bytes = target_tokens * in_dim * 2;
         let d_img_in = QwenImage21Workspace::ensure_buf(
             &mut ws.d_img_in,
+            &mut ws.alloc_epoch,
             self.device_id,
-            target_latents_f16.len() * 2,
+            tgt_bytes,
         )?;
-        let d_timesteps = QwenImage21Workspace::ensure_buf(&mut ws.d_timesteps, self.device_id, 8)?;
-        let d_t_sin = QwenImage21Workspace::ensure_buf(&mut ws.d_t_sin, self.device_id, 256 * 2)?;
-        let d_temb_mid =
-            QwenImage21Workspace::ensure_buf(&mut ws.d_temb_mid, self.device_id, inner_dim * 2)?;
-        let d_temb =
-            QwenImage21Workspace::ensure_buf(&mut ws.d_temb, self.device_id, inner_dim * 2)?;
-        let d_temb_silu =
-            QwenImage21Workspace::ensure_buf(&mut ws.d_temb_silu, self.device_id, inner_dim * 2)?;
+        let d_timesteps = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_timesteps,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            8,
+        )?;
+        let d_t_sin = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_t_sin,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            256 * 2,
+        )?;
+        let d_temb_mid = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_temb_mid,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            inner_dim * 2,
+        )?;
+        let d_temb = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_temb,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            inner_dim * 2,
+        )?;
+        let d_temb_silu = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_temb_silu,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            inner_dim * 2,
+        )?;
         let d_modulation = QwenImage21Workspace::ensure_buf(
             &mut ws.d_modulation,
+            &mut ws.alloc_epoch,
             self.device_id,
             4 * inner_dim * 2,
         )?;
         let d_norm_out_scale = QwenImage21Workspace::ensure_buf(
             &mut ws.d_norm_out_scale,
+            &mut ws.alloc_epoch,
             self.device_id,
             inner_dim * 2,
         )?;
         let d_joint = QwenImage21Workspace::ensure_buf(
             &mut ws.d_joint,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * inner_dim * 2,
         )?;
         let d_norm = QwenImage21Workspace::ensure_buf(
             &mut ws.d_norm,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * inner_dim * 2,
         )?;
         let d_q = QwenImage21Workspace::ensure_buf(
             &mut ws.d_q,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * self.qkv_dim_local * 2,
         )?;
         let d_k = QwenImage21Workspace::ensure_buf(
             &mut ws.d_k,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * self.qkv_dim_local * 2,
         )?;
         let d_attn_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_attn_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * self.qkv_dim_local * 2,
         )?;
         let d_branch_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_branch_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * inner_dim * 2,
         )?;
         let d_gate_up = QwenImage21Workspace::ensure_buf(
             &mut ws.d_gate_up,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * 2 * self.mlp_local * 2,
         )?;
         let d_mlp_interm = QwenImage21Workspace::ensure_buf(
             &mut ws.d_mlp_interm,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * self.mlp_local * 2,
         )?;
         let d_out = QwenImage21Workspace::ensure_buf(
             &mut ws.d_out,
+            &mut ws.alloc_epoch,
             self.device_id,
             target_tokens * out_dim * 2,
         )?;
 
-        ws.d_img_in
-            .as_ref()
-            .unwrap()
-            .copy_from_host(target_latents_f16, stream)?;
-        ws.d_timesteps
-            .as_ref()
-            .unwrap()
-            .copy_from_host(std::slice::from_ref(&timestep), stream)?;
+        if let Some(tgt_host) = target_latents_host_f16 {
+            ws.d_img_in
+                .as_ref()
+                .unwrap()
+                .copy_from_host(tgt_host, stream)?;
+        } else {
+            check_rc(
+                // SAFETY: `d_img_in` and `d_target_latents_in` both span `tgt_bytes` bytes on `self.device_id`.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        d_img_in as *mut c_void,
+                        d_target_latents_in as *const c_void,
+                        tgt_bytes,
+                        stream.handle,
+                    )
+                },
+                "QwenImage21 cached target latents D2D",
+            )?;
+        }
+        if let Some(ts_host) = timestep_host {
+            ws.d_timesteps
+                .as_ref()
+                .unwrap()
+                .copy_from_host(std::slice::from_ref(&ts_host), stream)?;
+        } else {
+            check_rc(
+                // SAFETY: `d_timesteps` and `d_timestep_in` both span at least 4 bytes on `self.device_id`.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        d_timesteps as *mut c_void,
+                        d_timestep_in as *const c_void,
+                        4,
+                        stream.handle,
+                    )
+                },
+                "QwenImage21 cached timestep D2D",
+            )?;
+        }
 
         let layer_k_addrs: Vec<u64> = kv_cache.layer_k.iter().map(DeviceBuffer::addr).collect();
         let layer_v_addrs: Vec<u64> = kv_cache.layer_v.iter().map(DeviceBuffer::addr).collect();
+        let proj_out_h64 = self.proj_out.can_fuse_h64_from_producer() && (inner_dim & 63) == 0;
 
         let mut emit_cached_step = || -> Result<()> {
             self.img_in.forward(
@@ -1750,12 +2266,12 @@ impl QwenImage21TransformerEngine {
                 1,
             )?;
 
-            let tail_byte_off = (prefix_len * self.qkv_dim_local * 2) as u64;
-            for (layer_idx, block) in self.blocks.iter().enumerate() {
+            if let Some(first_block) = self.blocks.first() {
+                let first_qkv_h64 = first_block.qkv_can_fuse_h64(inner_dim);
                 check_rc(
-                    // SAFETY: `d_joint` and `d_norm` span `target_tokens * inner_dim * 2` bytes; `target_token_mask` is null (all tokens use row 0).
+                    // SAFETY: `d_joint` and `d_norm` span `target_tokens * inner_dim * 2` bytes; `target_token_mask` is null.
                     unsafe {
-                        ffi::warp34_qwen_image_adaln_modulate_f16(
+                        ffi::warp34_qwen_image_adaln_modulate_ex_f16(
                             &ex,
                             d_joint as *const c_void,
                             d_modulation as *const c_void,
@@ -1766,68 +2282,120 @@ impl QwenImage21TransformerEngine {
                             (4 * inner_dim) as i32,
                             0,
                             eps,
+                            i32::from(first_qkv_h64),
                         )
                     },
-                    "warp34_qwen_image_adaln_modulate_f16(cached img_norm1)",
+                    "warp34_qwen_image_adaln_modulate_ex_f16(cached img_norm1[0])",
                 )?;
+            } else {
+                check_rc(
+                    // SAFETY: `d_joint` and `d_norm` span `target_tokens * inner_dim * 2` bytes.
+                    unsafe {
+                        ffi::warp34_qwen_image_adaln_modulate_ex_f16(
+                            &ex,
+                            d_joint as *const c_void,
+                            d_norm_out_scale as *const c_void,
+                            core::ptr::null(),
+                            d_norm as *mut c_void,
+                            target_tokens as i32,
+                            inner_dim as i32,
+                            inner_dim as i32,
+                            0,
+                            eps,
+                            i32::from(proj_out_h64),
+                        )
+                    },
+                    "warp34_qwen_image_adaln_modulate_ex_f16(cached empty norm_out)",
+                )?;
+            }
 
+            let tail_byte_off = (prefix_len * self.qkv_dim_local * 2) as u64;
+            for (layer_idx, block) in self.blocks.iter().enumerate() {
                 let k_cache_full = layer_k_addrs[layer_idx];
                 let v_cache_full = layer_v_addrs[layer_idx];
                 let k_cache_tail = k_cache_full + tail_byte_off;
                 let v_cache_tail = v_cache_full + tail_byte_off;
 
-                let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
-                    && block.to_k.can_fuse_h64_from_producer()
-                    && block.to_v.can_fuse_h64_from_producer();
-                block.to_q.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_norm,
-                    d_q,
-                    target_tokens,
-                )?;
-                if qkv_share_h64 {
+                if block.qkv_can_fuse_h64(inner_dim) {
+                    block.to_q.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_q,
+                        target_tokens,
+                    )?;
                     block.to_k.forward_prerotated(
                         &ex,
                         cublas,
                         marlin_ws_addr,
                         marlin_ws_ints,
-                        ex.scratch_ptr,
+                        d_norm,
                         d_k,
                         target_tokens,
                     )?;
-                    // Write target V directly into the tail of `layer_v[layer_idx]` (`[prefix_len..prefix_len + target_tokens]`).
                     block.to_v.forward_prerotated(
                         &ex,
                         cublas,
                         marlin_ws_addr,
                         marlin_ws_ints,
-                        ex.scratch_ptr,
+                        d_norm,
                         v_cache_tail,
                         target_tokens,
                     )?;
                 } else {
-                    block.to_k.forward(
+                    let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
+                        && block.to_k.can_fuse_h64_from_producer()
+                        && block.to_v.can_fuse_h64_from_producer();
+                    block.to_q.forward(
                         &ex,
                         cublas,
                         marlin_ws_addr,
                         marlin_ws_ints,
                         d_norm,
-                        d_k,
+                        d_q,
                         target_tokens,
                     )?;
-                    // Write target V directly into the tail of `layer_v[layer_idx]` (`[prefix_len..prefix_len + target_tokens]`).
-                    block.to_v.forward(
-                        &ex,
-                        cublas,
-                        marlin_ws_addr,
-                        marlin_ws_ints,
-                        d_norm,
-                        v_cache_tail,
-                        target_tokens,
-                    )?;
+                    if qkv_share_h64 {
+                        block.to_k.forward_prerotated(
+                            &ex,
+                            cublas,
+                            marlin_ws_addr,
+                            marlin_ws_ints,
+                            ex.scratch_ptr,
+                            d_k,
+                            target_tokens,
+                        )?;
+                        block.to_v.forward_prerotated(
+                            &ex,
+                            cublas,
+                            marlin_ws_addr,
+                            marlin_ws_ints,
+                            ex.scratch_ptr,
+                            v_cache_tail,
+                            target_tokens,
+                        )?;
+                    } else {
+                        block.to_k.forward(
+                            &ex,
+                            cublas,
+                            marlin_ws_addr,
+                            marlin_ws_ints,
+                            d_norm,
+                            d_k,
+                            target_tokens,
+                        )?;
+                        block.to_v.forward(
+                            &ex,
+                            cublas,
+                            marlin_ws_addr,
+                            marlin_ws_ints,
+                            d_norm,
+                            v_cache_tail,
+                            target_tokens,
+                        )?;
+                    }
                 }
 
                 // Write rotated target K directly into `k_cache_tail`.
@@ -1889,162 +2457,556 @@ impl QwenImage21TransformerEngine {
                     ar(d_branch_out, target_tokens * inner_dim, stream)?;
                 }
 
+                let mlp_gu_h64 =
+                    block.mlp_gate_up.can_fuse_h64_from_producer() && (inner_dim & 63) == 0;
                 check_rc(
-                    // SAFETY: `d_joint` and `d_branch_out` span `target_tokens * inner_dim * 2` bytes.
+                    // SAFETY: fuses `gate1` (`inner_dim`) residual update with `scale2` (`2 * inner_dim`) AdaLN.
                     unsafe {
-                        ffi::warp34_qwen_image_gated_residual_f16(
+                        ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
                             &ex,
                             d_joint as *mut c_void,
                             d_branch_out as *const c_void,
                             d_modulation as *const c_void,
                             core::ptr::null(),
-                            target_tokens as i32,
-                            inner_dim as i32,
                             (4 * inner_dim) as i32,
                             inner_dim as i32,
-                        )
-                    },
-                    "warp34_qwen_image_gated_residual_f16(cached attn)",
-                )?;
-
-                check_rc(
-                    // SAFETY: `d_joint` and `d_norm` span `target_tokens * inner_dim * 2` bytes.
-                    unsafe {
-                        ffi::warp34_qwen_image_adaln_modulate_f16(
-                            &ex,
-                            d_joint as *const c_void,
                             d_modulation as *const c_void,
                             core::ptr::null(),
+                            (4 * inner_dim) as i32,
+                            (2 * inner_dim) as i32,
                             d_norm as *mut c_void,
                             target_tokens as i32,
                             inner_dim as i32,
-                            (4 * inner_dim) as i32,
-                            (2 * inner_dim) as i32,
                             eps,
+                            i32::from(mlp_gu_h64),
                         )
                     },
-                    "warp34_qwen_image_adaln_modulate_f16(cached img_norm2)",
+                    "warp34_qwen_image_fused_gated_residual_adaln_f16(cached attn->mlp)",
                 )?;
 
-                block.mlp_gate_up.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_norm,
-                    d_gate_up,
-                    target_tokens,
-                )?;
-                check_rc(
-                    // SAFETY: `d_gate_up` and `d_mlp_interm` match `target_tokens * mlp_local`.
-                    unsafe {
-                        ffi::warp34_silu_and_mul_f16(
-                            &ex,
-                            d_gate_up as *const c_void,
-                            d_mlp_interm as *mut c_void,
-                            core::ptr::null(),
-                            target_tokens as i32,
-                            self.mlp_local as i32,
-                        )
-                    },
-                    "warp34_silu_and_mul_f16(cached MLP)",
-                )?;
-                block.mlp_out.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_mlp_interm,
-                    d_branch_out,
-                    target_tokens,
-                )?;
+                if mlp_gu_h64 {
+                    block.mlp_gate_up.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_gate_up,
+                        target_tokens,
+                    )?;
+                } else {
+                    block.mlp_gate_up.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_gate_up,
+                        target_tokens,
+                    )?;
+                }
+
+                if block.mlp_out.can_fuse_h64_from_producer() && (self.mlp_local & 63) == 0 {
+                    check_rc(
+                        // SAFETY: `d_gate_up` and `d_mlp_interm` match `target_tokens * mlp_local`.
+                        unsafe {
+                            ffi::warp34_silu_and_mul_hadamard_f16(
+                                &ex,
+                                d_gate_up as *const c_void,
+                                d_mlp_interm as *mut c_void,
+                                core::ptr::null(),
+                                target_tokens as i32,
+                                self.mlp_local as i32,
+                            )
+                        },
+                        "warp34_silu_and_mul_hadamard_f16(cached MLP)",
+                    )?;
+                    block.mlp_out.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_mlp_interm,
+                        d_branch_out,
+                        target_tokens,
+                    )?;
+                } else {
+                    check_rc(
+                        // SAFETY: `d_gate_up` and `d_mlp_interm` match `target_tokens * mlp_local`.
+                        unsafe {
+                            ffi::warp34_silu_and_mul_f16(
+                                &ex,
+                                d_gate_up as *const c_void,
+                                d_mlp_interm as *mut c_void,
+                                core::ptr::null(),
+                                target_tokens as i32,
+                                self.mlp_local as i32,
+                            )
+                        },
+                        "warp34_silu_and_mul_f16(cached MLP)",
+                    )?;
+                    block.mlp_out.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_mlp_interm,
+                        d_branch_out,
+                        target_tokens,
+                    )?;
+                }
                 if self.tp_size > 1
                     && let Some(ref mut ar) = allreduce_fn
                 {
                     ar(d_branch_out, target_tokens * inner_dim, stream)?;
                 }
 
-                check_rc(
-                    // SAFETY: `d_joint` and `d_branch_out` span `target_tokens * inner_dim * 2` bytes.
-                    unsafe {
-                        ffi::warp34_qwen_image_gated_residual_f16(
-                            &ex,
-                            d_joint as *mut c_void,
-                            d_branch_out as *const c_void,
-                            d_modulation as *const c_void,
-                            core::ptr::null(),
-                            target_tokens as i32,
-                            inner_dim as i32,
-                            (4 * inner_dim) as i32,
-                            (3 * inner_dim) as i32,
-                        )
-                    },
-                    "warp34_qwen_image_gated_residual_f16(cached mlp)",
-                )?;
+                if let Some(next_block) = self.blocks.get(layer_idx + 1) {
+                    let next_qkv_h64 = next_block.qkv_can_fuse_h64(inner_dim);
+                    check_rc(
+                        // SAFETY: fuses `gate2` (`3 * inner_dim`) residual update with next block's `scale1` (`0`) AdaLN.
+                        unsafe {
+                            ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
+                                &ex,
+                                d_joint as *mut c_void,
+                                d_branch_out as *const c_void,
+                                d_modulation as *const c_void,
+                                core::ptr::null(),
+                                (4 * inner_dim) as i32,
+                                (3 * inner_dim) as i32,
+                                d_modulation as *const c_void,
+                                core::ptr::null(),
+                                (4 * inner_dim) as i32,
+                                0,
+                                d_norm as *mut c_void,
+                                target_tokens as i32,
+                                inner_dim as i32,
+                                eps,
+                                i32::from(next_qkv_h64),
+                            )
+                        },
+                        "warp34_qwen_image_fused_gated_residual_adaln_f16(cached mlp->next_attn)",
+                    )?;
+                } else {
+                    check_rc(
+                        // SAFETY: fuses final block `gate2` (`3 * inner_dim`) residual update with `norm_out`.
+                        unsafe {
+                            ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
+                                &ex,
+                                d_joint as *mut c_void,
+                                d_branch_out as *const c_void,
+                                d_modulation as *const c_void,
+                                core::ptr::null(),
+                                (4 * inner_dim) as i32,
+                                (3 * inner_dim) as i32,
+                                d_norm_out_scale as *const c_void,
+                                core::ptr::null(),
+                                inner_dim as i32,
+                                0,
+                                d_norm as *mut c_void,
+                                target_tokens as i32,
+                                inner_dim as i32,
+                                eps,
+                                i32::from(proj_out_h64),
+                            )
+                        },
+                        "warp34_qwen_image_fused_gated_residual_adaln_f16(cached mlp->norm_out)",
+                    )?;
+                }
             }
 
-            check_rc(
-                // SAFETY: `d_joint` and `d_norm` span `target_tokens * inner_dim * 2` bytes.
-                unsafe {
-                    ffi::warp34_qwen_image_adaln_modulate_f16(
-                        &ex,
-                        d_joint as *const c_void,
-                        d_norm_out_scale as *const c_void,
-                        core::ptr::null(),
-                        d_norm as *mut c_void,
-                        target_tokens as i32,
-                        inner_dim as i32,
-                        inner_dim as i32,
-                        0,
-                        eps,
-                    )
-                },
-                "warp34_qwen_image_adaln_modulate_f16(cached norm_out)",
-            )?;
-            self.proj_out.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_out,
-                target_tokens,
-            )
+            if proj_out_h64 {
+                self.proj_out.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_out,
+                    target_tokens,
+                )
+            } else {
+                self.proj_out.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_out,
+                    target_tokens,
+                )
+            }
         };
 
-        let geom = (prefix_len, target_tokens);
-        if use_cuda_graph && self.tp_size == 1 {
-            if let Some((gp, gt, ref graph)) = kv_cache.cached_graph
-                && (gp, gt) == geom
+        let can_graph = use_cuda_graph && (self.tp_size == 1 || capture_gate.is_some());
+        let geom = (prefix_len, target_tokens, ws.alloc_epoch);
+        if can_graph {
+            let local_mode: u8 = if kv_cache
+                .cached_graph
+                .as_ref()
+                .is_some_and(|&(gp, gt, ge, _)| (gp, gt, ge) == geom)
             {
-                graph.launch(stream)?;
+                2
             } else if kv_cache.graph_warmed_geom == Some(geom) {
-                let graph = CudaGraph::capture(stream, &mut emit_cached_step)?;
-                graph.launch(stream)?;
-                kv_cache.cached_graph = Some((prefix_len, target_tokens, graph));
+                1
             } else {
-                emit_cached_step()?;
-                kv_cache.graph_warmed_geom = Some(geom);
+                0
+            };
+            let mode = if let Some(gate) = capture_gate {
+                gate.agree_min_u8(local_mode)?
+            } else {
+                local_mode
+            };
+            if mode < 2 {
+                kv_cache.cached_graph = None;
+            }
+            if mode == 0 {
+                kv_cache.graph_warmed_geom = None;
+            }
+            match mode {
+                2 => {
+                    kv_cache.cached_graph.as_ref().unwrap().3.launch(stream)?;
+                }
+                1 => {
+                    let cap_res = CudaGraph::capture(stream, &mut emit_cached_step);
+                    if let Some(gate) = capture_gate
+                        && gate.agree_min_u8(u8::from(cap_res.is_ok()))? == 0
+                    {
+                        return Err(cap_res.err().unwrap_or_else(|| {
+                            CudaError::new(-10, "peer TP=2 rank failed CudaGraph capture")
+                        }));
+                    }
+                    let graph = cap_res?;
+                    graph.launch(stream)?;
+                    kv_cache.cached_graph =
+                        Some((prefix_len, target_tokens, ws.alloc_epoch, graph));
+                }
+                _ => {
+                    emit_cached_step()?;
+                    kv_cache.graph_warmed_geom = Some(geom);
+                }
             }
         } else {
             emit_cached_step()?;
         }
 
-        let mut target_output_f16 = vec![0u16; target_tokens * out_dim];
+        if let Some(ref mut g) = gate_guard {
+            g.disarm();
+        }
+        Ok(d_out)
+    }
+
+    /// Executes the full multi-step Euler flow-matching denoising loop (`Step 0` block-causal extract +
+    /// `Steps 1..N-1` cached decode) keeping latents and velocity predictions 100% GPU-resident across steps.
+    ///
+    /// Returns `(final_packed_latents_f16, step0_ms, cached_ms)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_loop(
+        &self,
+        cond_latents_f16: &[u16],
+        init_target_latents_f16: &[u16],
+        cond_prompt_embeds_f16: &[u16],
+        cond_vlm_mask: &[bool],
+        neg_prompt_and_mask: Option<(&[u16], &[bool])>,
+        img_shapes: &[(usize, usize, usize)],
+        timesteps: &[f32],
+        sigmas: &[f32],
+        true_cfg_scale: f32,
+        use_cuda_graph: bool,
+        cond_cache: &mut QwenImage21KvCacheGpu,
+        neg_cache: &mut QwenImage21KvCacheGpu,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+    ) -> Result<(Vec<u16>, f64, f64)> {
+        self.denoise_loop_with_allreduce::<fn(u64, usize, &CudaStream) -> Result<()>>(
+            cond_latents_f16,
+            init_target_latents_f16,
+            cond_prompt_embeds_f16,
+            cond_vlm_mask,
+            neg_prompt_and_mask,
+            img_shapes,
+            timesteps,
+            sigmas,
+            true_cfg_scale,
+            use_cuda_graph,
+            cond_cache,
+            neg_cache,
+            cublas,
+            stream,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_loop_with_allreduce<F>(
+        &self,
+        cond_latents_f16: &[u16],
+        init_target_latents_f16: &[u16],
+        cond_prompt_embeds_f16: &[u16],
+        cond_vlm_mask: &[bool],
+        neg_prompt_and_mask: Option<(&[u16], &[bool])>,
+        img_shapes: &[(usize, usize, usize)],
+        timesteps: &[f32],
+        sigmas: &[f32],
+        true_cfg_scale: f32,
+        use_cuda_graph: bool,
+        cond_cache: &mut QwenImage21KvCacheGpu,
+        neg_cache: &mut QwenImage21KvCacheGpu,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        mut allreduce_fn: Option<F>,
+        capture_gate: Option<&Tp2CaptureGate>,
+    ) -> Result<(Vec<u16>, f64, f64)>
+    where
+        F: FnMut(u64, usize, &CudaStream) -> Result<()>,
+    {
+        let _dev = CudaDevice::set_current(self.device_id)?;
+        let num_steps = timesteps.len();
+        if num_steps == 0 {
+            return Ok((init_target_latents_f16.to_vec(), 0.0, 0.0));
+        }
+        if sigmas.len() < num_steps + 1 {
+            return Err(CudaError::new(
+                -10,
+                "sigmas.len() must be >= timesteps.len() + 1 in denoise_loop",
+            ));
+        }
+        let in_dim = self.cfg.in_channels * self.cfg.patch_size * self.cfg.patch_size;
+        let out_dim = self.cfg.out_channels * self.cfg.patch_size * self.cfg.patch_size;
+        if in_dim != out_dim {
+            return Err(CudaError::new(
+                -10,
+                "denoise_loop requires in_channels == out_channels",
+            ));
+        }
+
+        let do_cfg = neg_prompt_and_mask.is_some() && true_cfg_scale > 1.0;
+        let target_elems = init_target_latents_f16.len();
+        let target_bytes = target_elems * 2;
+        let mut ws_guard = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let ws = &mut *ws_guard;
+
+        let d_latents = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_latents,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            target_bytes,
+        )?;
+        let d_cond_pred = if do_cfg {
+            QwenImage21Workspace::ensure_buf(
+                &mut ws.d_cond_pred,
+                &mut ws.alloc_epoch,
+                self.device_id,
+                target_bytes,
+            )?
+        } else {
+            0
+        };
+        let d_step_timesteps = QwenImage21Workspace::ensure_buf(
+            &mut ws.d_step_timesteps,
+            &mut ws.alloc_epoch,
+            self.device_id,
+            num_steps * 4,
+        )?;
+        ws.d_latents
+            .as_ref()
+            .unwrap()
+            .copy_from_host(init_target_latents_f16, stream)?;
+        ws.d_step_timesteps
+            .as_ref()
+            .unwrap()
+            .copy_from_host(timesteps, stream)?;
+
+        let ex_step = stream.exec(0, 0);
+
+        // Step 0: block-causal prefill + prefix KV cache extraction + GPU Euler/CFG step
+        let t_s0 = Instant::now();
+        let (_, prefix_len_c, target_tokens, d_out_c) = self.forward_extract_device_inner(
+            ws,
+            cond_latents_f16,
+            None,
+            d_latents,
+            cond_prompt_embeds_f16,
+            cond_vlm_mask,
+            img_shapes,
+            timesteps[0],
+            Some(cond_cache),
+            cublas,
+            stream,
+            allreduce_fn.as_mut(),
+        )?;
+        if target_tokens * out_dim != target_elems {
+            return Err(CudaError::new(
+                -10,
+                "init_target_latents_f16 length mismatch vs img_shapes target_tokens",
+            ));
+        }
+        let d_tgt_c = d_out_c + (prefix_len_c * out_dim * 2) as u64;
+        let dt0 = sigmas[1] - sigmas[0];
+        if let Some((neg_embeds, neg_mask)) = neg_prompt_and_mask
+            && do_cfg
+        {
+            check_rc(
+                // SAFETY: `d_cond_pred` and `d_tgt_c` both span `target_bytes` bytes on `self.device_id`.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        d_cond_pred as *mut c_void,
+                        d_tgt_c as *const c_void,
+                        target_bytes,
+                        stream.handle,
+                    )
+                },
+                "QwenImage21 step0 cond_pred D2D",
+            )?;
+            let (_, prefix_len_u, _, d_out_u) = self.forward_extract_device_inner(
+                ws,
+                cond_latents_f16,
+                None,
+                d_latents,
+                neg_embeds,
+                neg_mask,
+                img_shapes,
+                timesteps[0],
+                Some(neg_cache),
+                cublas,
+                stream,
+                allreduce_fn.as_mut(),
+            )?;
+            let d_tgt_u = d_out_u + (prefix_len_u * out_dim * 2) as u64;
+            check_rc(
+                // SAFETY: `d_latents`, `d_cond_pred`, and `d_tgt_u` span `target_elems` FP16 elements.
+                unsafe {
+                    ffi::warp34_qwen_image_euler_cfg_step_f16(
+                        &ex_step,
+                        d_latents as *mut c_void,
+                        d_cond_pred as *const c_void,
+                        d_tgt_u as *const c_void,
+                        true_cfg_scale,
+                        dt0,
+                        target_elems as i64,
+                    )
+                },
+                "warp34_qwen_image_euler_cfg_step_f16(step0 CFG)",
+            )?;
+        } else {
+            check_rc(
+                // SAFETY: `d_latents` and `d_tgt_c` span `target_elems` FP16 elements.
+                unsafe {
+                    ffi::warp34_qwen_image_euler_cfg_step_f16(
+                        &ex_step,
+                        d_latents as *mut c_void,
+                        d_tgt_c as *const c_void,
+                        core::ptr::null(),
+                        1.0,
+                        dt0,
+                        target_elems as i64,
+                    )
+                },
+                "warp34_qwen_image_euler_cfg_step_f16(step0)",
+            )?;
+        }
+        stream.synchronize()?;
+        let step0_ms = t_s0.elapsed().as_secs_f64() * 1000.0;
+
+        // Steps 1..num_steps - 1: 100% GPU-resident cached decode + CUDA Graph replay + GPU Euler/CFG step
+        let t_cached = Instant::now();
+        for step in 1..num_steps {
+            let d_ts = d_step_timesteps + (step * 4) as u64;
+            let d_out_c = self.forward_cached_device_inner(
+                ws,
+                None,
+                d_latents,
+                None,
+                d_ts,
+                cond_cache,
+                use_cuda_graph,
+                cublas,
+                stream,
+                allreduce_fn.as_mut(),
+                capture_gate,
+            )?;
+            let dt = sigmas[step + 1] - sigmas[step];
+            if do_cfg {
+                check_rc(
+                    // SAFETY: `d_cond_pred` and `d_out_c` both span `target_bytes` bytes on `self.device_id`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2d_async(
+                            d_cond_pred as *mut c_void,
+                            d_out_c as *const c_void,
+                            target_bytes,
+                            stream.handle,
+                        )
+                    },
+                    "QwenImage21 cached cond_pred D2D",
+                )?;
+                let d_out_u = self.forward_cached_device_inner(
+                    ws,
+                    None,
+                    d_latents,
+                    None,
+                    d_ts,
+                    neg_cache,
+                    use_cuda_graph,
+                    cublas,
+                    stream,
+                    allreduce_fn.as_mut(),
+                    capture_gate,
+                )?;
+                check_rc(
+                    // SAFETY: `d_latents`, `d_cond_pred`, and `d_out_u` span `target_elems` FP16 elements.
+                    unsafe {
+                        ffi::warp34_qwen_image_euler_cfg_step_f16(
+                            &ex_step,
+                            d_latents as *mut c_void,
+                            d_cond_pred as *const c_void,
+                            d_out_u as *const c_void,
+                            true_cfg_scale,
+                            dt,
+                            target_elems as i64,
+                        )
+                    },
+                    "warp34_qwen_image_euler_cfg_step_f16(cached CFG)",
+                )?;
+            } else {
+                check_rc(
+                    // SAFETY: `d_latents` and `d_out_c` span `target_elems` FP16 elements.
+                    unsafe {
+                        ffi::warp34_qwen_image_euler_cfg_step_f16(
+                            &ex_step,
+                            d_latents as *mut c_void,
+                            d_out_c as *const c_void,
+                            core::ptr::null(),
+                            1.0,
+                            dt,
+                            target_elems as i64,
+                        )
+                    },
+                    "warp34_qwen_image_euler_cfg_step_f16(cached)",
+                )?;
+            }
+        }
+
+        let mut final_latents_f16 = vec![0u16; target_elems];
         check_rc(
-            // SAFETY: `target_output_f16` and `d_out` both span `target_tokens * out_dim * 2` bytes.
+            // SAFETY: `final_latents_f16` and `d_latents` both span `target_bytes` bytes.
             unsafe {
                 ffi::warp34_memcpy_d2h_async(
-                    target_output_f16.as_mut_ptr() as *mut c_void,
-                    d_out as *const c_void,
-                    target_output_f16.len() * 2,
+                    final_latents_f16.as_mut_ptr() as *mut c_void,
+                    d_latents as *const c_void,
+                    target_bytes,
                     stream.handle,
                 )
             },
-            "QwenImage21 cached output D2H",
+            "QwenImage21 denoise_loop final latents D2H",
         )?;
         stream.synchronize()?;
-        Ok(target_output_f16)
+        let cached_ms = if num_steps > 1 {
+            t_cached.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+        Ok((final_latents_f16, step0_ms, cached_ms))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2142,6 +3104,117 @@ impl QwenImage21TransformerEngine {
     }
 }
 
+#[cfg(feature = "cuda")]
+struct ErasedScopedTask(usize);
+
+#[cfg(feature = "cuda")]
+struct PersistentScopedWorker {
+    tx: Option<mpsc::SyncSender<ErasedScopedTask>>,
+    done_rx: Mutex<mpsc::Receiver<std::result::Result<(), Box<dyn std::any::Any + Send>>>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "cuda")]
+impl PersistentScopedWorker {
+    fn new(device_id: i32) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<ErasedScopedTask>(1);
+        let (done_tx, done_rx) =
+            mpsc::sync_channel::<std::result::Result<(), Box<dyn std::any::Any + Send>>>(1);
+        let join = std::thread::Builder::new()
+            .name(format!("warp34-qi-tp2-r{device_id}"))
+            .spawn(move || {
+                let _ = CudaDevice::set_current(device_id);
+                while let Ok(ErasedScopedTask(addr)) = rx.recv() {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // SAFETY: `addr` points to a stack-allocated `&mut dyn FnMut()` kept alive by
+                        // `run_parallel`'s `WaitOnDrop` guard until `done_tx.send` is received.
+                        let func = unsafe { &mut *(addr as *mut &mut (dyn FnMut() + Send)) };
+                        func();
+                    }));
+                    if done_tx.send(res).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn PersistentScopedWorker");
+        Self {
+            tx: Some(tx),
+            done_rx: Mutex::new(done_rx),
+            join: Some(join),
+        }
+    }
+
+    fn run_parallel<F0, F1, R0, R1>(&self, f0: F0, f1: F1) -> Result<(R0, R1)>
+    where
+        F0: FnOnce() -> R0,
+        F1: FnOnce() -> R1 + Send,
+        R1: Send,
+    {
+        let mut r1_slot: Option<R1> = None;
+        let mut f1_opt = Some(f1);
+        let mut closure = || {
+            if let Some(f) = f1_opt.take() {
+                r1_slot = Some(f());
+            }
+        };
+        let mut trait_obj: &mut (dyn FnMut() + Send) = &mut closure;
+        let addr = (&raw mut trait_obj) as usize;
+
+        let done_guard = self.done_rx.lock().unwrap_or_else(|e| e.into_inner());
+        self.tx
+            .as_ref()
+            .ok_or_else(|| CudaError::new(-10, "TP=2 worker shut down"))?
+            .send(ErasedScopedTask(addr))
+            .map_err(|_| CudaError::new(-10, "TP=2 worker exited"))?;
+
+        struct WaitOnDrop<'a> {
+            rx: &'a mpsc::Receiver<std::result::Result<(), Box<dyn std::any::Any + Send>>>,
+            waited: bool,
+            outcome: Option<std::result::Result<(), Box<dyn std::any::Any + Send>>>,
+        }
+        impl Drop for WaitOnDrop<'_> {
+            fn drop(&mut self) {
+                if !self.waited {
+                    let _ = self.rx.recv();
+                    self.waited = true;
+                }
+            }
+        }
+
+        let mut wait = WaitOnDrop {
+            rx: &done_guard,
+            waited: false,
+            outcome: None,
+        };
+        let r0 = f0();
+        wait.outcome = wait.rx.recv().ok();
+        wait.waited = true;
+        drop(wait);
+        drop(done_guard);
+
+        match wait_outcome_check(r1_slot) {
+            Some(r1) => Ok((r0, r1)),
+            None => Err(CudaError::new(-10, "TP=2 rank 1 worker panicked")),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[inline]
+fn wait_outcome_check<R>(slot: Option<R>) -> Option<R> {
+    slot
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PersistentScopedWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Multi-GPU `TP=2` execution engine for `QwenImage21Transformer2DModel` across devices `0` and `1`.
 #[cfg(feature = "cuda")]
 pub struct QwenImage21TransformerTp2Engine {
@@ -2152,6 +3225,8 @@ pub struct QwenImage21TransformerTp2Engine {
     pub cublas0: CublasHandle,
     pub cublas1: CublasHandle,
     pub comm: Arc<Tp2Collectives>,
+    capture_gate: Tp2CaptureGate,
+    worker1: PersistentScopedWorker,
 }
 
 #[cfg(feature = "cuda")]
@@ -2173,7 +3248,7 @@ fn chunked_all_reduce_f16(
     while off < n_elems {
         let chunk = (n_elems - off).min(max_chunk);
         let ptr = d_buf + (off * 2) as u64;
-        comm.all_reduce_f16(ex, ptr, ptr, rank, chunk as i32)?;
+        comm.all_reduce_pipelined_f16(ex, ptr, ptr, rank, chunk as i32)?;
         off += chunk;
     }
     Ok(())
@@ -2218,6 +3293,7 @@ impl QwenImage21TransformerTp2Engine {
 
         let max_stage_bytes = (max_tokens.max(16384) * cfg.inner_dim() * 2).max(256 * 1024);
         let comm = Arc::new(Tp2Collectives::new_for_tp(2, max_stage_bytes)?);
+        let worker1 = PersistentScopedWorker::new(1);
         Ok(Self {
             rank0,
             rank1,
@@ -2226,6 +3302,8 @@ impl QwenImage21TransformerTp2Engine {
             cublas0,
             cublas1,
             comm,
+            capture_gate: Tp2CaptureGate::new(),
+            worker1,
         })
     }
 
@@ -2244,14 +3322,32 @@ impl QwenImage21TransformerTp2Engine {
         timestep: f32,
         kv_caches: Option<(&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu)>,
     ) -> Result<QwenImage21ExtractOutput> {
-        let comm0 = Arc::clone(&self.comm);
-        let comm1 = Arc::clone(&self.comm);
+        let comm0 = &self.comm;
+        let comm1 = &self.comm;
         let (c0, c1) = match kv_caches {
             Some((a, b)) => (Some(a), Some(b)),
             None => (None, None),
         };
-        std::thread::scope(|s| {
-            let h1 = s.spawn(|| {
+        let (r0, r1) = self.worker1.run_parallel(
+            || {
+                let _dev = CudaDevice::set_current(0)?;
+                self.rank0.forward_extract_with_allreduce(
+                    cond_latents_f16,
+                    target_latents_f16,
+                    encoder_hidden_f16,
+                    vlm_img_mask,
+                    img_shapes,
+                    timestep,
+                    c0,
+                    &self.cublas0,
+                    &self.stream0,
+                    Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                        let ex = st.exec(0, 0);
+                        chunked_all_reduce_f16(comm0, &ex, d_buf, 0, n_elems)
+                    }),
+                )
+            },
+            || {
                 let _dev = CudaDevice::set_current(1)?;
                 self.rank1.forward_extract_with_allreduce(
                     cond_latents_f16,
@@ -2265,32 +3361,13 @@ impl QwenImage21TransformerTp2Engine {
                     &self.stream1,
                     Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                         let ex = st.exec(0, 0);
-                        chunked_all_reduce_f16(&comm1, &ex, d_buf, 1, n_elems)
+                        chunked_all_reduce_f16(comm1, &ex, d_buf, 1, n_elems)
                     }),
                 )
-            });
-            let _dev = CudaDevice::set_current(0)?;
-            let r0 = self.rank0.forward_extract_with_allreduce(
-                cond_latents_f16,
-                target_latents_f16,
-                encoder_hidden_f16,
-                vlm_img_mask,
-                img_shapes,
-                timestep,
-                c0,
-                &self.cublas0,
-                &self.stream0,
-                Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
-                    let ex = st.exec(0, 0);
-                    chunked_all_reduce_f16(&comm0, &ex, d_buf, 0, n_elems)
-                }),
-            );
-            let r1 = h1
-                .join()
-                .map_err(|_| CudaError::new(-10, "TP=2 rank 1 thread panicked"))?;
-            r1?;
-            r0
-        })
+            },
+        )?;
+        r1?;
+        r0
     }
 
     pub fn forward_cached(
@@ -2299,43 +3376,134 @@ impl QwenImage21TransformerTp2Engine {
         timestep: f32,
         kv_caches: (&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu),
     ) -> Result<Vec<u16>> {
-        let comm0 = Arc::clone(&self.comm);
-        let comm1 = Arc::clone(&self.comm);
+        self.forward_cached_ex(target_latents_f16, timestep, kv_caches, true)
+    }
+
+    pub fn forward_cached_ex(
+        &self,
+        target_latents_f16: &[u16],
+        timestep: f32,
+        kv_caches: (&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu),
+        use_cuda_graph: bool,
+    ) -> Result<Vec<u16>> {
+        self.capture_gate.reset();
+        let gate = &self.capture_gate;
+        let comm0 = &self.comm;
+        let comm1 = &self.comm;
         let (c0, c1) = kv_caches;
-        std::thread::scope(|s| {
-            let h1 = s.spawn(|| {
+        let (r0, r1) = self.worker1.run_parallel(
+            || {
+                let _dev = CudaDevice::set_current(0)?;
+                self.rank0.forward_cached_with_allreduce_gated(
+                    target_latents_f16,
+                    timestep,
+                    c0,
+                    use_cuda_graph,
+                    &self.cublas0,
+                    &self.stream0,
+                    Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                        let ex = st.exec(0, 0);
+                        chunked_all_reduce_f16(comm0, &ex, d_buf, 0, n_elems)
+                    }),
+                    Some(gate),
+                )
+            },
+            || {
                 let _dev = CudaDevice::set_current(1)?;
-                self.rank1.forward_cached_with_allreduce(
+                self.rank1.forward_cached_with_allreduce_gated(
                     target_latents_f16,
                     timestep,
                     c1,
-                    false,
+                    use_cuda_graph,
                     &self.cublas1,
                     &self.stream1,
                     Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                         let ex = st.exec(0, 0);
-                        chunked_all_reduce_f16(&comm1, &ex, d_buf, 1, n_elems)
+                        chunked_all_reduce_f16(comm1, &ex, d_buf, 1, n_elems)
                     }),
+                    Some(gate),
                 )
-            });
-            let _dev = CudaDevice::set_current(0)?;
-            let r0 = self.rank0.forward_cached_with_allreduce(
-                target_latents_f16,
-                timestep,
-                c0,
-                false,
-                &self.cublas0,
-                &self.stream0,
-                Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
-                    let ex = st.exec(0, 0);
-                    chunked_all_reduce_f16(&comm0, &ex, d_buf, 0, n_elems)
-                }),
-            );
-            let r1 = h1
-                .join()
-                .map_err(|_| CudaError::new(-10, "TP=2 rank 1 thread panicked"))?;
-            r1?;
-            r0
-        })
+            },
+        )?;
+        r1?;
+        r0
+    }
+
+    /// Executes the full GPU-resident Euler flow-matching denoising loop across `TP=2` ranks (`0` and `1`)
+    /// using persistent Rank-1 worker dispatch, full-duplex pipelined PCIe AllReduce, and `TP=2` CUDA Graphs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_loop(
+        &self,
+        cond_latents_f16: &[u16],
+        init_target_latents_f16: &[u16],
+        cond_prompt_embeds_f16: &[u16],
+        cond_vlm_mask: &[bool],
+        neg_prompt_and_mask: Option<(&[u16], &[bool])>,
+        img_shapes: &[(usize, usize, usize)],
+        timesteps: &[f32],
+        sigmas: &[f32],
+        true_cfg_scale: f32,
+        use_cuda_graph: bool,
+        cond_caches: (&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu),
+        neg_caches: (&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu),
+    ) -> Result<(Vec<u16>, f64, f64)> {
+        self.capture_gate.reset();
+        let gate = &self.capture_gate;
+        let comm0 = &self.comm;
+        let comm1 = &self.comm;
+        let (cond_c0, cond_c1) = cond_caches;
+        let (neg_c0, neg_c1) = neg_caches;
+        let (r0, r1) = self.worker1.run_parallel(
+            || {
+                let _dev = CudaDevice::set_current(0)?;
+                self.rank0.denoise_loop_with_allreduce(
+                    cond_latents_f16,
+                    init_target_latents_f16,
+                    cond_prompt_embeds_f16,
+                    cond_vlm_mask,
+                    neg_prompt_and_mask,
+                    img_shapes,
+                    timesteps,
+                    sigmas,
+                    true_cfg_scale,
+                    use_cuda_graph,
+                    cond_c0,
+                    neg_c0,
+                    &self.cublas0,
+                    &self.stream0,
+                    Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                        let ex = st.exec(0, 0);
+                        chunked_all_reduce_f16(comm0, &ex, d_buf, 0, n_elems)
+                    }),
+                    Some(gate),
+                )
+            },
+            || {
+                let _dev = CudaDevice::set_current(1)?;
+                self.rank1.denoise_loop_with_allreduce(
+                    cond_latents_f16,
+                    init_target_latents_f16,
+                    cond_prompt_embeds_f16,
+                    cond_vlm_mask,
+                    neg_prompt_and_mask,
+                    img_shapes,
+                    timesteps,
+                    sigmas,
+                    true_cfg_scale,
+                    use_cuda_graph,
+                    cond_c1,
+                    neg_c1,
+                    &self.cublas1,
+                    &self.stream1,
+                    Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                        let ex = st.exec(0, 0);
+                        chunked_all_reduce_f16(comm1, &ex, d_buf, 1, n_elems)
+                    }),
+                    Some(gate),
+                )
+            },
+        )?;
+        r1?;
+        r0
     }
 }

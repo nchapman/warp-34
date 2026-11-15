@@ -216,6 +216,7 @@ pub struct QwenImage21ServerState {
     pub worker: QwenImage21Worker,
     pub metrics: Arc<Telemetry>,
     pub allow_remote_images: bool,
+    pub use_cuda_graph: bool,
     admission: Arc<Semaphore>,
 }
 
@@ -223,6 +224,7 @@ impl QwenImage21ServerState {
     pub fn from_loader_with_options(
         model_name: String,
         allow_remote_images: bool,
+        use_cuda_graph: bool,
         options: super::ServeOptions,
         loader: impl FnOnce() -> Result<QwenImage21PipelineEngine, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
@@ -236,6 +238,7 @@ impl QwenImage21ServerState {
             worker,
             metrics,
             allow_remote_images,
+            use_cuda_graph,
             admission: Arc::new(Semaphore::new(options.max_num_seqs.max(1))),
         }))
     }
@@ -246,8 +249,8 @@ pub struct ParsedImageRequest {
     pub prompt: String,
     pub negative_prompt: Option<String>,
     pub condition_images: Vec<QwenImage21ConditionImage>,
-    pub width: u32,
-    pub height: u32,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub output_resolution: u32,
     pub num_inference_steps: Option<usize>,
     pub guidance_scale: f32,
@@ -375,17 +378,23 @@ pub fn parse_size_spec(
     size: Option<&str>,
     width: Option<u32>,
     height: Option<u32>,
-    condition_images: &[QwenImage21ConditionImage],
-) -> Result<(u32, u32, u32), String> {
-    if let (Some(w), Some(h)) = (width, height) {
-        if !(64..=2048).contains(&w) || !(64..=2048).contains(&h) {
-            return Err("width and height must be in 64..=2048".into());
+) -> Result<(Option<u32>, Option<u32>), String> {
+    if width.is_some() || height.is_some() {
+        if let Some(w) = width
+            && !(64..=2048).contains(&w)
+        {
+            return Err("width must be in 64..=2048".into());
         }
-        return Ok((w, h, w.max(h)));
+        if let Some(h) = height
+            && !(64..=2048).contains(&h)
+        {
+            return Err("height must be in 64..=2048".into());
+        }
+        return Ok((width, height));
     }
     if let Some(s) = size
         .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "auto")
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
     {
         let (w_str, h_str) = s
             .split_once('x')
@@ -400,19 +409,9 @@ pub fn parse_size_spec(
         if !(64..=2048).contains(&w) || !(64..=2048).contains(&h) {
             return Err("image size dimensions must be in 64..=2048".into());
         }
-        return Ok((w, h, w.max(h)));
+        return Ok((Some(w), Some(h)));
     }
-    if let Some(last) = condition_images.last() {
-        let w = last.width.clamp(64, 2048);
-        let h = last.height.clamp(64, 2048);
-        return Ok((w, h, 1024));
-    }
-    let w = width.unwrap_or(1024);
-    let h = height.unwrap_or(1024);
-    if !(64..=2048).contains(&w) || !(64..=2048).contains(&h) {
-        return Err("width and height must be in 64..=2048".into());
-    }
-    Ok((w, h, w.max(h)))
+    Ok((None, None))
 }
 
 pub fn parse_json_image_request(
@@ -434,11 +433,12 @@ pub fn parse_json_image_request(
         .ok_or_else(|| "'prompt' is required and must be a non-empty string".to_string())?
         .to_string();
 
+    // Preserve explicit `""` or `" "` negative prompts so `guidance_scale > 1.0` enables CFG
+    // identically to `QwenImage21Pipeline.__call__(negative_prompt="", true_cfg_scale=4.0)`.
     let negative_prompt = obj
         .get("negative_prompt")
         .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty());
+        .map(str::to_string);
 
     let mut condition_images = Vec::new();
     for key in ["image", "images"] {
@@ -489,7 +489,7 @@ pub fn parse_json_image_request(
         .map(|v| u32::try_from(v).map_err(|_| "invalid height".to_string()))
         .transpose()?;
     let size = obj.get("size").and_then(Value::as_str);
-    let (w, h, default_res) = parse_size_spec(size, width, height, &condition_images)?;
+    let (w, h) = parse_size_spec(size, width, height)?;
     let output_resolution = match obj
         .get("resolution")
         .or_else(|| obj.get("output_resolution"))
@@ -502,7 +502,7 @@ pub fn parse_json_image_request(
             }
             res
         }
-        None => default_res,
+        None => 1024,
     };
 
     let num_inference_steps = obj
@@ -607,6 +607,7 @@ pub fn parse_multipart_image_request(
     let mut size: Option<String> = None;
     let mut width: Option<u32> = None;
     let mut height: Option<u32> = None;
+    let mut output_resolution: u32 = 1024;
     let mut steps: Option<usize> = None;
     let mut guidance_scale: f32 = 1.0;
     let mut seed: u64 = 42;
@@ -677,8 +678,24 @@ pub fn parse_multipart_image_request(
                 condition_images.push(decode_condition_image_bytes(content)?);
             }
             "prompt" => prompt = Some(as_text()?),
-            "negative_prompt" => negative_prompt = Some(as_text()?).filter(|s| !s.is_empty()),
+            "negative_prompt" => {
+                let raw = std::str::from_utf8(content)
+                    .map(str::to_string)
+                    .map_err(|_| {
+                        "multipart field 'negative_prompt' is not valid UTF-8".to_string()
+                    })?;
+                negative_prompt = Some(raw);
+            }
             "size" => size = Some(as_text()?),
+            "resolution" | "output_resolution" => {
+                let res: u32 = as_text()?
+                    .parse()
+                    .map_err(|_| "invalid multipart 'resolution'".to_string())?;
+                if !(64..=2048).contains(&res) {
+                    return Err("'resolution' must be in 64..=2048".into());
+                }
+                output_resolution = res;
+            }
             "width" => {
                 width = Some(
                     as_text()?
@@ -734,8 +751,7 @@ pub fn parse_multipart_image_request(
     if !guidance_scale.is_finite() || !(0.0..=30.0).contains(&guidance_scale) {
         return Err("'guidance_scale' must be in 0.0..=30.0".into());
     }
-    let (w, h, output_resolution) =
-        parse_size_spec(size.as_deref(), width, height, &condition_images)?;
+    let (w, h) = parse_size_spec(size.as_deref(), width, height)?;
     let rgba_output = match background.as_deref() {
         Some("transparent") => true,
         Some("opaque" | "auto") | None => rgba_flag,
@@ -823,8 +839,8 @@ async fn handle_image_request(
             prompt: parsed.prompt.clone(),
             negative_prompt: parsed.negative_prompt.clone(),
             condition_images: parsed.condition_images.clone(),
-            width: Some(parsed.width),
-            height: Some(parsed.height),
+            width: parsed.width,
+            height: parsed.height,
             output_resolution: parsed.output_resolution,
             num_inference_steps: Some(steps),
             sigmas: None,
@@ -832,6 +848,7 @@ async fn handle_image_request(
             seed: item_seed,
             initial_latents_chw_f16: None,
             rgba_output: parsed.rgba_output,
+            use_cuda_graph: state.use_cuda_graph,
         };
         let res = state
             .worker
@@ -1064,11 +1081,25 @@ mod tests {
         assert_eq!(parsed.prompt, "A glowing crystal cube");
         assert_eq!(parsed.negative_prompt.as_deref(), Some("blurry"));
         assert_eq!(parsed.condition_images.len(), 1);
-        assert_eq!(parsed.width, 1024);
-        assert_eq!(parsed.height, 768);
+        assert_eq!(parsed.width, Some(1024));
+        assert_eq!(parsed.height, Some(768));
+        assert_eq!(parsed.output_resolution, 1024);
         assert_eq!(parsed.num_inference_steps, Some(8));
         assert_eq!(parsed.seed, 123);
         assert!(parsed.rgba_output);
+
+        // Explicit empty `negative_prompt: ""` must remain `Some("")` so CFG stays enabled!
+        let empty_neg_body = serde_json::to_vec(&json!({
+            "prompt": "A mountain lake",
+            "negative_prompt": "",
+            "guidance_scale": 4.0
+        }))
+        .unwrap();
+        let empty_neg = parse_json_image_request(&empty_neg_body, false, false).unwrap();
+        assert_eq!(empty_neg.negative_prompt.as_deref(), Some(""));
+        assert_eq!(empty_neg.width, None);
+        assert_eq!(empty_neg.height, None);
+        assert_eq!(empty_neg.output_resolution, 1024);
 
         let boundary = "----warp34boundary";
         let mut mp = Vec::new();
@@ -1100,8 +1131,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mp_parsed.prompt, "Edit the sky");
-        assert_eq!(mp_parsed.width, 512);
-        assert_eq!(mp_parsed.height, 512);
+        assert_eq!(mp_parsed.width, Some(512));
+        assert_eq!(mp_parsed.height, Some(512));
         assert_eq!(mp_parsed.condition_images.len(), 1);
     }
 }

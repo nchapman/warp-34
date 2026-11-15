@@ -287,6 +287,60 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     }
 }
 
+__global__ void __launch_bounds__(512, 1) tp2_all_reduce_rx_chunk_f16_kernel(
+    const __half* local_in,
+    __half* out,
+    const __half* __restrict__ peer_s,
+    Signal* __restrict__ sig0,
+    Signal* __restrict__ sig1,
+    int rank,
+    int num_elems,
+    int trailing_barrier) {
+    Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    uint32_t epoch = 0;
+    barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+
+    const int chunk_elems = (num_elems + 7) >> 3;
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)peer_s) & 15u) == 0);
+    if (vec8) {
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s);
+        uint4* out_v = reinterpret_cast<uint4*>(out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const uint4 lv = local_v[i];
+            const uint4 pv = peer_v[i];
+            const __half* lh = reinterpret_cast<const __half*>(&lv);
+            const __half* ph = reinterpret_cast<const __half*>(&pv);
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float fl = __half2float(lh[d]);
+                const float fp = __half2float(ph[d]);
+                oh[d] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+            }
+            out_v[i] = ov;
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 3;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    const float fl = __half2float(local_in[idx]);
+                    const float fp = __half2float(peer_s[idx]);
+                    out[idx] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+                }
+            }
+        }
+    }
+    if (trailing_barrier != 0) {
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+    }
+}
+
 template <int THREADS, int MAX_ITERS>
 __global__ void __launch_bounds__(THREADS, (THREADS <= 256) ? 2 : 1) tp2_all_reduce_residual_gemma_rms_norm_f16_kernel(
     const __half* local_in,
@@ -1854,6 +1908,100 @@ extern "C" int warp34_tp2_all_reduce_f16(const warp34_exec* ex, const void* loca
         (warp34_comm::Signal*)sig0, (warp34_comm::Signal*)sig1,
         rank_and_flags, num_elems);
     return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_tp2_all_reduce_pipelined_f16(
+    const warp34_exec* ex,
+    const void* local_in,
+    void* out,
+    void* stage0,
+    void* stage1,
+    void* sig0,
+    void* sig1,
+    int rank,
+    int num_elems,
+    uintptr_t dma_stream,
+    uintptr_t ev_ready,
+    const uintptr_t* ev_tx_done,
+    int max_chunks) {
+    if (ex == nullptr || local_in == nullptr || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
+        (rank != 0 && rank != 1) || num_elems <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const size_t num_bytes = (size_t)num_elems * sizeof(__half);
+    if (dma_stream == 0 || ev_ready == 0 || ev_tx_done == nullptr ||
+        max_chunks <= 1 || num_bytes < 512 * 1024) {
+        return warp34_tp2_all_reduce_f16(ex, local_in, out, stage0, stage1, sig0, sig1, rank, num_elems);
+    }
+    bool is_p2p = false;
+    cudaError_t p2p_err = warp34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
+    if (is_p2p) {
+        return warp34_tp2_all_reduce_f16(ex, local_in, out, stage0, stage1, sig0, sig1, rank, num_elems);
+    }
+
+    const int cap_blocks = warp34_comm::tp2_pcie_block_cap();
+    const int min_chunk_elems = 131072 > (cap_blocks * warp34_comm::kVec8F16ElemsPerBlock)
+        ? 131072
+        : (cap_blocks * warp34_comm::kVec8F16ElemsPerBlock);
+    int k = (max_chunks > 8) ? 8 : max_chunks;
+    while (k > 1 && (num_elems / k) < min_chunk_elems) {
+        k >>= 1;
+    }
+    if (k <= 1) {
+        return warp34_tp2_all_reduce_f16(ex, local_in, out, stage0, stage1, sig0, sig1, rank, num_elems);
+    }
+
+    const int base_chunk = ((num_elems / k) & ~7);
+    if (base_chunk < min_chunk_elems) {
+        return warp34_tp2_all_reduce_f16(ex, local_in, out, stage0, stage1, sig0, sig1, rank, num_elems);
+    }
+
+    cudaStream_t main_s = (cudaStream_t)ex->stream;
+    cudaStream_t dma_s = (cudaStream_t)dma_stream;
+    const __half* in_h = (const __half*)local_in;
+    __half* out_h = (__half*)out;
+    __half* my_stage = (__half*)((rank == 0) ? stage0 : stage1);
+    const __half* peer_stage = (const __half*)((rank == 0) ? stage1 : stage0);
+
+    cudaError_t err = cudaEventRecord((cudaEvent_t)ev_ready, main_s);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaStreamWaitEvent(dma_s, (cudaEvent_t)ev_ready, 0);
+    if (err != cudaSuccess) return (int)err;
+
+    for (int c = 0; c < k; ++c) {
+        const int off = c * base_chunk;
+        const int chunk = (c == k - 1) ? (num_elems - off) : base_chunk;
+        err = cudaMemcpyAsync(
+            my_stage + off,
+            in_h + off,
+            (size_t)chunk * sizeof(__half),
+            cudaMemcpyDefault,
+            dma_s);
+        if (err != cudaSuccess) return (int)err;
+        err = cudaEventRecord((cudaEvent_t)ev_tx_done[c], dma_s);
+        if (err != cudaSuccess) return (int)err;
+    }
+
+    for (int c = 0; c < k; ++c) {
+        const int off = c * base_chunk;
+        const int chunk = (c == k - 1) ? (num_elems - off) : base_chunk;
+        err = cudaStreamWaitEvent(main_s, (cudaEvent_t)ev_tx_done[c], 0);
+        if (err != cudaSuccess) return (int)err;
+        warp34_comm::tp2_all_reduce_rx_chunk_f16_kernel<<<cap_blocks, 512, 0, main_s>>>(
+            in_h + off,
+            out_h + off,
+            peer_stage + off,
+            (warp34_comm::Signal*)sig0,
+            (warp34_comm::Signal*)sig1,
+            rank,
+            chunk,
+            (c == k - 1) ? 1 : 0);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return (int)err;
+    }
+    return 0;
 }
 
 extern "C" int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(

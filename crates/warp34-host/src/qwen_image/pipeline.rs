@@ -10,9 +10,8 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use std::time::Instant;
 
-use image::codecs::png::PngEncoder;
-use image::imageops::FilterType;
-use image::{ColorType, ExtendedColorType, ImageEncoder, RgbaImage};
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
+use image::{ColorType, ExtendedColorType, ImageEncoder};
 #[cfg(feature = "cuda")]
 use tokenizers::Tokenizer;
 
@@ -25,12 +24,13 @@ use crate::loader::SafetensorsArchive;
 use crate::qwen_image::text_encoder::{Qwen3VlConditioningEncoder, Qwen3VlConditioningOutput};
 #[cfg(feature = "cuda")]
 use crate::qwen_image::transformer::{
-    QwenImage21TransformerEngine, QwenImage21TransformerTp2Engine, euler_cfg_step_f16,
+    QwenImage21KvCacheGpu, QwenImage21TransformerEngine, QwenImage21TransformerTp2Engine,
     pack_latents_chw_to_hwc, unpack_latents_hwc_to_chw,
 };
 #[cfg(feature = "cuda")]
 use crate::qwen_image::vae::{
-    QwenImage21VaeEngine, QwenImage21VaeWeightsGpu, rgba_u8_to_vae_chw_f16, vae_chw_f16_to_rgba_u8,
+    QwenImage21VaeEngine, QwenImage21VaeTilingConfig, QwenImage21VaeWeightsGpu,
+    rgba_u8_to_vae_chw_f16, vae_chw_f16_to_rgba_u8,
 };
 #[cfg(feature = "cuda")]
 use crate::qwen_image::{
@@ -195,25 +195,182 @@ impl QwenImage21ConditionImage {
         Self::from_image_bytes(&bytes)
     }
 
-    /// Resizes the condition image to `(target_width, target_height)` using Lanczos3
-    /// (matching `VaeImageProcessor.resize(..., resample="lanczos")`).
+    /// Resizes the condition image to `(target_width, target_height)` using Pillow-compatible
+    /// premultiplied-alpha separable Lanczos-3 (`PIL.Image.resize(..., resample=LANCZOS)`),
+    /// matching `VaeImageProcessor.resize(..., resample="lanczos")` without transparent-edge color bleed.
     pub fn resize_lanczos(&self, target_width: u32, target_height: u32) -> Self {
         let target_width = target_width.max(1);
         let target_height = target_height.max(1);
         if self.width == target_width && self.height == target_height {
             return self.clone();
         }
-        let Some(src) = RgbaImage::from_raw(self.width, self.height, self.rgba.clone()) else {
+        let expected = (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(4);
+        if self.rgba.len() != expected || self.width == 0 || self.height == 0 {
             return self.clone();
-        };
-        let resized =
-            image::imageops::resize(&src, target_width, target_height, FilterType::Lanczos3);
+        }
+        let rgba = resize_rgba_premultiplied_lanczos3(
+            &self.rgba,
+            self.width as usize,
+            self.height as usize,
+            target_width as usize,
+            target_height as usize,
+        );
         Self {
-            rgba: resized.into_raw(),
+            rgba,
             width: target_width,
             height: target_height,
         }
     }
+}
+
+#[inline]
+fn lanczos3_kernel(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 1e-12 {
+        1.0
+    } else if ax >= 3.0 {
+        0.0
+    } else {
+        let pix = core::f64::consts::PI * x;
+        let pix3 = pix / 3.0;
+        (pix.sin() / pix) * (pix3.sin() / pix3)
+    }
+}
+
+const LANCZOS_PRECISION_BITS: i64 = 32 - 8 - 2;
+
+fn build_lanczos3_taps(in_size: usize, out_size: usize) -> Vec<(usize, Vec<i64>)> {
+    let scale = (in_size as f64) / (out_size as f64);
+    let filter_scale = scale.max(1.0);
+    let support = 3.0 * filter_scale;
+    let inv_filter_scale = 1.0 / filter_scale;
+    let scale_fp = (1i64 << LANCZOS_PRECISION_BITS) as f64;
+    let mut table = Vec::with_capacity(out_size);
+    for out_i in 0..out_size {
+        let center = ((out_i as f64) + 0.5) * scale;
+        let xmin = (center - support + 0.5).floor().max(0.0) as usize;
+        let xmax = ((center + support + 0.5).floor().max(0.0) as usize).min(in_size);
+        let mut weights = Vec::with_capacity(xmax.saturating_sub(xmin));
+        let mut sum = 0.0f64;
+        for src_i in xmin..xmax {
+            let w = lanczos3_kernel(((src_i as f64) - center + 0.5) * inv_filter_scale);
+            weights.push(w);
+            sum += w;
+        }
+        let inv_sum = if sum.abs() > 1e-12 { 1.0 / sum } else { 0.0 };
+        let weights_fp: Vec<i64> = weights
+            .into_iter()
+            .map(|w| (w * inv_sum * scale_fp).round() as i64)
+            .collect();
+        table.push((xmin, weights_fp));
+    }
+    table
+}
+
+fn resize_rgba_premultiplied_lanczos3(
+    src: &[u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<u8> {
+    let has_alpha = src.as_chunks::<4>().0.iter().any(|px| px[3] != 255);
+    let half_bias = 1i64 << (LANCZOS_PRECISION_BITS - 1);
+
+    // 1. RGBA -> RGBa premultiplication (`(c * a + 127) / 255` matching Pillow `rgb2rgb_a`).
+    let pre: std::borrow::Cow<'_, [u8]> = if has_alpha {
+        let mut buf = vec![0u8; src.len()];
+        for (dst_px, src_px) in buf
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src.as_chunks::<4>().0.iter())
+        {
+            let a = src_px[3] as u32;
+            dst_px[0] = ((src_px[0] as u32 * a + 127) / 255) as u8;
+            dst_px[1] = ((src_px[1] as u32 * a + 127) / 255) as u8;
+            dst_px[2] = ((src_px[2] as u32 * a + 127) / 255) as u8;
+            dst_px[3] = src_px[3];
+        }
+        std::borrow::Cow::Owned(buf)
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    };
+
+    // 2. Horizontal pass (`in_w -> out_w`) in 22-bit fixed-point into `[in_h, out_w, 4]` u8.
+    let horiz: Vec<u8> = if out_w != in_w {
+        let x_taps = build_lanczos3_taps(in_w, out_w);
+        let mut buf = vec![0u8; in_h * out_w * 4];
+        for y in 0..in_h {
+            let src_row = &pre[y * in_w * 4..(y + 1) * in_w * 4];
+            let dst_row = &mut buf[y * out_w * 4..(y + 1) * out_w * 4];
+            for (ox, (start, taps)) in x_taps.iter().enumerate() {
+                let mut acc = [half_bias; 4];
+                for (k, &w) in taps.iter().enumerate() {
+                    let px = &src_row[(start + k) * 4..(start + k) * 4 + 4];
+                    acc[0] += (px[0] as i64) * w;
+                    acc[1] += (px[1] as i64) * w;
+                    acc[2] += (px[2] as i64) * w;
+                    acc[3] += (px[3] as i64) * w;
+                }
+                dst_row[ox * 4] = (acc[0] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 1] = (acc[1] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 2] = (acc[2] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 3] = if has_alpha {
+                    (acc[3] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8
+                } else {
+                    255
+                };
+            }
+        }
+        buf
+    } else {
+        pre.into_owned()
+    };
+
+    // 3. Vertical pass (`in_h -> out_h`) in 22-bit fixed-point into `[out_h, out_w, 4]` u8.
+    let mut out = if out_h != in_h {
+        let y_taps = build_lanczos3_taps(in_h, out_h);
+        let mut buf = vec![0u8; out_h * out_w * 4];
+        for (oy, (start, taps)) in y_taps.iter().enumerate() {
+            let dst_row = &mut buf[oy * out_w * 4..(oy + 1) * out_w * 4];
+            for ox in 0..out_w {
+                let mut acc = [half_bias; 4];
+                for (k, &w) in taps.iter().enumerate() {
+                    let p =
+                        &horiz[((start + k) * out_w + ox) * 4..((start + k) * out_w + ox) * 4 + 4];
+                    acc[0] += (p[0] as i64) * w;
+                    acc[1] += (p[1] as i64) * w;
+                    acc[2] += (p[2] as i64) * w;
+                    acc[3] += (p[3] as i64) * w;
+                }
+                dst_row[ox * 4] = (acc[0] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 1] = (acc[1] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 2] = (acc[2] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8;
+                dst_row[ox * 4 + 3] = if has_alpha {
+                    (acc[3] >> LANCZOS_PRECISION_BITS).clamp(0, 255) as u8
+                } else {
+                    255
+                };
+            }
+        }
+        buf
+    } else {
+        horiz
+    };
+
+    // 4. RGBa -> RGBA unpremultiplication (`(c * 255) / a` matching Pillow `rgb_a2rgba`).
+    if has_alpha {
+        for px in out.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            px[0] = (px[0] as u32 * 255).checked_div(a).unwrap_or(0).min(255) as u8;
+            px[1] = (px[1] as u32 * 255).checked_div(a).unwrap_or(0).min(255) as u8;
+            px[2] = (px[2] as u32 * 255).checked_div(a).unwrap_or(0).min(255) as u8;
+        }
+    }
+    out
 }
 
 /// Request parameters for `QwenImage21PipelineEngine::generate`.
@@ -243,6 +400,8 @@ pub struct QwenImage21GenerationRequest {
     pub initial_latents_chw_f16: Option<Vec<u16>>,
     /// Preserve the 4th alpha channel in the output PNG (`true` = RGBA, `false` = RGB).
     pub rgba_output: bool,
+    /// Enable CUDA Graph capture & replay on Steps `1..N-1` (`true` by default).
+    pub use_cuda_graph: bool,
 }
 
 impl Default for QwenImage21GenerationRequest {
@@ -260,6 +419,7 @@ impl Default for QwenImage21GenerationRequest {
             seed: 42,
             initial_latents_chw_f16: None,
             rgba_output: false,
+            use_cuda_graph: true,
         }
     }
 }
@@ -318,8 +478,12 @@ pub fn encode_png_bytes(
         4 => ExtendedColorType::Rgba8,
         _ => return Err(format!("unsupported PNG channel count: {channels}")),
     };
-    let mut buf = Vec::new();
-    let encoder = PngEncoder::new(Cursor::new(&mut buf));
+    let mut buf = Vec::with_capacity(pixels.len() / 2);
+    let encoder = PngEncoder::new_with_quality(
+        Cursor::new(&mut buf),
+        CompressionType::Fast,
+        PngFilterType::Sub,
+    );
     encoder
         .write_image(pixels, width, height, color_type)
         .map_err(|e| format!("PNG encode failed: {e}"))?;
@@ -360,9 +524,13 @@ enum TransformerBackend {
         engine: QwenImage21TransformerEngine,
         stream: CudaStream,
         cublas: CublasHandle,
+        cond_cache: QwenImage21KvCacheGpu,
+        neg_cache: QwenImage21KvCacheGpu,
     },
     Tp2 {
         engine: QwenImage21TransformerTp2Engine,
+        cond_caches: (QwenImage21KvCacheGpu, QwenImage21KvCacheGpu),
+        neg_caches: (QwenImage21KvCacheGpu, QwenImage21KvCacheGpu),
     },
 }
 
@@ -454,11 +622,18 @@ impl QwenImage21PipelineEngine {
         let vae_archive = SafetensorsArchive::open(&cfg.vae_dir)
             .map_err(|e| CudaError::with_detail(-10, "open vae safetensors", e.to_string()))?;
 
-        // Enable spatial tiling for >1024px images while keeping <=1024px untiled for maximum speed.
+        // Enable spatial tiling above 1536x1536 so <=1536px runs untiled single-pass while >=2048px avoids OOM.
         let vae_dev = if num_gpus >= 2 && tp_size == 2 { 1 } else { 0 };
         let vae_weights =
             QwenImage21VaeWeightsGpu::from_archive(&vae_archive, &cfg.vae, "", vae_dev)?;
-        let vae = QwenImage21VaeEngine::new(vae_weights)?;
+        let mut vae = QwenImage21VaeEngine::new(vae_weights)?;
+        vae.set_tiling(QwenImage21VaeTilingConfig {
+            enabled: true,
+            tile_sample_min_height: 1536,
+            tile_sample_min_width: 1536,
+            tile_sample_stride_height: 1152,
+            tile_sample_stride_width: 1152,
+        });
 
         let tf_quant = &cfg.transformer.quant;
         let te_quant = &cfg.text_encoder.quant;
@@ -468,8 +643,10 @@ impl QwenImage21PipelineEngine {
                 &cfg.transformer,
                 tf_quant,
                 "",
-                8192,
+                16384,
             )?;
+            let cond_caches = tf_tp2.new_kv_caches();
+            let neg_caches = tf_tp2.new_kv_caches();
             let te_stream = CudaStream::new(0)?;
             let te_cublas = CublasHandle::new(&te_stream)?;
             let te_encoder = Qwen3VlConditioningEncoder::load(
@@ -480,7 +657,11 @@ impl QwenImage21PipelineEngine {
                 &te_stream,
             )?;
             (
-                Some(TransformerBackend::Tp2 { engine: tf_tp2 }),
+                Some(TransformerBackend::Tp2 {
+                    engine: tf_tp2,
+                    cond_caches,
+                    neg_caches,
+                }),
                 ConditioningBackend::Resident {
                     encoder: te_encoder,
                     stream: te_stream,
@@ -497,6 +678,8 @@ impl QwenImage21PipelineEngine {
                 0,
                 &tf_stream,
             )?;
+            let cond_cache = tf_single.new_kv_cache();
+            let neg_cache = tf_single.new_kv_cache();
             let te_stream = CudaStream::new(1)?;
             let te_cublas = CublasHandle::new(&te_stream)?;
             let te_encoder = Qwen3VlConditioningEncoder::load(
@@ -511,6 +694,8 @@ impl QwenImage21PipelineEngine {
                     engine: tf_single,
                     stream: tf_stream,
                     cublas: tf_cublas,
+                    cond_cache,
+                    neg_cache,
                 }),
                 ConditioningBackend::Resident {
                     encoder: te_encoder,
@@ -528,6 +713,8 @@ impl QwenImage21PipelineEngine {
                 0,
                 &tf_stream,
             )?;
+            let cond_cache = tf_single.new_kv_cache();
+            let neg_cache = tf_single.new_kv_cache();
             let te_stream = CudaStream::new(0)?;
             let te_cublas = CublasHandle::new(&te_stream)?;
             match Qwen3VlConditioningEncoder::load(
@@ -542,6 +729,8 @@ impl QwenImage21PipelineEngine {
                         engine: tf_single,
                         stream: tf_stream,
                         cublas: tf_cublas,
+                        cond_cache,
+                        neg_cache,
                     }),
                     ConditioningBackend::Resident {
                         encoder: te_encoder,
@@ -554,6 +743,8 @@ impl QwenImage21PipelineEngine {
                         engine: tf_single,
                         stream: tf_stream,
                         cublas: tf_cublas,
+                        cond_cache,
+                        neg_cache,
                     }),
                     ConditioningBackend::OnDemand {
                         device_id: 0,
@@ -695,10 +886,14 @@ impl QwenImage21PipelineEngine {
                 0,
                 &tf_stream,
             )?;
+            let cond_cache = tf_single.new_kv_cache();
+            let neg_cache = tf_single.new_kv_cache();
             self.transformer = Some(TransformerBackend::Single {
                 engine: tf_single,
                 stream: tf_stream,
                 cublas: tf_cublas,
+                cond_cache,
+                neg_cache,
             });
         }
         Ok(())
@@ -806,7 +1001,7 @@ impl QwenImage21PipelineEngine {
         } else {
             torch_randn_f16(z_dim * latent_h * latent_w, req.seed)
         };
-        let mut latents = pack_latents_chw_to_hwc(&init_chw, z_dim, latent_h, latent_w);
+        let init_latents = pack_latents_chw_to_hwc(&init_chw, z_dim, latent_h, latent_w);
 
         // 4. Build FlowMatchEulerDiscreteScheduler schedule
         let default_steps = self
@@ -833,155 +1028,62 @@ impl QwenImage21PipelineEngine {
             .build_schedule(requested_steps, target_tokens, None, sigmas_override)
             .map_err(|e| CudaError::with_detail(-10, "build Euler schedule", e.to_string()))?;
         let num_steps = sched.num_steps();
+        let timesteps: Vec<f32> = sched
+            .timesteps
+            .iter()
+            .map(|&t| {
+                let t_f16 = crate::cuda::f16_to_f32(f32_to_f16(t));
+                crate::cuda::f16_to_f32(f32_to_f16(t_f16 / 1000.0))
+            })
+            .collect();
+        let neg_ref = neg_out
+            .as_ref()
+            .map(|n| (n.prompt_embeds_f16.as_slice(), n.image_pad_mask.as_slice()));
 
-        // 5. Denoising loop (Step 0: block-causal extract; Steps 1..N-1: cached decode + CudaGraph)
-        let mut denoise_step0_ms = 0.0f64;
-        let mut denoise_cached_ms = 0.0f64;
-
-        match self.transformer.as_mut().expect("transformer loaded") {
-            TransformerBackend::Single {
-                engine,
-                stream,
-                cublas,
-            } => {
-                let mut cond_cache = engine.new_kv_cache();
-                let mut neg_cache = engine.new_kv_cache();
-                for step in 0..num_steps {
-                    let t_step = Instant::now();
-                    let t_f16 = crate::cuda::f16_to_f32(f32_to_f16(sched.timesteps[step]));
-                    let timestep = crate::cuda::f16_to_f32(f32_to_f16(t_f16 / 1000.0));
-                    let (v_cond, v_uncond) = if step == 0 {
-                        let out_c = engine.forward_extract(
-                            &cond_latents_packed,
-                            &latents,
-                            &cond_out.prompt_embeds_f16,
-                            &cond_out.image_pad_mask,
-                            &img_shapes,
-                            timestep,
-                            Some(&mut cond_cache),
-                            cublas,
-                            stream,
-                        )?;
-                        let out_u = if let Some(neg) = &neg_out {
-                            Some(
-                                engine
-                                    .forward_extract(
-                                        &cond_latents_packed,
-                                        &latents,
-                                        &neg.prompt_embeds_f16,
-                                        &neg.image_pad_mask,
-                                        &img_shapes,
-                                        timestep,
-                                        Some(&mut neg_cache),
-                                        cublas,
-                                        stream,
-                                    )?
-                                    .target_output_f16,
-                            )
-                        } else {
-                            None
-                        };
-                        denoise_step0_ms += t_step.elapsed().as_secs_f64() * 1000.0;
-                        (out_c.target_output_f16, out_u)
-                    } else {
-                        let out_c = engine.forward_cached(
-                            &latents,
-                            timestep,
-                            &mut cond_cache,
-                            true,
-                            cublas,
-                            stream,
-                        )?;
-                        let out_u = if neg_out.is_some() {
-                            Some(engine.forward_cached(
-                                &latents,
-                                timestep,
-                                &mut neg_cache,
-                                true,
-                                cublas,
-                                stream,
-                            )?)
-                        } else {
-                            None
-                        };
-                        denoise_cached_ms += t_step.elapsed().as_secs_f64() * 1000.0;
-                        (out_c, out_u)
-                    };
-                    euler_cfg_step_f16(
-                        &mut latents,
-                        &v_cond,
-                        v_uncond.as_deref(),
-                        req.true_cfg_scale,
-                        sched.sigmas[step],
-                        sched.sigmas[step + 1],
-                    );
-                }
-            }
-            TransformerBackend::Tp2 { engine } => {
-                let (mut cond_c0, mut cond_c1) = engine.new_kv_caches();
-                let (mut neg_c0, mut neg_c1) = engine.new_kv_caches();
-                for step in 0..num_steps {
-                    let t_step = Instant::now();
-                    let t_f16 = crate::cuda::f16_to_f32(f32_to_f16(sched.timesteps[step]));
-                    let timestep = crate::cuda::f16_to_f32(f32_to_f16(t_f16 / 1000.0));
-                    let (v_cond, v_uncond) = if step == 0 {
-                        let out_c = engine.forward_extract(
-                            &cond_latents_packed,
-                            &latents,
-                            &cond_out.prompt_embeds_f16,
-                            &cond_out.image_pad_mask,
-                            &img_shapes,
-                            timestep,
-                            Some((&mut cond_c0, &mut cond_c1)),
-                        )?;
-                        let out_u = if let Some(neg) = &neg_out {
-                            Some(
-                                engine
-                                    .forward_extract(
-                                        &cond_latents_packed,
-                                        &latents,
-                                        &neg.prompt_embeds_f16,
-                                        &neg.image_pad_mask,
-                                        &img_shapes,
-                                        timestep,
-                                        Some((&mut neg_c0, &mut neg_c1)),
-                                    )?
-                                    .target_output_f16,
-                            )
-                        } else {
-                            None
-                        };
-                        denoise_step0_ms += t_step.elapsed().as_secs_f64() * 1000.0;
-                        (out_c.target_output_f16, out_u)
-                    } else {
-                        let out_c = engine.forward_cached(
-                            &latents,
-                            timestep,
-                            (&mut cond_c0, &mut cond_c1),
-                        )?;
-                        let out_u = if neg_out.is_some() {
-                            Some(engine.forward_cached(
-                                &latents,
-                                timestep,
-                                (&mut neg_c0, &mut neg_c1),
-                            )?)
-                        } else {
-                            None
-                        };
-                        denoise_cached_ms += t_step.elapsed().as_secs_f64() * 1000.0;
-                        (out_c, out_u)
-                    };
-                    euler_cfg_step_f16(
-                        &mut latents,
-                        &v_cond,
-                        v_uncond.as_deref(),
-                        req.true_cfg_scale,
-                        sched.sigmas[step],
-                        sched.sigmas[step + 1],
-                    );
-                }
-            }
-        }
+        // 5. GPU-resident denoising loop (Step 0: block-causal extract; Steps 1..N-1: cached decode + CudaGraph)
+        let (latents, denoise_step0_ms, denoise_cached_ms) =
+            match self.transformer.as_mut().expect("transformer loaded") {
+                TransformerBackend::Single {
+                    engine,
+                    stream,
+                    cublas,
+                    cond_cache,
+                    neg_cache,
+                } => engine.denoise_loop(
+                    &cond_latents_packed,
+                    &init_latents,
+                    &cond_out.prompt_embeds_f16,
+                    &cond_out.image_pad_mask,
+                    neg_ref,
+                    &img_shapes,
+                    &timesteps,
+                    &sched.sigmas,
+                    req.true_cfg_scale,
+                    req.use_cuda_graph,
+                    cond_cache,
+                    neg_cache,
+                    cublas,
+                    stream,
+                )?,
+                TransformerBackend::Tp2 {
+                    engine,
+                    cond_caches,
+                    neg_caches,
+                } => engine.denoise_loop(
+                    &cond_latents_packed,
+                    &init_latents,
+                    &cond_out.prompt_embeds_f16,
+                    &cond_out.image_pad_mask,
+                    neg_ref,
+                    &img_shapes,
+                    &timesteps,
+                    &sched.sigmas,
+                    req.true_cfg_scale,
+                    req.use_cuda_graph,
+                    (&mut cond_caches.0, &mut cond_caches.1),
+                    (&mut neg_caches.0, &mut neg_caches.1),
+                )?,
+            };
 
         // 6. Unpack latents & VAE decode
         let t_vae_dec_start = Instant::now();
@@ -1053,5 +1155,32 @@ mod tests {
         assert_eq!(resized.width, 8);
         assert_eq!(resized.height, 8);
         assert_eq!(resized.rgba.len(), 8 * 8 * 4);
+    }
+
+    #[test]
+    fn premultiplied_lanczos_prevents_transparent_rgb_fringe_bleed() {
+        // Left half opaque white (255,255,255,255), right half transparent green (0,255,0,0).
+        // Straight-alpha Lanczos would bleed bright green into semi-transparent boundary pixels;
+        // premultiplied Lanczos must keep RGB pure white (255,255,255) everywhere alpha > 0!
+        let mut rgba = Vec::with_capacity(8 * 4 * 4);
+        for _y in 0..4 {
+            for x in 0..8 {
+                if x < 4 {
+                    rgba.extend_from_slice(&[255, 255, 255, 255]);
+                } else {
+                    rgba.extend_from_slice(&[0, 255, 0, 0]);
+                }
+            }
+        }
+        let cond = QwenImage21ConditionImage::from_rgba_u8(rgba, 8, 4).unwrap();
+        let down = cond.resize_lanczos(4, 2);
+        for px in down.rgba.as_chunks::<4>().0 {
+            if px[3] > 0 {
+                assert!(
+                    px[0] >= 253 && px[1] >= 253 && px[2] >= 253,
+                    "transparent RGB bled into semi-transparent pixel: {px:?}"
+                );
+            }
+        }
     }
 }

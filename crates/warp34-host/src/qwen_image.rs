@@ -248,6 +248,12 @@ pub fn compute_qwen_image_21_rope_indices(
                 "img_shapes block exceeds image_pad_mask length",
             ));
         }
+        if image_pad_mask[block_start..cursor].iter().any(|&b| !b) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "image_pad_mask must be contiguous across each img_shapes block",
+            ));
+        }
         frame_index.resize(frame_index.len() + block_tokens, position);
         position += height.max(width) as i32;
 
@@ -268,6 +274,12 @@ pub fn compute_qwen_image_21_rope_indices(
     }
 
     if cursor < total_len {
+        if image_pad_mask[cursor..].iter().any(|&b| b) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "image_pad_mask contains extra image tokens beyond img_shapes",
+            ));
+        }
         let rem = total_len - cursor;
         for t in 0..rem {
             frame_index.push(position + t as i32);
@@ -1959,6 +1971,58 @@ mod tests {
             assert!(
                 diff_hw_cached < 5e-3,
                 "2-GPU TP=2 cached max diff {diff_hw_cached} exceeded 5e-3"
+            );
+
+            // Also verify full GPU-resident denoise_loop (CFG=2.0, 3 steps, pipelined AllReduce + CUDA Graph)
+            // matches single-GPU denoise_loop!
+            let timesteps = [t0, t1, t1 * 0.5];
+            let sigmas = [1.0f32, 0.7f32, 0.3f32, 0.0f32];
+            let mut tp1_cond_cache = engine.new_kv_cache();
+            let mut tp1_neg_cache = engine.new_kv_cache();
+            let (tp1_loop_out, _, _) = engine
+                .denoise_loop(
+                    &cond_latents,
+                    &target_latents_0,
+                    &enc_hidden,
+                    &vlm_img_mask,
+                    Some((&enc_hidden, &vlm_img_mask)),
+                    &img_shapes,
+                    &timesteps,
+                    &sigmas,
+                    2.0,
+                    true,
+                    &mut tp1_cond_cache,
+                    &mut tp1_neg_cache,
+                    &cublas,
+                    &stream,
+                )
+                .unwrap();
+            let (mut tp2_cond0, mut tp2_cond1) = tp2_engine.new_kv_caches();
+            let (mut tp2_neg0, mut tp2_neg1) = tp2_engine.new_kv_caches();
+            let (tp2_loop_out, _, _) = tp2_engine
+                .denoise_loop(
+                    &cond_latents,
+                    &target_latents_0,
+                    &enc_hidden,
+                    &vlm_img_mask,
+                    Some((&enc_hidden, &vlm_img_mask)),
+                    &img_shapes,
+                    &timesteps,
+                    &sigmas,
+                    2.0,
+                    true,
+                    (&mut tp2_cond0, &mut tp2_cond1),
+                    (&mut tp2_neg0, &mut tp2_neg1),
+                )
+                .unwrap();
+            let loop_diff = tp1_loop_out
+                .iter()
+                .zip(tp2_loop_out.iter())
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                loop_diff < 5e-3,
+                "2-GPU TP=2 denoise_loop max diff {loop_diff} vs TP=1 exceeded 5e-3"
             );
         }
     }

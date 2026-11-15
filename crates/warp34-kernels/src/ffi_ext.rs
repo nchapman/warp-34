@@ -1066,6 +1066,20 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn warp34_qwen_image_adaln_modulate_ex_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        scale_col_offset: i32,
+        eps: f32,
+        apply_had64: i32,
+    ) -> i32;
+
     pub fn warp34_qwen_image_gated_residual_f16(
         ex: *const Warp34Exec,
         residual: *mut c_void,
@@ -1076,6 +1090,35 @@ unsafe extern "C" {
         hidden_size: i32,
         mod_stride: i32,
         gate_col_offset: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_fused_gated_residual_adaln_f16(
+        ex: *const Warp34Exec,
+        residual: *mut c_void,
+        branch_out: *const c_void,
+        gate_modulation: *const c_void,
+        gate_target_mask: *const u8,
+        gate_mod_stride: i32,
+        gate_col_offset: i32,
+        scale_modulation: *const c_void,
+        scale_target_mask: *const u8,
+        scale_mod_stride: i32,
+        scale_col_offset: i32,
+        norm_out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        apply_had64: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_euler_cfg_step_f16(
+        ex: *const Warp34Exec,
+        sample_f16: *mut c_void,
+        cond_pred_f16: *const c_void,
+        uncond_pred_f16: *const c_void,
+        true_cfg_scale: f32,
+        dt: f32,
+        n_elems: i64,
     ) -> i32;
 
     pub fn warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
