@@ -17,7 +17,8 @@ use core::ffi::c_void;
 use warp34_kernels::ffi;
 
 use crate::cuda::{
-    CublasHandle, CudaError, CudaStream, DeviceBuffer, Result, check_rc, f16_to_f32, f32_to_f16,
+    CublasHandle, CudaDevice, CudaError, CudaStream, DeviceBuffer, Result, check_rc, f16_to_f32,
+    f32_to_f16,
 };
 use crate::loader::SafetensorsArchive;
 use crate::qwen_image::QwenImage21VaeConfig;
@@ -1171,6 +1172,7 @@ impl QwenImage21VaeEngine {
         height: usize,
         width: usize,
     ) -> Result<Vec<u16>> {
+        let _dev = CudaDevice::set_current(self.weights.device_id)?;
         let cfg = &self.weights.cfg;
         let max_c = cfg.dim_mult.iter().copied().max().unwrap_or(1).max(1)
             * cfg.base_dim.max(cfg.z_dim * 2);
@@ -1407,6 +1409,7 @@ impl QwenImage21VaeEngine {
         latent_h: usize,
         latent_w: usize,
     ) -> Result<Vec<u16>> {
+        let _dev = CudaDevice::set_current(self.weights.device_id)?;
         let cfg = &self.weights.cfg;
         let scale = cfg.scale_factor_spatial();
         let out_h = latent_h * scale;

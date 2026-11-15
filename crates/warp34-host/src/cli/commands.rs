@@ -67,8 +67,246 @@ pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         "profile-diff" => run_profile_diff(options),
         "serve" => run_serve(options, policy, spec_config),
         "chat" => run_chat(options, policy, spec_config),
+        "image" => run_image(options),
+        "bench-image" => run_bench_image(options),
         other => Err(format!("unknown subcommand: {other}")),
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn is_qwen_image_model(resolved_model: &str) -> bool {
+    std::path::Path::new(resolved_model)
+        .join("model_index.json")
+        .is_file()
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn load_cli_condition_images(
+    image_urls: &[String],
+    allow_remote_images: bool,
+) -> Result<Vec<crate::qwen_image::QwenImage21ConditionImage>, String> {
+    let mut out = Vec::with_capacity(image_urls.len());
+    for spec in image_urls {
+        let trimmed = spec.trim();
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("data:")
+        {
+            out.push(crate::server::load_condition_image_str(
+                trimmed,
+                allow_remote_images,
+            )?);
+        } else {
+            let bytes = std::fs::read(trimmed)
+                .map_err(|e| format!("failed to read image '{trimmed}': {e}"))?;
+            out.push(crate::server::decode_condition_image_bytes(&bytes)?);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        out_json,
+        ..
+    } = options;
+    let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height, default_res) =
+        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
+    let resolution = if image_width.is_some() || image_height.is_some() {
+        default_res
+    } else {
+        output_resolution
+    };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| {
+        engine
+            .cfg
+            .sample_sigmas
+            .as_ref()
+            .map(|s| s.len().max(1))
+            .unwrap_or(40)
+    });
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt,
+        negative_prompt,
+        condition_images,
+        width: Some(width),
+        height: Some(height),
+        output_resolution: resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output,
+    };
+    let res = engine.generate(&req).map_err(|e| e.to_string())?;
+    let out_path = out_json.unwrap_or_else(|| "out.png".to_string());
+    std::fs::write(&out_path, &res.png_bytes)
+        .map_err(|e| format!("failed to write output PNG '{out_path}': {e}"))?;
+    println!(
+        "[warp34 image] model={model} tp={} size={}x{}x{} steps={steps} cfg={cfg_scale:.1} seed={seed} cond_ms={:.2} vae_enc_ms={:.2} step0_ms={:.2} cached_ms={:.2} vae_dec_ms={:.2} total_ms={:.2} out={out_path}",
+        engine.tp_size(),
+        res.width,
+        res.height,
+        res.channels,
+        res.timings.condition_encode_ms,
+        res.timings.vae_encode_ms,
+        res.timings.denoise_step0_ms,
+        res.timings.denoise_cached_ms,
+        res.timings.vae_decode_ms,
+        res.timings.total_ms,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        prof_rounds,
+        out_json,
+        ..
+    } = options;
+    let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height, default_res) =
+        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
+    let resolution = if image_width.is_some() || image_height.is_some() {
+        default_res
+    } else {
+        output_resolution
+    };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| {
+        engine
+            .cfg
+            .sample_sigmas
+            .as_ref()
+            .map(|s| s.len().max(1))
+            .unwrap_or(40)
+    });
+    let rounds = if prof_rounds == 128 {
+        3
+    } else {
+        prof_rounds.max(1)
+    };
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt,
+        negative_prompt,
+        condition_images,
+        width: Some(width),
+        height: Some(height),
+        output_resolution: resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output,
+    };
+    // Warmup pass
+    let _ = engine.generate(&req).map_err(|e| e.to_string())?;
+
+    let mut cond_ms = 0.0;
+    let mut vae_enc_ms = 0.0;
+    let mut step0_ms = 0.0;
+    let mut cached_ms = 0.0;
+    let mut vae_dec_ms = 0.0;
+    let mut total_ms = 0.0;
+    let mut out_w = 0u32;
+    let mut out_h = 0u32;
+    let mut out_c = 0u8;
+    for _ in 0..rounds {
+        let r = engine.generate(&req).map_err(|e| e.to_string())?;
+        cond_ms += r.timings.condition_encode_ms;
+        vae_enc_ms += r.timings.vae_encode_ms;
+        step0_ms += r.timings.denoise_step0_ms;
+        cached_ms += r.timings.denoise_cached_ms;
+        vae_dec_ms += r.timings.vae_decode_ms;
+        total_ms += r.timings.total_ms;
+        out_w = r.width;
+        out_h = r.height;
+        out_c = r.channels;
+    }
+    let inv = 1.0 / (rounds as f64);
+    cond_ms *= inv;
+    vae_enc_ms *= inv;
+    step0_ms *= inv;
+    cached_ms *= inv;
+    vae_dec_ms *= inv;
+    total_ms *= inv;
+    let per_cached_step_ms = if steps > 1 {
+        cached_ms / ((steps - 1) as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "[warp34 bench-image] model={model} tp={} size={}x{}x{} steps={steps} rounds={rounds} cond_ms={cond_ms:.2} vae_enc_ms={vae_enc_ms:.2} step0_ms={step0_ms:.2} cached_step_ms={per_cached_step_ms:.2} cached_total_ms={cached_ms:.2} vae_dec_ms={vae_dec_ms:.2} total_ms={total_ms:.2} img_per_s={:.3}",
+        engine.tp_size(),
+        out_w,
+        out_h,
+        out_c,
+        1000.0 / total_ms,
+    );
+    if let Some(path) = out_json {
+        let report = serde_json::json!({
+            "model": model,
+            "tp": engine.tp_size(),
+            "width": out_w,
+            "height": out_h,
+            "channels": out_c,
+            "steps": steps,
+            "rounds": rounds,
+            "condition_encode_ms": cond_ms,
+            "vae_encode_ms": vae_enc_ms,
+            "denoise_step0_ms": step0_ms,
+            "denoise_cached_step_ms": per_cached_step_ms,
+            "denoise_cached_total_ms": cached_ms,
+            "vae_decode_ms": vae_dec_ms,
+            "total_ms": total_ms,
+            "images_per_sec": 1000.0 / total_ms,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())
+            .map_err(|e| format!("failed to write benchmark JSON '{path}': {e}"))?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(feature = "cuda")]
@@ -77,6 +315,9 @@ pub(crate) fn run_generate(
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if is_qwen_image_model(&options.resolved_model) {
+        return run_image(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,
@@ -197,6 +438,9 @@ pub(crate) fn run_bench(
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if is_qwen_image_model(&options.resolved_model) {
+        return run_bench_image(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,
@@ -686,6 +930,31 @@ pub(crate) fn run_serve(
         None => "none".to_string(),
     };
     let bind_addr = format!("{host}:{port}");
+    if is_qwen_image_model(&resolved_model) {
+        println!("[warp34 serve] loading QwenImage21 model={model} tp={tp} for http://{bind_addr}");
+        let worker_model = resolved_model;
+        let state = crate::server::QwenImage21ServerState::from_loader_with_options(
+            model,
+            allow_remote_images,
+            serve.options,
+            move || {
+                crate::qwen_image::QwenImage21PipelineEngine::load(
+                    std::path::Path::new(&worker_model),
+                    tp,
+                )
+                .map_err(|e| e.to_string())
+            },
+        )?;
+        println!(
+            "[warp34 serve] QwenImage21 api_auth={} tp={} default_steps={} max_num_seqs={max_num_seqs} (dashboard/metrics/health are public)",
+            if auth_enabled { "enabled" } else { "disabled" },
+            state.worker.tp_size,
+            state.worker.default_steps,
+        );
+        crate::server::run_blocking_image_server(&bind_addr, state)
+            .map_err(|e| format!("server error: {e}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     println!(
         "[warp34 serve] loading model={model} tp={tp} kv={kv_format} speculative={spec_label} for http://{bind_addr}"
     );

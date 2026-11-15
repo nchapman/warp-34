@@ -664,18 +664,21 @@ __global__ void vae_softmax_f32_to_f16_kernel(
     for (int offset = 16; offset > 0; offset >>= 1) {
         max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffffu, max_val, offset));
     }
-    __shared__ float smem_red[8];
-    if (lane == 0) smem_red[warp_id] = max_val;
+    __shared__ float smem_max[8];
+    __shared__ float smem_sum[8];
+    __shared__ float smem_max_total;
+    __shared__ float smem_sum_total;
+    if (lane == 0) smem_max[warp_id] = max_val;
     __syncthreads();
     if (warp_id == 0) {
-        float v = (lane < 8) ? smem_red[lane] : -1e30f;
+        float v = (lane < 8) ? smem_max[lane] : -1e30f;
         for (int offset = 4; offset > 0; offset >>= 1) {
             v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
         }
-        if (lane == 0) smem_red[0] = v;
+        if (lane == 0) smem_max_total = v;
     }
     __syncthreads();
-    max_val = smem_red[0];
+    max_val = smem_max_total;
 
     float sum_exp = 0.0f;
     for (int j = tid; j < seq_len; j += 256) {
@@ -684,17 +687,17 @@ __global__ void vae_softmax_f32_to_f16_kernel(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_exp += __shfl_xor_sync(0xffffffffu, sum_exp, offset);
     }
-    if (lane == 0) smem_red[warp_id] = sum_exp;
+    if (lane == 0) smem_sum[warp_id] = sum_exp;
     __syncthreads();
     if (warp_id == 0) {
-        float v = (lane < 8) ? smem_red[lane] : 0.0f;
+        float v = (lane < 8) ? smem_sum[lane] : 0.0f;
         for (int offset = 4; offset > 0; offset >>= 1) {
             v += __shfl_xor_sync(0xffffffffu, v, offset);
         }
-        if (lane == 0) smem_red[0] = v;
+        if (lane == 0) smem_sum_total = v;
     }
     __syncthreads();
-    const float inv_sum = 1.0f / smem_red[0];
+    const float inv_sum = 1.0f / smem_sum_total;
 
     for (int j = tid; j < seq_len; j += 256) {
         p_row[j] = __float2half(__nv_expf(s_row[j] - max_val) * inv_sum);

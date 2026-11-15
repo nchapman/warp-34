@@ -1159,6 +1159,61 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                           ? "Waiting for tokens…"
                           : "Send a request to inspect the response.")}
                     </pre>
+                    {parsedResult.images && parsedResult.images.length > 0 && (
+                      <div
+                        className="pg-image-output-grid"
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns:
+                            "repeat(auto-fit, minmax(260px, 1fr))",
+                          gap: "12px",
+                          marginTop: "12px",
+                        }}
+                      >
+                        {parsedResult.images.map((src, idx) => (
+                          <figure
+                            key={idx}
+                            style={{
+                              margin: 0,
+                              padding: "8px",
+                              borderRadius: "6px",
+                              border: "1px solid var(--border, #2a2f3a)",
+                              background:
+                                "repeating-conic-gradient(#1b1f27 0% 25%, #242936 0% 50%) 50% / 16px 16px",
+                            }}
+                          >
+                            <img
+                              src={src}
+                              alt={`Generated output ${idx + 1}`}
+                              style={{
+                                width: "100%",
+                                height: "auto",
+                                display: "block",
+                                borderRadius: "4px",
+                              }}
+                            />
+                            <figcaption
+                              className="mono muted"
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                marginTop: "6px",
+                                fontSize: "12px",
+                              }}
+                            >
+                              <span>Output #{idx + 1}</span>
+                              <a
+                                href={src}
+                                download={`qwen-image-${idx + 1}.png`}
+                                style={{ color: "var(--accent, #7aa2f7)" }}
+                              >
+                                Download PNG
+                              </a>
+                            </figcaption>
+                          </figure>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   {hasAssistantReply && !inFlight && (

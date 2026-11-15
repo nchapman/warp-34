@@ -8,7 +8,11 @@ mod decision_http;
 #[cfg(feature = "cuda")]
 mod http;
 #[cfg(feature = "cuda")]
+mod image_http;
+#[cfg(feature = "cuda")]
 pub use http::*;
+#[cfg(feature = "cuda")]
+pub use image_http::*;
 
 /// Deployment controls shared by the CLI, HTTP server, and engine ingress.
 /// Authentication is opt-in; secrets deliberately have no Debug implementation.

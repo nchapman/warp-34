@@ -665,11 +665,128 @@ pub(crate) fn run_greedy_diff(
 }
 
 #[cfg(feature = "cuda")]
+fn compute_image_psnr(a: &[u8], b: &[u8]) -> Result<(f64, u8), String> {
+    if a.len() != b.len() || a.is_empty() {
+        return Err(format!(
+            "image pixel length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    let mut sum_sq = 0.0f64;
+    let mut max_diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let diff = x.abs_diff(y);
+        max_diff = max_diff.max(diff);
+        let d = diff as f64;
+        sum_sq += d * d;
+    }
+    let mse = sum_sq / (a.len() as f64);
+    let psnr = if mse <= 1e-12 {
+        99.99
+    } else {
+        10.0 * ((255.0 * 255.0) / mse).log10()
+    };
+    Ok((psnr, max_diff))
+}
+
+#[cfg(feature = "cuda")]
+fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        golden_path,
+        ..
+    } = options;
+    let condition_images =
+        crate::cli::commands::load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height, default_res) =
+        crate::server::parse_size_spec(None, image_width, image_height, &condition_images)?;
+    let resolution = if image_width.is_some() || image_height.is_some() {
+        default_res
+    } else {
+        output_resolution
+    };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| {
+        engine
+            .cfg
+            .sample_sigmas
+            .as_ref()
+            .map(|s| s.len().max(1))
+            .unwrap_or(40)
+    });
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt,
+        negative_prompt,
+        condition_images,
+        width: Some(width),
+        height: Some(height),
+        output_resolution: resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output: rgba_output || golden_path.is_some(),
+    };
+    let res = engine.generate(&req).map_err(|e| e.to_string())?;
+    if let Some(ref golden) = golden_path {
+        let bytes = std::fs::read(golden)
+            .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
+        let ref_img = crate::server::decode_condition_image_bytes(&bytes)?;
+        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, &ref_img.rgba)?;
+        println!(
+            "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} golden={golden} psnr={psnr:.2}dB max_px_diff={max_diff} total_ms={:.2}",
+            engine.tp_size(),
+            res.width,
+            res.height,
+            res.channels,
+            res.timings.total_ms,
+        );
+        if psnr < 28.0 {
+            return Err(format!(
+                "dump-diff PSNR {psnr:.2} dB below 28.0 dB threshold against '{golden}'"
+            ));
+        }
+    } else {
+        println!(
+            "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} total_ms={:.2}",
+            engine.tp_size(),
+            res.width,
+            res.height,
+            res.channels,
+            res.timings.total_ms,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_dump_diff(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if crate::cli::commands::is_qwen_image_model(&options.resolved_model) {
+        return run_qwen_image_dump_diff(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,

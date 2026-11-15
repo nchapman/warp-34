@@ -774,6 +774,9 @@ fn strict_test_env() -> bool {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_tp2_collectives_entrypoints_and_validation() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert!(Tp2Collectives::new_for_tp(1, 4096).is_err());
     assert!(Tp2Collectives::new_for_tp(3, 4096).is_err());
     if CudaDevice::count().unwrap_or(0) < 2 {

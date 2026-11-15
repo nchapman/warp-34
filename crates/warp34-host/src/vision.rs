@@ -403,7 +403,7 @@ pub fn preprocess_rgba_image_for_vision(
     )
 }
 
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u32;

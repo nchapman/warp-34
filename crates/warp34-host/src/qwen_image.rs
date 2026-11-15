@@ -31,6 +31,15 @@ pub use vae::{
     denormalize_latents_f16, normalize_latents_f16, rgba_u8_to_vae_chw_f16, vae_chw_f16_to_rgba_u8,
 };
 
+#[path = "qwen_image/pipeline.rs"]
+pub mod pipeline;
+#[cfg(feature = "cuda")]
+pub use pipeline::QwenImage21PipelineEngine;
+pub use pipeline::{
+    QwenImage21ConditionImage, QwenImage21GenerationRequest, QwenImage21GenerationResult,
+    QwenImage21GenerationTimings, compute_psnr_u8, encode_png_bytes, torch_randn_f16,
+};
+
 /// System prompt used by `QwenImage21Pipeline` in `diffusers`.
 pub const SYS_PROMPT: &str = "Comprehend and analyze the provided prompt.";
 
@@ -1634,6 +1643,9 @@ mod tests {
         use std::ffi::c_void;
         use warp34_kernels::ffi;
 
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if CudaDevice::count().unwrap_or(0) <= 0 {
             return;
         }

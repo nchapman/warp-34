@@ -5,6 +5,7 @@ export type EndpointKind =
   | "openai-responses"
   | "anthropic-messages"
   | "openai-completions"
+  | "openai-images"
   | "decisions"
   | "utility";
 
@@ -53,6 +54,7 @@ export interface ParsedToolCall {
 export interface ParsedApiResult {
   reasoning: string;
   content: string;
+  images?: string[];
   toolCalls: ParsedToolCall[];
   finishReason: string | null;
   responseId: string | null;
@@ -384,6 +386,108 @@ export const ENDPOINTS: EndpointSpec[] = [
           temperature: 0,
           logprobs: 3,
           stream: false,
+        }),
+      },
+    ],
+  },
+  {
+    id: "images-generations",
+    group: "Generative",
+    method: "POST",
+    path: "/v1/images/generations",
+    label: "POST /v1/images/generations",
+    kind: "openai-images",
+    conversational: false,
+    supportsStream: false,
+    presets: [
+      {
+        id: "t2i-turbo",
+        label: "Text-to-Image (8-Step Turbo)",
+        description: "Qwen-Image-2.1-Turbo 1024x1024 text-to-image synthesis",
+        buildBody: (model) => ({
+          model,
+          prompt:
+            "A cinematic macro photograph of a translucent mechanical watch movement on dark slate, studio lighting",
+          size: "1024x1024",
+          steps: 8,
+          guidance_scale: 1.0,
+          seed: 42,
+        }),
+      },
+      {
+        id: "t2i-rgba",
+        label: "RGBA Transparent Asset",
+        description:
+          "4-channel RGBA PNG generation via AutoencoderKLQwenImage21",
+        buildBody: (model) => ({
+          model,
+          prompt:
+            "An isometric glowing crystal potion bottle with gold filigree, isolated sticker icon with transparent background",
+          size: "1024x1024",
+          steps: 8,
+          guidance_scale: 1.0,
+          seed: 42,
+          background: "transparent",
+        }),
+      },
+      {
+        id: "t2i-cfg",
+        label: "Text-to-Image with Negative Prompt (CFG)",
+        description:
+          "Classifier-free guidance with explicit negative conditioning",
+        buildBody: (model) => ({
+          model,
+          prompt:
+            "Architectural photograph of a sunlit brutalist concrete library atrium with indoor trees",
+          negative_prompt: "blurry, low contrast, oversaturated, watermark",
+          size: "1024x1024",
+          steps: 8,
+          guidance_scale: 4.0,
+          seed: 42,
+        }),
+      },
+    ],
+  },
+  {
+    id: "images-edits",
+    group: "Generative",
+    method: "POST",
+    path: "/v1/images/edits",
+    label: "POST /v1/images/edits",
+    kind: "openai-images",
+    conversational: false,
+    supportsStream: false,
+    presets: [
+      {
+        id: "ti2i-edit",
+        label: "Single-Image Edit (TI2I)",
+        description:
+          "Condition on an input image via dual Qwen3-VL-8B + VAE latent prefix",
+        buildBody: (model) => ({
+          model,
+          prompt:
+            "Transform the checkerboard pattern into a polished stained-glass mosaic with warm amber lighting",
+          image: [SAMPLE_IMAGE_DATA_URL],
+          size: "512x512",
+          steps: 8,
+          guidance_scale: 1.0,
+          seed: 42,
+        }),
+      },
+      {
+        id: "ti2i-multi",
+        label: "Multi-Image Composition",
+        description:
+          "Condition on multiple reference images (Picture 1, Picture 2)",
+        buildBody: (model) => ({
+          model,
+          prompt:
+            "Combine the color palette of Picture 1 with the geometric structure of Picture 2 in a minimalist poster",
+          image: [SAMPLE_IMAGE_DATA_URL, SAMPLE_IMAGE_DATA_URL],
+          size: "512x512",
+          steps: 8,
+          guidance_scale: 1.0,
+          seed: 42,
         }),
       },
     ],
@@ -1214,6 +1318,44 @@ export function parseJsonResponse(
       }
     }
     extractAnthropicUsage(obj.usage, res);
+    return res;
+  }
+
+  if (kind === "openai-images") {
+    const data = Array.isArray(obj.data) ? obj.data : [];
+    const imgs: string[] = [];
+    const summaries: string[] = [];
+    for (let i = 0; i < data.length; i++) {
+      const item = data[i] as Record<string, unknown> | undefined;
+      if (!item || typeof item !== "object") continue;
+      if (typeof item.b64_json === "string" && item.b64_json.length > 0) {
+        imgs.push(`data:image/png;base64,${item.b64_json}`);
+      }
+      const w = typeof item.width === "number" ? item.width : 1024;
+      const h = typeof item.height === "number" ? item.height : 1024;
+      const ch = typeof item.channels === "number" ? item.channels : 3;
+      const steps = typeof item.steps === "number" ? item.steps : 8;
+      const seed = typeof item.seed === "number" ? item.seed : 42;
+      const timings = item.timings as Record<string, unknown> | undefined;
+      if (typeof item.steps === "number") {
+        res.usage.outputTokens = item.steps;
+      }
+      if (timings && typeof timings.total_ms === "number") {
+        summaries.push(
+          `Image #${i + 1}: ${w}x${h}x${ch} (${ch === 4 ? "RGBA" : "RGB"}) · steps=${steps} · seed=${seed} · cond=${Number(timings.condition_encode_ms ?? 0).toFixed(1)}ms · step0=${Number(timings.denoise_step0_ms ?? 0).toFixed(1)}ms · cached=${Number(timings.denoise_cached_ms ?? 0).toFixed(1)}ms · vae=${Number(timings.vae_decode_ms ?? 0).toFixed(1)}ms · total=${Number(timings.total_ms).toFixed(1)}ms`,
+        );
+      } else {
+        summaries.push(
+          `Image #${i + 1}: ${w}x${h}x${ch} (${ch === 4 ? "RGBA" : "RGB"}) · steps=${steps} · seed=${seed}`,
+        );
+      }
+    }
+    res.images = imgs;
+    res.finishReason = "completed";
+    res.content =
+      summaries.length > 0
+        ? summaries.join("\n")
+        : JSON.stringify(obj, null, 2);
     return res;
   }
 
