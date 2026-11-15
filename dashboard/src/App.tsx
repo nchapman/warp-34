@@ -577,7 +577,8 @@ export function Dashboard({ state }: { state: MetricsState }) {
             : state.connection === "offline"
               ? "Waiting to reconnect"
               : "Connecting to engine"}
-          <span className="separator">·</span>Read-only
+          <span className="separator">·</span>
+          {page === "playground" ? "Interactive console" : "Read-only"}
         </span>
       </footer>
     </div>

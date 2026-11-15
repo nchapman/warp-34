@@ -705,7 +705,7 @@ footer {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  min-width: 230px;
+  min-width: 180px;
   flex: 1;
 }
 .pg-actions {
@@ -832,6 +832,10 @@ footer {
   color: var(--muted);
   cursor: pointer;
 }
+.pg-checkbox input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
 .pg-messages-header {
   display: flex;
   justify-content: space-between;
@@ -947,8 +951,10 @@ footer {
   gap: 3px;
 }
 .pg-metrics-strip strong {
-  font-weight: 400;
+  font-weight: 500;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
 }
 .pg-parsed-view {
   display: flex;
