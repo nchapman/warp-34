@@ -24,7 +24,7 @@ All owners are **unassigned** pending maintainer acceptance. A checkbox closes o
 - [ ] **G6 — Deployment:** exact digest under production user/cache/driver; real request readiness; stall alert; shutdown, restart, key rotation, upgrade and rollback rehearsal.
 - [ ] **G7 — Sign-off/contribution:** named owner per in-scope capability, release manifest, durable artifacts, PR validation policy, no unresolved in-scope blocker, canary/rollback criteria approved.
 
-**Current CI limitation:** `.github/workflows/docker-image.yml` runs CPU checks and builds the CUDA image, but does not execute a GPU qualification job. Its CPU test step uses `cargo test --lib` and doctests, not all CPU integration tests. A green workflow is not G1/G2. Until GPU receipts are enforced automatically, the release owner must review them before creating a `v*` tag (which publishes release image tags). Do not claim this document changed branch protection or CI enforcement.
+**Current CI limitation:** `.github/workflows/docker.yml` runs CPU checks and builds the CUDA image, but does not execute a GPU qualification job. Its CPU test step uses `cargo test --lib` and doctests, not all CPU integration tests. A green workflow is not G1/G2. Until GPU receipts are enforced automatically, the release owner must review them before creating a `v*` tag (which publishes release image tags). Do not claim this document changed branch protection or CI enforcement.
 
 ## Baseline commands
 

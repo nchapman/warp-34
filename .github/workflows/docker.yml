@@ -1,4 +1,4 @@
-name: docker-image
+name: docker
 
 # CI: CPU-side checks (dashboard, rustfmt, clippy, unit/doc tests, Python suites)
 # + the multi-stage Docker image build (which compiles all CUDA kernels with nvcc
