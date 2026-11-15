@@ -162,37 +162,52 @@ def generate_synthetic_fixture(out_path: Path):
 
     # 3. Miniature AutoencoderKLQwenImage21 (base_dim=8, decoder_base_dim=8, z_dim=4, dim_mult=[1, 2, 2])
     torch.manual_seed(20260421)
-    vae = AutoencoderKLQwenImage21(
-        base_dim=8,
-        decoder_base_dim=8,
-        z_dim=4,
-        dim_mult=[1, 2, 2],
-        num_res_blocks=1,
-        attn_scales=[],
-        temperal_downsample=[False, False],
-        in_channels=4,
-        out_channels=4,
-        is_residual=True,
-        latents_mean=[0.1 * i for i in range(4)],
-        latents_std=[1.0 + 0.1 * i for i in range(4)],
-    ).eval()
+    vae = (
+        AutoencoderKLQwenImage21(
+            base_dim=8,
+            decoder_base_dim=8,
+            z_dim=4,
+            dim_mult=[1, 2, 2],
+            num_res_blocks=1,
+            attn_scales=[],
+            temperal_downsample=[False, True],
+            in_channels=4,
+            out_channels=4,
+            is_residual=True,
+            scale_factor_spatial=4,
+            latents_mean=[0.1 * i for i in range(4)],
+            latents_std=[1.0 + 0.1 * i for i in range(4)],
+        )
+        .eval()
+        .to(torch.float16)
+    )
     for k, v in vae.state_dict().items():
         tensors[f"vae.weight.{k}"] = v.contiguous()
 
-    vae_img_in = torch.randn(1, 4, 1, 16, 16, dtype=torch.float32)
+    vae_img_in = torch.randn(1, 4, 1, 16, 16, dtype=torch.float16)
     with torch.no_grad():
         vae_enc_dist = vae.encode(vae_img_in).latent_dist
         vae_z = vae_enc_dist.mode()
         vae_dec_out = vae.decode(vae_z).sample
+        vae.enable_tiling(
+            tile_sample_min_height=8,
+            tile_sample_min_width=8,
+            tile_sample_stride_height=4,
+            tile_sample_stride_width=4,
+        )
+        vae_tiled_z = vae.encode(vae_img_in).latent_dist.mode()
+        vae_tiled_dec_out = vae.decode(vae_z).sample
     tensors["vae.img_in"] = vae_img_in.contiguous()
     tensors["vae.z_mode"] = vae_z.contiguous()
     tensors["vae.dec_out"] = vae_dec_out.contiguous()
+    tensors["vae.tiled_z_mode"] = vae_tiled_z.contiguous()
+    tensors["vae.tiled_dec_out"] = vae_tiled_dec_out.contiguous()
 
     # Standalone QwenImage21RMS_norm (channel-wise RMSNorm)
-    rms = QwenImage21RMS_norm(16, images=True)
+    rms = QwenImage21RMS_norm(16, images=True).to(torch.float16)
     with torch.no_grad():
         rms.gamma.copy_(torch.randn_like(rms.gamma))
-    rms_in = torch.randn(1, 16, 8, 8, dtype=torch.float32)
+    rms_in = torch.randn(1, 16, 8, 8, dtype=torch.float16)
     with torch.no_grad():
         rms_out = rms(rms_in)
     tensors["vae.rms_gamma"] = rms.gamma.view(-1).contiguous()

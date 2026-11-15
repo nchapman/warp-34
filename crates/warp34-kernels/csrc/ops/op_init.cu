@@ -748,3 +748,95 @@ extern "C" int warp34_cublas_gemm_bf16(uintptr_t handle, const void* a, const vo
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (int)st;
 }
+
+// Row-major out [out_c, ld_out] (slice [:, 0..spatial]) = weight [out_c, k_dim] @ col [k_dim, spatial].
+// Column-major: out^T [spatial, out_c] (ldc = ld_out) = col^T [spatial, k_dim] @ weight^T [k_dim, out_c].
+extern "C" int warp34_cublas_conv_gemm_f16(
+    uintptr_t handle,
+    const void* col,
+    const void* weight,
+    void* out,
+    int spatial,
+    int out_c,
+    int k_dim,
+    int ld_out) {
+    if (handle == 0 || col == nullptr || weight == nullptr || out == nullptr ||
+        spatial <= 0 || out_c <= 0 || k_dim <= 0 || ld_out < spatial) {
+        return (int)cudaErrorInvalidValue;
+    }
+    std::lock_guard<std::mutex> lock(((Warp34Blas*)handle)->mutex);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(
+        ((Warp34Blas*)handle)->blas,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        spatial, out_c, k_dim,
+        &alpha,
+        col, CUDA_R_16F, spatial,
+        weight, CUDA_R_16F, k_dim,
+        &beta,
+        out, CUDA_R_16F, ld_out,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)st;
+}
+
+// Row-major scores [spatial, spatial] (FP32) = scale * (q_cs^T [spatial, channels] @ k_cs [channels, spatial]).
+// Column-major: scores^T [spatial, spatial] = scale * (k_cs^T [spatial, channels] @ (q_cs^T)^T [channels, spatial]).
+extern "C" int warp34_cublas_vae_qk_f16_f32(
+    uintptr_t handle,
+    const void* q_cs,
+    const void* k_cs,
+    float* scores_f32,
+    int spatial,
+    int channels,
+    float scale) {
+    if (handle == 0 || q_cs == nullptr || k_cs == nullptr || scores_f32 == nullptr ||
+        spatial <= 0 || channels <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    std::lock_guard<std::mutex> lock(((Warp34Blas*)handle)->mutex);
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(
+        ((Warp34Blas*)handle)->blas,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        spatial, spatial, channels,
+        &scale,
+        k_cs, CUDA_R_16F, spatial,
+        q_cs, CUDA_R_16F, spatial,
+        &beta,
+        scores_f32, CUDA_R_32F, spatial,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)st;
+}
+
+// Row-major out_cs [channels, spatial] = v_cs [channels, spatial] @ probs^T [spatial, spatial].
+// Column-major: out_cs^T [spatial, channels] = (probs^T)^T [spatial, spatial] @ v_cs^T [spatial, channels].
+extern "C" int warp34_cublas_vae_sv_f16(
+    uintptr_t handle,
+    const void* probs_f16,
+    const void* v_cs,
+    void* out_cs,
+    int spatial,
+    int channels) {
+    if (handle == 0 || probs_f16 == nullptr || v_cs == nullptr || out_cs == nullptr ||
+        spatial <= 0 || channels <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    std::lock_guard<std::mutex> lock(((Warp34Blas*)handle)->mutex);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(
+        ((Warp34Blas*)handle)->blas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        spatial, channels, spatial,
+        &alpha,
+        probs_f16, CUDA_R_16F, spatial,
+        v_cs, CUDA_R_16F, spatial,
+        &beta,
+        out_cs, CUDA_R_16F, spatial,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)st;
+}

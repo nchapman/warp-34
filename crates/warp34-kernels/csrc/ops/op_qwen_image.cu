@@ -424,3 +424,502 @@ extern "C" int warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
         eps);
     return (int)cudaGetLastError();
 }
+
+namespace warp34_qwen_image_vae {
+
+// 1. QwenImage21RMS_norm over channels [channels, spatial] + optional SiLU.
+// Matches PyTorch:
+//   normalized = F.normalize(x.float(), dim=1, eps=1e-12).to(x.dtype)
+//   out = normalized * sqrt(channels) * gamma
+__global__ void vae_rms_norm_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ gamma,
+    __half* __restrict__ out,
+    int channels,
+    int spatial,
+    int apply_silu) {
+    const int s = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (s >= spatial) return;
+
+    float sum_sq = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        const float v = __half2float(x[(int64_t)c * spatial + s]);
+        sum_sq += v * v;
+    }
+    const float inv_norm = 1.0f / fmaxf(sqrtf(sum_sq), 1e-12f);
+    const float scale = sqrtf((float)channels);
+
+    for (int c = 0; c < channels; ++c) {
+        const int64_t idx = (int64_t)c * spatial + s;
+        const float v = __half2float(x[idx]);
+        const __half n_h = __float2half(v * inv_norm);
+        const __half s_h = __float2half(__half2float(n_h) * scale);
+        __half o_h = __float2half(__half2float(s_h) * __half2float(gamma[c]));
+        if (apply_silu != 0) {
+            const float of = __half2float(o_h);
+            o_h = __float2half(of / (1.0f + __nv_expf(-of)));
+        }
+        out[idx] = o_h;
+    }
+}
+
+// 2. 2D im2col for horizontal output strip [oh_start .. oh_start + chunk_h]:
+//    x [in_c, h_in, w_in] -> col [in_c * k_h * k_w, chunk_h * w_out]
+__global__ void vae_im2col_f16_kernel(
+    const __half* __restrict__ x,
+    __half* __restrict__ col,
+    int in_c,
+    int h_in,
+    int w_in,
+    int k_h,
+    int k_w,
+    int pad_top,
+    int pad_left,
+    int stride_h,
+    int stride_w,
+    int oh_start,
+    int chunk_h,
+    int w_out) {
+    const int chunk_spatial = chunk_h * w_out;
+    const int k_dim = in_c * k_h * k_w;
+    const int64_t total = (int64_t)k_dim * (int64_t)chunk_spatial;
+    const int64_t idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (idx >= total) return;
+
+    const int s = (int)(idx % (int64_t)chunk_spatial);
+    const int k = (int)(idx / (int64_t)chunk_spatial);
+    const int local_oh = s / w_out;
+    const int ow = s % w_out;
+    const int oh = oh_start + local_oh;
+
+    const int kw = k % k_w;
+    const int kh = (k / k_w) % k_h;
+    const int ic = k / (k_h * k_w);
+
+    const int ih = oh * stride_h - pad_top + kh;
+    const int iw = ow * stride_w - pad_left + kw;
+    __half val = __float2half(0.0f);
+    if (ih >= 0 && ih < h_in && iw >= 0 && iw < w_in) {
+        val = x[((int64_t)ic * h_in + ih) * w_in + iw];
+    }
+    col[idx] = val;
+}
+
+// 3. Per-channel bias + optional residual add + optional [-1, 1] clamp on [channels, spatial].
+__global__ void vae_bias_residual_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ bias,
+    const __half* __restrict__ residual,
+    __half* __restrict__ out,
+    int channels,
+    int spatial,
+    int clamp_pm1) {
+    const int64_t total = (int64_t)channels * (int64_t)spatial;
+    const int64_t idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (idx >= total) return;
+
+    const int c = (int)(idx / (int64_t)spatial);
+    __half v_h = __float2half(__half2float(x[idx]) + __half2float(bias[c]));
+    if (residual != nullptr) {
+        v_h = __float2half(__half2float(v_h) + __half2float(residual[idx]));
+    }
+    if (clamp_pm1 != 0) {
+        const float vf = fminf(fmaxf(__half2float(v_h), -1.0f), 1.0f);
+        v_h = __float2half(vf);
+    }
+    out[idx] = v_h;
+}
+
+// 4. Nearest-exact 2x spatial upsample: [channels, h_in, w_in] -> [channels, 2*h_in, 2*w_in].
+__global__ void vae_upsample2d_nearest2x_f16_kernel(
+    const __half* __restrict__ x,
+    __half* __restrict__ out,
+    int channels,
+    int h_in,
+    int w_in) {
+    const int h_out = h_in * 2;
+    const int w_out = w_in * 2;
+    const int spatial_out = h_out * w_out;
+    const int64_t total = (int64_t)channels * (int64_t)spatial_out;
+    const int64_t idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (idx >= total) return;
+
+    const int c = (int)(idx / (int64_t)spatial_out);
+    const int rem = (int)(idx % (int64_t)spatial_out);
+    const int oh = rem / w_out;
+    const int ow = rem % w_out;
+    const int ih = oh >> 1;
+    const int iw = ow >> 1;
+    out[idx] = x[((int64_t)c * h_in + ih) * w_in + iw];
+}
+
+// 5. QwenImage21AvgDown3D for single-frame image (T = 1) + optional residual add:
+//    x [in_c, h_in, w_in] -> out [out_c, h_in / factor_s, w_in / factor_s]
+__global__ void vae_avg_down_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ residual,
+    __half* __restrict__ out,
+    int in_c,
+    int out_c,
+    int h_in,
+    int w_in,
+    int factor_t,
+    int factor_s) {
+    const int h_out = h_in / factor_s;
+    const int w_out = w_in / factor_s;
+    const int spatial_out = h_out * w_out;
+    const int64_t total = (int64_t)out_c * (int64_t)spatial_out;
+    const int64_t idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (idx >= total) return;
+
+    const int oc = (int)(idx / (int64_t)spatial_out);
+    const int rem_s = (int)(idx % (int64_t)spatial_out);
+    const int oh = rem_s / w_out;
+    const int ow = rem_s % w_out;
+
+    const int fs2 = factor_s * factor_s;
+    const int factor = factor_t * fs2;
+    const int group_size = (in_c * factor) / out_c;
+
+    float acc = 0.0f;
+    for (int k = 0; k < group_size; ++k) {
+        const int flat = oc * group_size + k;
+        const int ic = flat / factor;
+        const int rem = flat % factor;
+        const int t_idx = rem / fs2;
+        if (t_idx == factor_t - 1) {
+            const int sh = (rem / factor_s) % factor_s;
+            const int sw = rem % factor_s;
+            const int ih = oh * factor_s + sh;
+            const int iw = ow * factor_s + sw;
+            acc += __half2float(x[((int64_t)ic * h_in + ih) * w_in + iw]);
+        }
+    }
+    __half v_h = __float2half(acc / (float)group_size);
+    if (residual != nullptr) {
+        v_h = __float2half(__half2float(v_h) + __half2float(residual[idx]));
+    }
+    out[idx] = v_h;
+}
+
+// 6. QwenImage21DupUp3D(first_chunk=True) for single-frame image (T = 1) + optional residual add:
+//    x [in_c, h_in, w_in] -> out [out_c, h_in * factor_s, w_in * factor_s]
+__global__ void vae_dup_up_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ residual,
+    __half* __restrict__ out,
+    int in_c,
+    int out_c,
+    int h_in,
+    int w_in,
+    int factor_t,
+    int factor_s) {
+    const int h_out = h_in * factor_s;
+    const int w_out = w_in * factor_s;
+    const int spatial_out = h_out * w_out;
+    const int64_t total = (int64_t)out_c * (int64_t)spatial_out;
+    const int64_t idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (idx >= total) return;
+
+    const int oc = (int)(idx / (int64_t)spatial_out);
+    const int rem_s = (int)(idx % (int64_t)spatial_out);
+    const int oh = rem_s / w_out;
+    const int ow = rem_s % w_out;
+    const int ih = oh / factor_s;
+    const int iw = ow / factor_s;
+    const int sh = oh % factor_s;
+    const int sw = ow % factor_s;
+
+    const int factor = factor_t * factor_s * factor_s;
+    const int repeats = (out_c * factor) / in_c;
+    const int rep_c = ((oc * factor_t + (factor_t - 1)) * factor_s + sh) * factor_s + sw;
+    const int ic = rep_c / repeats;
+
+    __half v_h = x[((int64_t)ic * h_in + ih) * w_in + iw];
+    if (residual != nullptr) {
+        v_h = __float2half(__half2float(v_h) + __half2float(residual[idx]));
+    }
+    out[idx] = v_h;
+}
+
+// 7. Row-wise softmax over [seq_len, seq_len]: FP32 scores -> FP16 probabilities.
+//    1 CTA (256 threads = 8 warps) per row.
+__global__ void vae_softmax_f32_to_f16_kernel(
+    const float* __restrict__ scores,
+    __half* __restrict__ probs,
+    int seq_len) {
+    const int row = (int)blockIdx.x;
+    if (row >= seq_len) return;
+    const int tid = (int)threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const float* s_row = scores + (int64_t)row * seq_len;
+    __half* p_row = probs + (int64_t)row * seq_len;
+
+    float max_val = -1e30f;
+    for (int j = tid; j < seq_len; j += 256) {
+        max_val = fmaxf(max_val, s_row[j]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffffu, max_val, offset));
+    }
+    __shared__ float smem_red[8];
+    if (lane == 0) smem_red[warp_id] = max_val;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane < 8) ? smem_red[lane] : -1e30f;
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
+        }
+        if (lane == 0) smem_red[0] = v;
+    }
+    __syncthreads();
+    max_val = smem_red[0];
+
+    float sum_exp = 0.0f;
+    for (int j = tid; j < seq_len; j += 256) {
+        sum_exp += __nv_expf(s_row[j] - max_val);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_exp += __shfl_xor_sync(0xffffffffu, sum_exp, offset);
+    }
+    if (lane == 0) smem_red[warp_id] = sum_exp;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane < 8) ? smem_red[lane] : 0.0f;
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, offset);
+        }
+        if (lane == 0) smem_red[0] = v;
+    }
+    __syncthreads();
+    const float inv_sum = 1.0f / smem_red[0];
+
+    for (int j = tid; j < seq_len; j += 256) {
+        p_row[j] = __float2half(__nv_expf(s_row[j] - max_val) * inv_sum);
+    }
+}
+
+} // namespace warp34_qwen_image_vae
+
+extern "C" int warp34_qwen_image_vae_rms_norm_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* gamma,
+    void* out,
+    int channels,
+    int spatial,
+    int apply_silu) {
+    if (ex == nullptr || x == nullptr || gamma == nullptr || out == nullptr ||
+        channels <= 0 || spatial < 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (spatial == 0) return 0;
+    const int threads = 256;
+    const int blocks = (spatial + threads - 1) / threads;
+    warp34_qwen_image_vae::vae_rms_norm_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (const __half*)gamma,
+        (__half*)out,
+        channels,
+        spatial,
+        apply_silu);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_im2col_f16(
+    const warp34_exec* ex,
+    const void* x,
+    void* col,
+    int in_c,
+    int h_in,
+    int w_in,
+    int k_h,
+    int k_w,
+    int pad_top,
+    int pad_left,
+    int stride_h,
+    int stride_w,
+    int oh_start,
+    int chunk_h,
+    int w_out) {
+    if (ex == nullptr || x == nullptr || col == nullptr ||
+        in_c <= 0 || h_in <= 0 || w_in <= 0 || k_h <= 0 || k_w <= 0 ||
+        stride_h <= 0 || stride_w <= 0 || oh_start < 0 || chunk_h < 0 || w_out <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int64_t total = (int64_t)in_c * k_h * k_w * (int64_t)chunk_h * w_out;
+    if (total == 0) return 0;
+    if (total > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    warp34_qwen_image_vae::vae_im2col_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (__half*)col,
+        in_c,
+        h_in,
+        w_in,
+        k_h,
+        k_w,
+        pad_top,
+        pad_left,
+        stride_h,
+        stride_w,
+        oh_start,
+        chunk_h,
+        w_out);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_bias_residual_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* bias,
+    const void* residual,
+    void* out,
+    int channels,
+    int spatial,
+    int clamp_pm1) {
+    if (ex == nullptr || x == nullptr || bias == nullptr || out == nullptr ||
+        channels <= 0 || spatial < 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int64_t total = (int64_t)channels * (int64_t)spatial;
+    if (total == 0) return 0;
+    if (total > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    warp34_qwen_image_vae::vae_bias_residual_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (const __half*)bias,
+        (const __half*)residual,
+        (__half*)out,
+        channels,
+        spatial,
+        clamp_pm1);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_upsample2d_nearest2x_f16(
+    const warp34_exec* ex,
+    const void* x,
+    void* out,
+    int channels,
+    int h_in,
+    int w_in) {
+    if (ex == nullptr || x == nullptr || out == nullptr ||
+        channels <= 0 || h_in < 0 || w_in < 0 ||
+        (int64_t)h_in * 2 > INT_MAX || (int64_t)w_in * 2 > INT_MAX) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int64_t total = (int64_t)channels * ((int64_t)h_in * 2) * ((int64_t)w_in * 2);
+    if (total == 0) return 0;
+    if (total > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    warp34_qwen_image_vae::vae_upsample2d_nearest2x_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (__half*)out,
+        channels,
+        h_in,
+        w_in);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_avg_down_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* residual,
+    void* out,
+    int in_c,
+    int out_c,
+    int h_in,
+    int w_in,
+    int factor_t,
+    int factor_s) {
+    if (ex == nullptr || x == nullptr || out == nullptr ||
+        in_c <= 0 || out_c <= 0 || h_in <= 0 || w_in <= 0 ||
+        factor_t <= 0 || factor_s <= 0 ||
+        (int64_t)factor_t * factor_s > INT_MAX ||
+        (int64_t)factor_t * factor_s * factor_s > INT_MAX ||
+        (int64_t)in_c * factor_t * factor_s * factor_s > INT_MAX ||
+        (h_in % factor_s) != 0 || (w_in % factor_s) != 0 ||
+        (((int64_t)in_c * factor_t * factor_s * factor_s) % out_c) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int h_out = h_in / factor_s;
+    const int w_out = w_in / factor_s;
+    const int64_t total = (int64_t)out_c * (int64_t)h_out * (int64_t)w_out;
+    if (total > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    warp34_qwen_image_vae::vae_avg_down_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (const __half*)residual,
+        (__half*)out,
+        in_c,
+        out_c,
+        h_in,
+        w_in,
+        factor_t,
+        factor_s);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_dup_up_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* residual,
+    void* out,
+    int in_c,
+    int out_c,
+    int h_in,
+    int w_in,
+    int factor_t,
+    int factor_s) {
+    if (ex == nullptr || x == nullptr || out == nullptr ||
+        in_c <= 0 || out_c <= 0 || h_in <= 0 || w_in <= 0 ||
+        factor_t <= 0 || factor_s <= 0 ||
+        (int64_t)h_in * factor_s > INT_MAX || (int64_t)w_in * factor_s > INT_MAX ||
+        (int64_t)factor_t * factor_s > INT_MAX ||
+        (int64_t)factor_t * factor_s * factor_s > INT_MAX ||
+        (int64_t)out_c * factor_t * factor_s * factor_s > INT_MAX ||
+        (((int64_t)out_c * factor_t * factor_s * factor_s) % in_c) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int h_out = h_in * factor_s;
+    const int w_out = w_in * factor_s;
+    const int64_t total = (int64_t)out_c * (int64_t)h_out * (int64_t)w_out;
+    if (total > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    warp34_qwen_image_vae::vae_dup_up_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x,
+        (const __half*)residual,
+        (__half*)out,
+        in_c,
+        out_c,
+        h_in,
+        w_in,
+        factor_t,
+        factor_s);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_softmax_f32_to_f16(
+    const warp34_exec* ex,
+    const float* scores,
+    void* probs,
+    int seq_len) {
+    if (ex == nullptr || scores == nullptr || probs == nullptr || seq_len < 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (seq_len == 0) return 0;
+    warp34_qwen_image_vae::vae_softmax_f32_to_f16_kernel<<<seq_len, 256, 0, (cudaStream_t)ex->stream>>>(
+        scores,
+        (__half*)probs,
+        seq_len);
+    return (int)cudaGetLastError();
+}
+

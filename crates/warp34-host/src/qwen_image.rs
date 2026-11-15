@@ -22,6 +22,15 @@ pub use transformer::{
 };
 pub use transformer::{euler_cfg_step_f16, pack_latents_chw_to_hwc, unpack_latents_hwc_to_chw};
 
+#[cfg(feature = "cuda")]
+#[path = "qwen_image/vae.rs"]
+pub mod vae;
+#[cfg(feature = "cuda")]
+pub use vae::{
+    QwenImage21VaeEngine, QwenImage21VaeTilingConfig, QwenImage21VaeWeightsGpu,
+    denormalize_latents_f16, normalize_latents_f16, rgba_u8_to_vae_chw_f16, vae_chw_f16_to_rgba_u8,
+};
+
 /// System prompt used by `QwenImage21Pipeline` in `diffusers`.
 pub const SYS_PROMPT: &str = "Comprehend and analyze the provided prompt.";
 
@@ -1940,5 +1949,170 @@ mod tests {
                 "2-GPU TP=2 cached max diff {diff_hw_cached} exceeded 5e-3"
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_qwen_image_vae_encode_decode_and_tiling_match_oracle() {
+        use crate::cuda::{
+            CudaDevice, CudaStream, DeviceBuffer, f16_to_f32, f32_to_f16, prepare_execution_plan,
+        };
+        use crate::qwen_image::vae::{
+            QwenImage21VaeEngine, QwenImage21VaeTilingConfig, QwenImage21VaeWeightsGpu,
+            denormalize_latents_f16, normalize_latents_f16, rgba_u8_to_vae_chw_f16,
+            vae_chw_f16_to_rgba_u8,
+        };
+        use core::ffi::c_void;
+        use warp34_kernels::ffi;
+
+        if CudaDevice::count().unwrap_or(0) < 1 {
+            return;
+        }
+        prepare_execution_plan(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex = stream.exec(0, 0);
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/fixtures/qwen_image_ops.safetensors");
+        let arch = SafetensorsArchive::open(&fixture).unwrap();
+        let load_f16 = |name: &str| -> Vec<u16> { arch.read_f16_bits(name).unwrap() };
+        let max_diff = |got: &[u16], exp_name: &str| -> f32 {
+            let exp = load_f16(exp_name);
+            assert_eq!(got.len(), exp.len(), "length mismatch vs {exp_name}");
+            got.iter()
+                .zip(exp.iter())
+                .map(|(&g, &e)| (f16_to_f32(g) - f16_to_f32(e)).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // 1. Standalone QwenImage21RMS_norm (16 channels, 8x8 = 64 spatial)
+        let rms_in = load_f16("vae.rms_in");
+        let rms_gamma = load_f16("vae.rms_gamma");
+        let d_rms_in = DeviceBuffer::alloc(0, rms_in.len() * 2).unwrap();
+        let d_rms_gamma = DeviceBuffer::alloc(0, rms_gamma.len() * 2).unwrap();
+        let d_rms_out = DeviceBuffer::alloc(0, rms_in.len() * 2).unwrap();
+        // SAFETY: host and device buffers are valid and sized for `rms_in` / `rms_gamma`.
+        unsafe {
+            ffi::warp34_memcpy_h2d_async(
+                d_rms_in.ptr,
+                rms_in.as_ptr() as *const c_void,
+                rms_in.len() * 2,
+                stream.handle,
+            );
+            ffi::warp34_memcpy_h2d_async(
+                d_rms_gamma.ptr,
+                rms_gamma.as_ptr() as *const c_void,
+                rms_gamma.len() * 2,
+                stream.handle,
+            );
+        }
+        // SAFETY: `d_rms_in`, `d_rms_gamma`, and `d_rms_out` are valid device allocations on `ex.stream`.
+        let rc = unsafe {
+            ffi::warp34_qwen_image_vae_rms_norm_f16(
+                &ex,
+                d_rms_in.ptr as *const c_void,
+                d_rms_gamma.ptr as *const c_void,
+                d_rms_out.ptr,
+                16,
+                64,
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut h_rms_out = vec![0u16; rms_in.len()];
+        // SAFETY: `h_rms_out` and `d_rms_out` hold `rms_in.len() * 2` bytes.
+        unsafe {
+            ffi::warp34_memcpy_d2h_async(
+                h_rms_out.as_mut_ptr() as *mut c_void,
+                d_rms_out.ptr as *const c_void,
+                rms_in.len() * 2,
+                stream.handle,
+            );
+        }
+        stream.synchronize().unwrap();
+        let diff_rms = max_diff(&h_rms_out, "vae.rms_out");
+        assert!(
+            diff_rms < 1e-4,
+            "vae.rms_out max diff {diff_rms} exceeded 1e-4"
+        );
+
+        // 2. Full AutoencoderKLQwenImage21 untiled encode & decode
+        let cfg = QwenImage21VaeConfig {
+            base_dim: 8,
+            decoder_base_dim: 8,
+            z_dim: 4,
+            dim_mult: vec![1, 2, 2],
+            num_res_blocks: 1,
+            attn_scales: Vec::new(),
+            temperal_downsample: vec![false, true],
+            in_channels: 4,
+            out_channels: 4,
+            is_residual: true,
+            latents_mean: (0..4).map(|i| 0.1 * (i as f32)).collect(),
+            latents_std: (0..4).map(|i| 1.0 + 0.1 * (i as f32)).collect(),
+        };
+        let weights = QwenImage21VaeWeightsGpu::from_archive(&arch, &cfg, "vae.weight", 0).unwrap();
+        let mut engine = QwenImage21VaeEngine::new(weights).unwrap();
+
+        let img_in = load_f16("vae.img_in");
+        let z_mode = engine.encode_mode(&img_in, 16, 16).unwrap();
+        let diff_z = max_diff(&z_mode, "vae.z_mode");
+        assert!(
+            diff_z < 5e-3,
+            "untiled vae.z_mode max diff {diff_z} exceeded 5e-3"
+        );
+
+        let z_oracle = load_f16("vae.z_mode");
+        let dec_out = engine.decode(&z_oracle, 4, 4).unwrap();
+        let diff_dec = max_diff(&dec_out, "vae.dec_out");
+        assert!(
+            diff_dec < 5e-3,
+            "untiled vae.dec_out max diff {diff_dec} exceeded 5e-3"
+        );
+
+        // 3. Full AutoencoderKLQwenImage21 tiled encode & decode (8x8 tiles, stride 4x4)
+        engine.set_tiling(QwenImage21VaeTilingConfig {
+            enabled: true,
+            tile_sample_min_height: 8,
+            tile_sample_min_width: 8,
+            tile_sample_stride_height: 4,
+            tile_sample_stride_width: 4,
+        });
+        let tiled_z_mode = engine.encode_mode(&img_in, 16, 16).unwrap();
+        let diff_tiled_z = max_diff(&tiled_z_mode, "vae.tiled_z_mode");
+        assert!(
+            diff_tiled_z < 5e-3,
+            "tiled vae.tiled_z_mode max diff {diff_tiled_z} exceeded 5e-3"
+        );
+
+        let tiled_dec_out = engine.decode(&z_oracle, 4, 4).unwrap();
+        let diff_tiled_dec = max_diff(&tiled_dec_out, "vae.tiled_dec_out");
+        assert!(
+            diff_tiled_dec < 5e-3,
+            "tiled vae.tiled_dec_out max diff {diff_tiled_dec} exceeded 5e-3"
+        );
+
+        // 4. Latent normalization/denormalization and RGBA conversion helpers
+        let z_norm = normalize_latents_f16(
+            &z_oracle,
+            cfg.z_dim,
+            16,
+            &cfg.latents_mean,
+            &cfg.latents_std,
+        );
+        let z_denorm =
+            denormalize_latents_f16(&z_norm, cfg.z_dim, 16, &cfg.latents_mean, &cfg.latents_std);
+        for (&orig, &rt) in z_oracle.iter().zip(z_denorm.iter()) {
+            let err = (f16_to_f32(orig) - f16_to_f32(rt)).abs();
+            assert!(err < 5e-3, "latent norm/denorm roundtrip error {err}");
+        }
+
+        let rgba_in: Vec<u8> = (0..64).map(|i| (i * 4) as u8).collect();
+        let vae_chw = rgba_u8_to_vae_chw_f16(&rgba_in, 4, 4);
+        let rgba_rt = vae_chw_f16_to_rgba_u8(&vae_chw, 4, 4, true);
+        assert_eq!(rgba_in, rgba_rt);
+        let rgb_rt = vae_chw_f16_to_rgba_u8(&vae_chw, 4, 4, false);
+        assert_eq!(rgb_rt.len(), 4 * 4 * 3);
+        let _ = f32_to_f16(0.0);
     }
 }

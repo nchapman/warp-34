@@ -965,6 +965,39 @@ int warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
     void* q_out, void* k_out, void* cache_k_out,
     int num_tokens, int num_heads, int cache_write_len, float eps);
 
+int warp34_cublas_conv_gemm_f16(
+    uintptr_t handle, const void* col, const void* weight, void* out,
+    int spatial, int out_c, int k_dim, int ld_out);
+int warp34_cublas_vae_qk_f16_f32(
+    uintptr_t handle, const void* q_cs, const void* k_cs, float* scores_f32,
+    int spatial, int channels, float scale);
+int warp34_cublas_vae_sv_f16(
+    uintptr_t handle, const void* probs_f16, const void* v_cs, void* out_cs,
+    int spatial, int channels);
+
+int warp34_qwen_image_vae_rms_norm_f16(
+    const warp34_exec* ex, const void* x, const void* gamma, void* out,
+    int channels, int spatial, int apply_silu);
+int warp34_qwen_image_vae_im2col_f16(
+    const warp34_exec* ex, const void* x, void* col,
+    int in_c, int h_in, int w_in, int k_h, int k_w,
+    int pad_top, int pad_left, int stride_h, int stride_w,
+    int oh_start, int chunk_h, int w_out);
+int warp34_qwen_image_vae_bias_residual_f16(
+    const warp34_exec* ex, const void* x, const void* bias,
+    const void* residual, void* out, int channels, int spatial, int clamp_pm1);
+int warp34_qwen_image_vae_upsample2d_nearest2x_f16(
+    const warp34_exec* ex, const void* x, void* out,
+    int channels, int h_in, int w_in);
+int warp34_qwen_image_vae_avg_down_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s);
+int warp34_qwen_image_vae_dup_up_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s);
+int warp34_qwen_image_vae_softmax_f32_to_f16(
+    const warp34_exec* ex, const float* scores, void* probs, int seq_len);
+
 #ifdef __cplusplus
 }
 #endif
