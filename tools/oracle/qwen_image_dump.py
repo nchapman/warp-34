@@ -160,6 +160,75 @@ def generate_synthetic_fixture(out_path: Path):
     tensors["dit.cache_l0_k"] = kv_cache.get_layer(0).k.contiguous()
     tensors["dit.cache_l0_v"] = kv_cache.get_layer(0).v.contiguous()
 
+    # 2b. Multi-image conditioning (2 condition images [(1,2,2), (1,2,3)] + target (1,2,4))
+    # + 3-step Euler + CFG (true_cfg_scale=4.0) with asymmetric positive vs negative prompt lengths.
+    multi_img_shapes = [(1, 2, 2), (1, 2, 3), (1, 2, 4)]
+    # Positive VLM sequence: [txt, img1_slot(1->4), txt, img2_slot(2->8, truncated to 6 by img_shapes? No: in QwenImage21,
+    # vlm_img_mask has 1 bool per VLM token, and each True expands by 4x! Wait: in QwenImage21TransformerEngine,
+    # vlm_img_mask is already the expanded image_pad_mask of length text_tokens + sum(img_shapes)!)
+    # Let's check how dit() uses img_mask: in diffusers, encoder_hidden_states has 1 token per VLM vision token
+    # (so 1 VLM token -> 4 DiT image tokens after 2x2 repeat_interleave).
+    # So for img_shapes=[(1,2,2), (1,4,2), (1,2,4)] (4, 8, 8 tokens = 1, 2, 2 VLM image slots):
+    multi_img_shapes = [(1, 2, 2), (1, 4, 2), (1, 2, 4)]
+    pos_enc_hidden = torch.randn(1, 6, 64, dtype=torch.float16)  # 3 text + 1 img1 + 2 img2
+    pos_img_mask = torch.tensor(
+        [[False, True, False, True, True, False, True, True]], dtype=torch.bool
+    )
+    neg_enc_hidden = torch.randn(1, 4, 64, dtype=torch.float16)  # 1 text + 1 img1 + 2 img2
+    neg_img_mask = torch.tensor(
+        [[False, True, True, True, True, True]], dtype=torch.bool
+    )
+    multi_cond_latents = torch.randn(1, 12, 8, dtype=torch.float16)  # 4 + 8 = 12 cond tokens
+    multi_init_latents = torch.randn(1, 8, 8, dtype=torch.float16)
+    cfg_timesteps = [0.978453, 0.845148, 0.422574]
+    cfg_sigmas = [1.0, 0.7, 0.3, 0.0]
+    cfg_scale = 4.0
+
+    pos_kv = QwenImage21KVCache(num_layers=1)
+    neg_kv = QwenImage21KVCache(num_layers=1)
+    sample = multi_init_latents.clone()
+    with torch.no_grad():
+        for step_idx, t_val in enumerate(cfg_timesteps):
+            t_ten = torch.tensor([t_val], dtype=torch.float16)
+            mode = "extract" if step_idx == 0 else "cached"
+            h_in = torch.cat([multi_cond_latents, sample], dim=1)
+            cond_pred = dit(
+                hidden_states=h_in,
+                encoder_hidden_states=pos_enc_hidden,
+                timestep=t_ten,
+                img_shapes=[multi_img_shapes],
+                img_mask=pos_img_mask,
+                kv_cache=pos_kv,
+                kv_cache_mode=mode,
+                return_dict=False,
+            )[0][:, -8:]
+            if step_idx == 0:
+                multi_extract_target = cond_pred.clone()
+            uncond_pred = dit(
+                hidden_states=h_in,
+                encoder_hidden_states=neg_enc_hidden,
+                timestep=t_ten,
+                img_shapes=[multi_img_shapes],
+                img_mask=neg_img_mask,
+                kv_cache=neg_kv,
+                kv_cache_mode=mode,
+                return_dict=False,
+            )[0][:, -8:]
+            # Match QwenImage21Pipeline normed CFG + Euler step
+            comb = uncond_pred.float() + cfg_scale * (cond_pred.float() - uncond_pred.float())
+            cond_norm = torch.linalg.vector_norm(cond_pred.float(), dim=-1, keepdim=True)
+            comb_norm = torch.linalg.vector_norm(comb, dim=-1, keepdim=True)
+            pred = (comb * (cond_norm / (comb_norm + 1e-12))).to(torch.float16)
+            dt = cfg_sigmas[step_idx + 1] - cfg_sigmas[step_idx]
+            sample = (sample.float() + dt * pred.float()).to(torch.float16)
+
+    tensors["dit.multi.pos_enc_hidden"] = pos_enc_hidden.contiguous()
+    tensors["dit.multi.neg_enc_hidden"] = neg_enc_hidden.contiguous()
+    tensors["dit.multi.cond_latents"] = multi_cond_latents.contiguous()
+    tensors["dit.multi.init_latents"] = multi_init_latents.contiguous()
+    tensors["dit.multi.extract_target"] = multi_extract_target.contiguous()
+    tensors["dit.multi.final_latents"] = sample.contiguous()
+
     # 3. Miniature AutoencoderKLQwenImage21 (base_dim=8, decoder_base_dim=8, z_dim=4, dim_mult=[1, 2, 2])
     torch.manual_seed(20260421)
     vae = (
@@ -213,6 +282,49 @@ def generate_synthetic_fixture(out_path: Path):
     tensors["vae.rms_gamma"] = rms.gamma.view(-1).contiguous()
     tensors["vae.rms_in"] = rms_in.contiguous()
     tensors["vae.rms_out"] = rms_out.contiguous()
+
+    # 3b. 5-stage AutoencoderKLQwenImage21 (dim_mult=[1, 2, 4, 4, 4]) high-dynamic-range overflow test:
+    # Simulates the exact `alpha = 0` transparent RGBA decoder regime where `up_blocks.2` and `up_blocks.3`
+    # amplify the residual highway past `65,504.0` (`~1.5e6` in BF16/FP32) before `decoder.norm_out` (`RMSNorm`)
+    # normalizes it back to `O(1)`. Unscaled FP16 overflows to `Inf -> NaN`; rescaled FP16 matches BF16/FP32.
+    torch.manual_seed(20260423)
+    vae5 = (
+        AutoencoderKLQwenImage21(
+            base_dim=4,
+            decoder_base_dim=4,
+            z_dim=4,
+            dim_mult=[1, 2, 4, 4, 4],
+            num_res_blocks=1,
+            attn_scales=[],
+            temperal_downsample=[False, False, True, True],
+            in_channels=4,
+            out_channels=4,
+            is_residual=True,
+            scale_factor_spatial=16,
+            latents_mean=[0.0] * 4,
+            latents_std=[1.0] * 4,
+        )
+        .eval()
+        .to(torch.float32)
+    )
+    with torch.no_grad():
+        vae5.decoder.up_blocks[2].resnets[1].conv2.weight.normal_(mean=0.0, std=25.0)
+        vae5.decoder.up_blocks[2].upsampler.resample[1].weight.normal_(mean=0.0, std=4.0)
+        vae5.decoder.up_blocks[3].upsampler.resample[1].weight.normal_(mean=0.0, std=4.0)
+    vae5_z = torch.randn(1, 4, 1, 2, 2, dtype=torch.float16) * 4.0
+    with torch.no_grad():
+        # Reference output in FP32 (from FP16 weights):
+        vae5_f16_state = {k: v.half().contiguous() for k, v in vae5.state_dict().items()}
+        vae5.load_state_dict({k: v.float() for k, v in vae5_f16_state.items()})
+        vae5_dec_oracle = vae5.decode(vae5_z.float()).sample.to(torch.float16)
+        assert torch.isfinite(vae5_dec_oracle).all()
+        # Verify unscaled FP16 indeed overflows to NaN on this fixture:
+        unscaled_out = vae5.half().decode(vae5_z).sample
+        assert not torch.isfinite(unscaled_out).all(), "expected unscaled FP16 5-stage VAE to overflow"
+    for k, v in vae5_f16_state.items():
+        tensors[f"vae5.weight.{k}"] = v.contiguous()
+    tensors["vae5.z_in"] = vae5_z.contiguous()
+    tensors["vae5.dec_out"] = vae5_dec_oracle.contiguous()
 
     # 4. Qwen3-VL full-head mRoPE [24, 20, 20] at theta=5_000_000.0
     pos_3d = torch.tensor(
@@ -316,9 +428,135 @@ def generate_synthetic_fixture(out_path: Path):
     tensors["vl.mm_vis_deepstack_1"] = vis_out.deepstack_features[1].contiguous()
     tensors["vl.mm_pre_norm"] = captured["pre_norm"].squeeze(0).contiguous()
 
+    # 5c. Multi-image conditioning forward pass (2 images: 1x4x4=16 patches -> 4 tokens, 1x2x4=8 patches -> 2 tokens)
+    hook_handle2 = vl_model.language_model.norm.register_forward_pre_hook(_capture_pre_norm)
+    mm2_ids = torch.tensor([[1, 10, 10, 10, 10, 2, 10, 10, 3]], dtype=torch.long)
+    mm2_token_type_ids = (mm2_ids == 10).long()
+    mm2_pixel_values = torch.randn(24, 1536, dtype=torch.float16)
+    mm2_grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.long)
+    with torch.no_grad():
+        vl_model(
+            input_ids=mm2_ids,
+            pixel_values=mm2_pixel_values,
+            image_grid_thw=mm2_grid_thw,
+            mm_token_type_ids=mm2_token_type_ids,
+        )
+    hook_handle2.remove()
+    tensors["vl.mm2_input_ids"] = mm2_ids.view(-1).to(torch.int32).contiguous()
+    tensors["vl.mm2_pixel_values_1"] = mm2_pixel_values[:16].to(torch.float32).contiguous()
+    tensors["vl.mm2_pixel_values_2"] = mm2_pixel_values[16:].to(torch.float32).contiguous()
+    tensors["vl.mm2_pre_norm"] = captured["pre_norm"].squeeze(0).contiguous()
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_file(tensors, str(out_path))
     print(f"Wrote {len(tensors)} oracle tensors to {out_path}")
+
+
+def generate_real_golden_suite(out_dir: Path):
+    load_deps()
+    from diffusers import QwenImage21Pipeline
+    from PIL import Image
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prompt = "A serene alpine lake at golden hour reflecting snow-capped peaks, crisp foreground wildflowers, photorealistic 8k"
+    coco_raw = Image.open("tools/oracle/fixtures/coco_sample.png")
+    coco_576 = coco_raw.convert("RGBA").resize((576, 448), Image.Resampling.LANCZOS)
+    coco_576.save(out_dir / "coco_576x448.png")
+    coco_512 = coco_raw.convert("RGBA").resize((512, 512), Image.Resampling.LANCZOS)
+    coco_512.save(out_dir / "coco_512x512.png")
+
+    pipe = QwenImage21Pipeline.from_pretrained(
+        "Qwen/Qwen-Image-2.1-Turbo", dtype=torch.float16, local_files_only=True
+    )
+    pipe.enable_model_cpu_offload()
+
+    # 1. T2I 512x512 RGB
+    g = torch.Generator("cpu").manual_seed(42)
+    img_512 = pipe(prompt=prompt, width=512, height=512, num_inference_steps=8, generator=g).images[0]
+    img_512.convert("RGB").save(out_dir / "turbo_512.png")
+
+    # 2. T2I 768x512 Non-Square
+    g = torch.Generator("cpu").manual_seed(42)
+    img_768x512 = pipe(prompt=prompt, width=768, height=512, num_inference_steps=8, generator=g).images[0]
+    img_768x512.convert("RGB").save(out_dir / "turbo_768x512.png")
+
+    # 3. Single-image edit on raw 640x480 COCO -> 576x448 @ res=512
+    g = torch.Generator("cpu").manual_seed(42)
+    img_raw_edit = pipe(
+        prompt="Turn this scene into a watercolor painting",
+        image=[coco_raw],
+        width=576,
+        height=448,
+        output_resolution=512,
+        num_inference_steps=8,
+        generator=g,
+    ).images[0]
+    img_raw_edit.convert("RGB").save(out_dir / "diffusers_raw_640x480_edit.png")
+
+    # 4. Multi-image edit on [512x512, 576x448] -> 512x512
+    g = torch.Generator("cpu").manual_seed(123)
+    img_multi_edit = pipe(
+        prompt="Combine lighting from image 2 onto image 1",
+        image=[coco_512, coco_576],
+        width=512,
+        height=512,
+        output_resolution=512,
+        num_inference_steps=8,
+        generator=g,
+    ).images[0]
+    img_multi_edit.convert("RGB").save(out_dir / "diffusers_512_576_seed123.png")
+    del pipe
+    torch.cuda.empty_cache()
+
+    # 5. RGBA 1024x1024 transparent T2I + RGBA single-image edit (BF16 VAE reference)
+    pipe_bf16 = QwenImage21Pipeline.from_pretrained(
+        "Qwen/Qwen-Image-2.1-Turbo", dtype=torch.bfloat16, local_files_only=True
+    )
+    pipe_bf16.enable_model_cpu_offload()
+    g = torch.Generator("cpu").manual_seed(42)
+    out_rgba = pipe_bf16(
+        prompt="This is an RGBA image with transparency. A cute isometric 3D icon of a glowing crystal potion bottle with a cork stopper. The image has alpha channel and the background is transparent.",
+        width=1024,
+        height=1024,
+        output_resolution=1024,
+        num_inference_steps=8,
+        true_cfg_scale=1.0,
+        generator=g,
+    ).images[0]
+    out_rgba.save(out_dir / "diffusers_rgba_transparent_1024.png")
+
+    g = torch.Generator("cpu").manual_seed(42)
+    out_edit_rgba = pipe_bf16(
+        image=[out_rgba],
+        prompt="Change the glowing potion inside the crystal bottle from purple to bright emerald green and add golden runes etched on the glass",
+        width=1024,
+        height=1024,
+        output_resolution=1024,
+        num_inference_steps=8,
+        true_cfg_scale=1.0,
+        generator=g,
+    ).images[0]
+    out_edit_rgba.save(out_dir / "diffusers_rgba_edit_1024.png")
+    del pipe_bf16
+    torch.cuda.empty_cache()
+
+    # 6. Standard Qwen-Image-2.1 CFG=4.0 + empty negative_prompt
+    pipe_std = QwenImage21Pipeline.from_pretrained(
+        "Qwen/Qwen-Image-2.1", dtype=torch.float16, local_files_only=True
+    )
+    pipe_std.enable_model_cpu_offload()
+    g = torch.Generator("cpu").manual_seed(42)
+    img_cfg = pipe_std(
+        prompt=prompt,
+        negative_prompt="",
+        true_cfg_scale=4.0,
+        width=512,
+        height=512,
+        num_inference_steps=8,
+        generator=g,
+    ).images[0]
+    img_cfg.convert("RGB").save(out_dir / "std_cfg4_emptyneg_512.png")
+    print(f"Wrote real-model diffusers golden suite to {out_dir}")
 
 
 def main():
@@ -329,8 +567,17 @@ def main():
         default=Path("tools/oracle/fixtures/qwen_image_ops.safetensors"),
         help="Output .safetensors fixture path",
     )
+    parser.add_argument(
+        "--real-golden-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to generate full real-model diffusers golden PNG suite",
+    )
     args = parser.parse_args()
-    generate_synthetic_fixture(args.output)
+    if args.real_golden_dir is not None:
+        generate_real_golden_suite(args.real_golden_dir)
+    else:
+        generate_synthetic_fixture(args.output)
 
 
 if __name__ == "__main__":

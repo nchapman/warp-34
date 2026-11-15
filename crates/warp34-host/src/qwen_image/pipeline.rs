@@ -647,26 +647,49 @@ impl QwenImage21PipelineEngine {
             )?;
             let cond_caches = tf_tp2.new_kv_caches();
             let neg_caches = tf_tp2.new_kv_caches();
-            let te_stream = CudaStream::new(0)?;
-            let te_cublas = CublasHandle::new(&te_stream)?;
-            let te_encoder = Qwen3VlConditioningEncoder::load(
-                Arc::clone(&text_archive),
-                &cfg.text_encoder,
-                te_quant,
-                0,
-                &te_stream,
-            )?;
+            // Place the VLM conditioning encoder on GPU 1 (since GPU 0 holds the 64-ch RGBA VAE + im2col workspace).
+            // On 24 GB GPUs running unquantized FP16 (20B DiT + 8B VLM = 14.4 GiB), load the VLM on-demand on GPU 1
+            // and release it before `denoise_loop` so both ranks retain ~16 GiB free for 1024x1024+ TI2I KV caches.
+            let gpu1_total_bytes = CudaDevice::set_current(1)
+                .and_then(|d| d.mem_info())
+                .map(|(_, total)| total)
+                .unwrap_or(0);
+            let need_ondemand_te = *tf_quant == crate::loader::QuantScheme::Unquantized
+                && *te_quant == crate::loader::QuantScheme::Unquantized
+                && gpu1_total_bytes < (32usize << 30);
+            let cond_backend = if need_ondemand_te {
+                ConditioningBackend::OnDemand {
+                    device_id: 1,
+                    archive: text_archive,
+                }
+            } else {
+                let te_stream = CudaStream::new(1)?;
+                let te_cublas = CublasHandle::new(&te_stream)?;
+                match Qwen3VlConditioningEncoder::load(
+                    Arc::clone(&text_archive),
+                    &cfg.text_encoder,
+                    te_quant,
+                    1,
+                    &te_stream,
+                ) {
+                    Ok(te_encoder) => ConditioningBackend::Resident {
+                        encoder: te_encoder,
+                        stream: te_stream,
+                        cublas: te_cublas,
+                    },
+                    Err(_) => ConditioningBackend::OnDemand {
+                        device_id: 1,
+                        archive: text_archive,
+                    },
+                }
+            };
             (
                 Some(TransformerBackend::Tp2 {
                     engine: tf_tp2,
                     cond_caches,
                     neg_caches,
                 }),
-                ConditioningBackend::Resident {
-                    encoder: te_encoder,
-                    stream: te_stream,
-                    cublas: te_cublas,
-                },
+                cond_backend,
             )
         } else if num_gpus >= 2 {
             let tf_stream = CudaStream::new(0)?;
@@ -854,8 +877,21 @@ impl QwenImage21PipelineEngine {
                 cublas,
             } => encoder.encode_conditioning(&input_ids, images, self.drop_idx, cublas, stream)?,
             ConditioningBackend::OnDemand { device_id, archive } => {
-                // Free the single-GPU transformer before loading the 14.4 GiB text encoder.
-                self.transformer = None;
+                // On single-GPU (`tp_size == 1`), free the transformer before loading the 14.4 GiB text encoder.
+                // On `tp_size == 2`, GPU 1 only holds `rank1` (~7.0 GiB), so the 14.4 GiB text encoder fits
+                // alongside `rank1` and is dropped at the end of this block before `denoise_loop` allocates KV cache.
+                if self.tp_size == 1 {
+                    self.transformer = None;
+                } else if let Some(TransformerBackend::Tp2 {
+                    engine,
+                    cond_caches,
+                    neg_caches,
+                }) = &mut self.transformer
+                {
+                    *cond_caches = engine.new_kv_caches();
+                    *neg_caches = engine.new_kv_caches();
+                    engine.release_workspaces();
+                }
                 let stream = CudaStream::new(*device_id)?;
                 let cublas = CublasHandle::new(&stream)?;
                 let encoder = Qwen3VlConditioningEncoder::load(
@@ -1040,6 +1076,11 @@ impl QwenImage21PipelineEngine {
             .as_ref()
             .map(|n| (n.prompt_embeds_f16.as_slice(), n.image_pad_mask.as_slice()));
 
+        let is_ondemand = matches!(self.conditioning, ConditioningBackend::OnDemand { .. });
+        if is_ondemand {
+            self.vae.release_workspace()?;
+        }
+
         // 5. GPU-resident denoising loop (Step 0: block-causal extract; Steps 1..N-1: cached decode + CudaGraph)
         let (latents, denoise_step0_ms, denoise_cached_ms) =
             match self.transformer.as_mut().expect("transformer loaded") {
@@ -1085,12 +1126,19 @@ impl QwenImage21PipelineEngine {
                 )?,
             };
 
+        if is_ondemand && let Some(TransformerBackend::Tp2 { engine, .. }) = &self.transformer {
+            engine.release_workspaces();
+        }
+
         // 6. Unpack latents & VAE decode
         let t_vae_dec_start = Instant::now();
         let latents_chw_f16 = unpack_latents_hwc_to_chw(&latents, z_dim, latent_h, latent_w);
         let decoded_chw_f16 = self
             .vae
             .decode_denormalized(&latents_chw_f16, latent_h, latent_w)?;
+        if is_ondemand {
+            self.vae.release_workspace()?;
+        }
         let channels: u8 = if req.rgba_output { 4 } else { 3 };
         let pixels_u8 = vae_chw_f16_to_rgba_u8(
             &decoded_chw_f16,

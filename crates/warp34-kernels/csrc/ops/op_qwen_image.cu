@@ -926,7 +926,7 @@ __global__ void vae_rms_norm_f16_kernel(
 
     float sum_sq = 0.0f;
     for (int c = 0; c < channels; ++c) {
-        const float v = __half2float(x[(int64_t)c * spatial + s]);
+        const float v = fminf(fmaxf(__half2float(x[(int64_t)c * spatial + s]), -65504.0f), 65504.0f);
         sum_sq += v * v;
     }
     const float inv_norm = 1.0f / fmaxf(sqrtf(sum_sq), 1e-12f);
@@ -934,7 +934,7 @@ __global__ void vae_rms_norm_f16_kernel(
 
     for (int c = 0; c < channels; ++c) {
         const int64_t idx = (int64_t)c * spatial + s;
-        const float v = __half2float(x[idx]);
+        const float v = fminf(fmaxf(__half2float(x[idx]), -65504.0f), 65504.0f);
         const __half n_h = __float2half(v * inv_norm);
         const __half s_h = __float2half(__half2float(n_h) * scale);
         __half o_h = __float2half(__half2float(s_h) * __half2float(gamma[c]));
@@ -969,7 +969,7 @@ __global__ void vae_rms_norm_vec8_f16_kernel(
         const __half* xh = reinterpret_cast<const __half*>(&xv);
         #pragma unroll
         for (int d = 0; d < 8; ++d) {
-            const float v = __half2float(xh[d]);
+            const float v = fminf(fmaxf(__half2float(xh[d]), -65504.0f), 65504.0f);
             sum_sq[d] += v * v;
         }
     }
@@ -990,7 +990,7 @@ __global__ void vae_rms_norm_vec8_f16_kernel(
         __half* oh = reinterpret_cast<__half*>(&ov);
         #pragma unroll
         for (int d = 0; d < 8; ++d) {
-            const float v = __half2float(xh[d]);
+            const float v = fminf(fmaxf(__half2float(xh[d]), -65504.0f), 65504.0f);
             const __half n_h = __float2half(v * inv_norm[d]);
             const __half s_h = __float2half(__half2float(n_h) * scale);
             __half o_h = __float2half(__half2float(s_h) * gc);
@@ -1325,7 +1325,8 @@ __global__ void vae_dup_up_2d_f16_kernel(
     int h_in,
     int w_in,
     int factor_t,
-    int factor_s) {
+    int factor_s,
+    float x_scale) {
     const int oc = (int)blockIdx.y;
     const int s_idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
     const int h_out = h_in * factor_s;
@@ -1347,6 +1348,9 @@ __global__ void vae_dup_up_2d_f16_kernel(
 
     const size_t out_idx = (size_t)oc * spatial_out + s_idx;
     __half v_h = x[((int64_t)ic * h_in + ih) * w_in + iw];
+    if (x_scale != 1.0f) {
+        v_h = __float2half(__half2float(v_h) * x_scale);
+    }
     if (residual != nullptr) {
         v_h = __float2half(__half2float(v_h) + __half2float(residual[out_idx]));
     }
@@ -1670,7 +1674,7 @@ extern "C" int warp34_qwen_image_vae_avg_down_f16(
     return (int)cudaGetLastError();
 }
 
-extern "C" int warp34_qwen_image_vae_dup_up_f16(
+extern "C" int warp34_qwen_image_vae_dup_up_scaled_f16(
     const warp34_exec* ex,
     const void* x,
     const void* residual,
@@ -1680,7 +1684,8 @@ extern "C" int warp34_qwen_image_vae_dup_up_f16(
     int h_in,
     int w_in,
     int factor_t,
-    int factor_s) {
+    int factor_s,
+    float x_scale) {
     if (ex == nullptr || x == nullptr || out == nullptr ||
         in_c <= 0 || out_c <= 0 || h_in <= 0 || w_in <= 0 ||
         factor_t <= 0 || factor_s <= 0 ||
@@ -1706,8 +1711,24 @@ extern "C" int warp34_qwen_image_vae_dup_up_f16(
         h_in,
         w_in,
         factor_t,
-        factor_s);
+        factor_s,
+        x_scale);
     return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_qwen_image_vae_dup_up_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* residual,
+    void* out,
+    int in_c,
+    int out_c,
+    int h_in,
+    int w_in,
+    int factor_t,
+    int factor_s) {
+    return warp34_qwen_image_vae_dup_up_scaled_f16(
+        ex, x, residual, out, in_c, out_c, h_in, w_in, factor_t, factor_s, 1.0f);
 }
 
 extern "C" int warp34_qwen_image_vae_softmax_f32_to_f16(

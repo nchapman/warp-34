@@ -1013,6 +1013,9 @@ int warp34_qwen_image_vae_avg_down_f16(
 int warp34_qwen_image_vae_dup_up_f16(
     const warp34_exec* ex, const void* x, const void* residual, void* out,
     int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s);
+int warp34_qwen_image_vae_dup_up_scaled_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s, float x_scale);
 int warp34_qwen_image_vae_softmax_f32_to_f16(
     const warp34_exec* ex, const float* scores, void* probs, int seq_len);
 

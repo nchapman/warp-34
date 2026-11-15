@@ -1242,6 +1242,20 @@ unsafe extern "C" {
         factor_s: i32,
     ) -> i32;
 
+    pub fn warp34_qwen_image_vae_dup_up_scaled_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        in_c: i32,
+        out_c: i32,
+        h_in: i32,
+        w_in: i32,
+        factor_t: i32,
+        factor_s: i32,
+        x_scale: f32,
+    ) -> i32;
+
     pub fn warp34_qwen_image_vae_softmax_f32_to_f16(
         ex: *const Warp34Exec,
         scores: *const f32,

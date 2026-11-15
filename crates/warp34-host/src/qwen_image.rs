@@ -1642,6 +1642,48 @@ mod tests {
             mm_max_diff < 5e-3,
             "Qwen3-VL multimodal pre-norm max diff {mm_max_diff} exceeded 5e-3"
         );
+
+        // 2d. Check multi-image conditioning forward pass (2 images with distinct grid_thw: [1,4,4] and [1,2,4])
+        let mm2_ids_bytes = arch.read_bytes("vl.mm2_input_ids").unwrap();
+        let mm2_ids: Vec<i32> = mm2_ids_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        let mm2_px1 = arch.read_f32("vl.mm2_pixel_values_1").unwrap();
+        let mm2_px2 = arch.read_f32("vl.mm2_pixel_values_2").unwrap();
+        let imgs2 = [
+            PreprocessedImage {
+                patches_f32: mm2_px1.into(),
+                grid_thw: [1, 4, 4],
+                content_hash: 1,
+            },
+            PreprocessedImage {
+                patches_f32: mm2_px2.into(),
+                grid_thw: [1, 2, 4],
+                content_hash: 2,
+            },
+        ];
+        let mm2_expected = arch.read_f32("vl.mm2_pre_norm").unwrap();
+        let mm2_out = encoder
+            .encode_conditioning(&mm2_ids, &imgs2, 0, &cublas, &stream)
+            .unwrap();
+        assert_eq!(mm2_out.seq_len, mm2_ids.len());
+        assert_eq!(
+            mm2_out.image_pad_mask,
+            vec![false, true, true, true, true, false, true, true, false]
+        );
+        let mm2_max_diff = mm2_out
+            .prompt_embeds_f32
+            .iter()
+            .zip(mm2_expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mm2_max_diff < 5e-3,
+            "Qwen3-VL multi-image pre-norm max diff {mm2_max_diff} exceeded 5e-3"
+        );
     }
 
     #[test]
@@ -2043,6 +2085,90 @@ mod tests {
                 loop_diff < 5e-3,
                 "2-GPU TP=2 denoise_loop max diff {loop_diff} vs TP=1 exceeded 5e-3"
             );
+
+            // Multi-image conditioning (2 reference images [(1,2,2), (1,4,2)] + target (1,2,4))
+            // + 3-step Euler + normed CFG (true_cfg_scale=4.0) with asymmetric positive (len=6)
+            // vs negative (len=4) VLM sequences, verified directly against diffusers oracle!
+            let multi_shapes = [
+                (1usize, 2usize, 2usize),
+                (1usize, 4usize, 2usize),
+                (1usize, 2usize, 4usize),
+            ];
+            let pos_enc = arch.read_f16_bits("dit.multi.pos_enc_hidden").unwrap();
+            let neg_enc = arch.read_f16_bits("dit.multi.neg_enc_hidden").unwrap();
+            let pos_mask = [false, true, false, true, true, false];
+            let neg_mask = [false, true, true, true];
+            let multi_cond = arch.read_f16_bits("dit.multi.cond_latents").unwrap();
+            let multi_init = arch.read_f16_bits("dit.multi.init_latents").unwrap();
+            let cfg_timesteps = [0.978453f32, 0.845148f32, 0.422574f32];
+            let cfg_sigmas = [1.0f32, 0.7f32, 0.3f32, 0.0f32];
+
+            let mut m_tp1_cond = engine.new_kv_cache();
+            let mut m_tp1_neg = engine.new_kv_cache();
+            let m_ext = engine
+                .forward_extract(
+                    &multi_cond,
+                    &multi_init,
+                    &pos_enc,
+                    &pos_mask,
+                    &multi_shapes,
+                    cfg_timesteps[0],
+                    Some(&mut m_tp1_cond),
+                    &cublas,
+                    &stream,
+                )
+                .unwrap();
+            let diff_m_ext = max_diff(&m_ext.target_output_f16, "dit.multi.extract_target");
+            assert!(
+                diff_m_ext < 5e-3,
+                "multi-image extract_target max diff {diff_m_ext} exceeded 5e-3"
+            );
+
+            let (tp1_multi_final, _, _) = engine
+                .denoise_loop(
+                    &multi_cond,
+                    &multi_init,
+                    &pos_enc,
+                    &pos_mask,
+                    Some((&neg_enc, &neg_mask)),
+                    &multi_shapes,
+                    &cfg_timesteps,
+                    &cfg_sigmas,
+                    4.0,
+                    true,
+                    &mut m_tp1_cond,
+                    &mut m_tp1_neg,
+                    &cublas,
+                    &stream,
+                )
+                .unwrap();
+            let diff_m_tp1 = max_diff(&tp1_multi_final, "dit.multi.final_latents");
+            assert!(
+                diff_m_tp1 < 1e-2,
+                "TP=1 multi-image + asymmetric CFG denoise_loop max diff {diff_m_tp1} vs diffusers exceeded 1e-2"
+            );
+
+            let (tp2_multi_final, _, _) = tp2_engine
+                .denoise_loop(
+                    &multi_cond,
+                    &multi_init,
+                    &pos_enc,
+                    &pos_mask,
+                    Some((&neg_enc, &neg_mask)),
+                    &multi_shapes,
+                    &cfg_timesteps,
+                    &cfg_sigmas,
+                    4.0,
+                    true,
+                    (&mut tp2_cond0, &mut tp2_cond1),
+                    (&mut tp2_neg0, &mut tp2_neg1),
+                )
+                .unwrap();
+            let diff_m_tp2 = max_diff(&tp2_multi_final, "dit.multi.final_latents");
+            assert!(
+                diff_m_tp2 < 1e-2,
+                "TP=2 multi-image + asymmetric CFG denoise_loop max diff {diff_m_tp2} vs diffusers exceeded 1e-2"
+            );
         }
     }
 
@@ -2209,6 +2335,38 @@ mod tests {
         let rgb_rt = vae_chw_f16_to_rgba_u8(&vae_chw, 4, 4, false);
         assert_eq!(rgb_rt.len(), 4 * 4 * 3);
         let _ = f32_to_f16(0.0);
+
+        // 5. 5-stage AutoencoderKLQwenImage21 (dim_mult=[1, 2, 4, 4, 4]) high-dynamic-range overflow oracle:
+        // Unscaled FP16 overflows past 65,504.0 to Inf/NaN in up_blocks.2 / up_blocks.3;
+        // RMSNorm-homogeneity rescaled FP16 stays finite and matches the FP32 oracle.
+        let cfg5 = QwenImage21VaeConfig {
+            base_dim: 4,
+            decoder_base_dim: 4,
+            z_dim: 4,
+            dim_mult: vec![1, 2, 4, 4, 4],
+            num_res_blocks: 1,
+            attn_scales: Vec::new(),
+            temperal_downsample: vec![false, false, true, true],
+            in_channels: 4,
+            out_channels: 4,
+            is_residual: true,
+            latents_mean: vec![0.0; 4],
+            latents_std: vec![1.0; 4],
+        };
+        let weights5 =
+            QwenImage21VaeWeightsGpu::from_archive(&arch, &cfg5, "vae5.weight", 0).unwrap();
+        let mut engine5 = QwenImage21VaeEngine::new(weights5).unwrap();
+        let z5 = load_f16("vae5.z_in");
+        let dec5 = engine5.decode(&z5, 2, 2).unwrap();
+        assert!(
+            dec5.iter().all(|&bits| f16_to_f32(bits).is_finite()),
+            "5-stage VAE decode produced non-finite (NaN/Inf) output"
+        );
+        let diff_dec5 = max_diff(&dec5, "vae5.dec_out");
+        assert!(
+            diff_dec5 < 1.5e-2,
+            "5-stage high-dynamic-range vae5.dec_out max diff {diff_dec5} exceeded 1.5e-2"
+        );
     }
 
     #[test]
@@ -2301,5 +2459,266 @@ mod tests {
                 .unwrap(),
             Some(64)
         );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_qwen_image_real_model_matches_diffusers_oracle_suite() {
+        use crate::cuda::{CudaDevice, f16_to_f32};
+
+        if std::env::var_os("WARP34_RUN_QWEN_IMAGE_ORACLE_SUITE").is_none() {
+            return;
+        }
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let num_gpus = CudaDevice::count().unwrap_or(0);
+        if num_gpus < 1 {
+            return;
+        }
+        let tp = if num_gpus >= 2 { 2 } else { 1 };
+        let golden_dir = PathBuf::from(
+            std::env::var("WARP34_QWEN_IMAGE_GOLDEN_DIR")
+                .unwrap_or_else(|_| "/tmp/oracle_verify".to_string()),
+        );
+        if !golden_dir.join("turbo_512.png").is_file() {
+            return;
+        }
+        let opts = crate::hub::HubOptions {
+            revision: None,
+            offline: true,
+        };
+        let Ok(turbo_dir) = crate::hub::resolve_model(
+            "Qwen/Qwen-Image-2.1-Turbo",
+            &opts,
+            crate::hub::ModelRole::Target,
+        ) else {
+            return;
+        };
+        let mut engine = QwenImage21PipelineEngine::load(&turbo_dir, tp).unwrap();
+        let prompt = "A serene alpine lake at golden hour reflecting snow-capped peaks, crisp foreground wildflowers, photorealistic 8k";
+
+        let load_golden_rgb = |name: &str| -> Vec<u8> {
+            let bytes = std::fs::read(golden_dir.join(name)).unwrap();
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgb8()
+                .into_raw()
+        };
+        let load_golden_rgba = |name: &str| -> Vec<u8> {
+            let bytes = std::fs::read(golden_dir.join(name)).unwrap();
+            image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgba8()
+                .into_raw()
+        };
+        let premul_rgba_psnr = |a: &[u8], b: &[u8]| -> f64 {
+            let mut sum_sq = 0.0f64;
+            for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
+                let aa = (pa[3] as f64) / 255.0;
+                let ab = (pb[3] as f64) / 255.0;
+                for c in 0..3 {
+                    let d = (pa[c] as f64) * aa - (pb[c] as f64) * ab;
+                    sum_sq += d * d;
+                }
+                let da = (pa[3] as f64) - (pb[3] as f64);
+                sum_sq += da * da;
+            }
+            10.0 * ((255.0 * 255.0) / (sum_sq / (a.len() as f64))).log10()
+        };
+
+        // 1. T2I 512x512 RGB
+        let r1 = engine
+            .generate(&QwenImage21GenerationRequest {
+                prompt: prompt.to_string(),
+                negative_prompt: None,
+                condition_images: Vec::new(),
+                width: Some(512),
+                height: Some(512),
+                output_resolution: 1024,
+                num_inference_steps: Some(8),
+                sigmas: None,
+                true_cfg_scale: 1.0,
+                seed: 42,
+                initial_latents_chw_f16: None,
+                rgba_output: false,
+                use_cuda_graph: true,
+            })
+            .unwrap();
+        let psnr1 = compute_psnr_u8(&r1.pixels_u8, &load_golden_rgb("turbo_512.png"));
+        assert!(psnr1 >= 45.0, "T2I 512x512 PSNR {psnr1:.2} dB < 45.0 dB");
+
+        // 2. T2I 768x512 Non-Square
+        let r2 = engine
+            .generate(&QwenImage21GenerationRequest {
+                prompt: prompt.to_string(),
+                negative_prompt: None,
+                condition_images: Vec::new(),
+                width: Some(768),
+                height: Some(512),
+                output_resolution: 1024,
+                num_inference_steps: Some(8),
+                sigmas: None,
+                true_cfg_scale: 1.0,
+                seed: 42,
+                initial_latents_chw_f16: None,
+                rgba_output: false,
+                use_cuda_graph: true,
+            })
+            .unwrap();
+        let psnr2 = compute_psnr_u8(&r2.pixels_u8, &load_golden_rgb("turbo_768x512.png"));
+        assert!(psnr2 >= 45.0, "T2I 768x512 PSNR {psnr2:.2} dB < 45.0 dB");
+
+        // 3. T2I 1024x1024 RGBA Transparent + 4. Single-Image RGBA Edit
+        if golden_dir
+            .join("diffusers_rgba_transparent_1024.png")
+            .is_file()
+        {
+            let r3 = engine
+                .generate(&QwenImage21GenerationRequest {
+                    prompt: ensure_rgba_transparency_prompt(
+                        "A cute isometric 3D icon of a glowing crystal potion bottle with a cork stopper",
+                    ),
+                    negative_prompt: None,
+                    condition_images: Vec::new(),
+                    width: Some(1024),
+                    height: Some(1024),
+                    output_resolution: 1024,
+                    num_inference_steps: Some(8),
+                    sigmas: None,
+                    true_cfg_scale: 1.0,
+                    seed: 42,
+                    initial_latents_chw_f16: None,
+                    rgba_output: true,
+                    use_cuda_graph: true,
+                })
+                .unwrap();
+            assert!(
+                r3.decoded_chw_f16
+                    .iter()
+                    .all(|&b| f16_to_f32(b).is_finite()),
+                "1024x1024 RGBA T2I produced non-finite (NaN/Inf) VAE output"
+            );
+            let trans_px = r3
+                .pixels_u8
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|px| px[3] < 10)
+                .count();
+            assert!(
+                trans_px > (1024 * 1024) / 2,
+                "expected >50% transparent pixels on 1024x1024 RGBA T2I, got {trans_px}"
+            );
+            let psnr3 = premul_rgba_psnr(
+                &r3.pixels_u8,
+                &load_golden_rgba("diffusers_rgba_transparent_1024.png"),
+            );
+            assert!(
+                psnr3 >= 35.0,
+                "T2I 1024x1024 RGBA premultiplied PSNR {psnr3:.2} dB < 35.0 dB"
+            );
+
+            if golden_dir.join("diffusers_rgba_edit_1024.png").is_file() {
+                let cond_rgba = QwenImage21ConditionImage::from_path(
+                    &golden_dir.join("diffusers_rgba_transparent_1024.png"),
+                )
+                .unwrap();
+                let r4 = engine
+                    .generate(&QwenImage21GenerationRequest {
+                        prompt: "Change the glowing potion inside the crystal bottle from purple to bright emerald green and add golden runes etched on the glass".to_string(),
+                        negative_prompt: None,
+                        condition_images: vec![cond_rgba],
+                        width: Some(1024),
+                        height: Some(1024),
+                        output_resolution: 1024,
+                        num_inference_steps: Some(8),
+                        sigmas: None,
+                        true_cfg_scale: 1.0,
+                        seed: 42,
+                        initial_latents_chw_f16: None,
+                        rgba_output: true,
+                        use_cuda_graph: true,
+                    })
+                    .unwrap();
+                assert!(
+                    r4.decoded_chw_f16
+                        .iter()
+                        .all(|&b| f16_to_f32(b).is_finite()),
+                    "1024x1024 RGBA Edit produced non-finite (NaN/Inf) VAE output"
+                );
+                let psnr4 = premul_rgba_psnr(
+                    &r4.pixels_u8,
+                    &load_golden_rgba("diffusers_rgba_edit_1024.png"),
+                );
+                assert!(
+                    psnr4 >= 38.0,
+                    "Edit 1024x1024 RGBA premultiplied PSNR {psnr4:.2} dB < 38.0 dB"
+                );
+            }
+        }
+
+        // 5. Raw 640x480 COCO Single-Image Edit -> 576x448 @ res=512
+        let coco_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/fixtures/coco_sample.png");
+        let cond_coco = QwenImage21ConditionImage::from_path(&coco_path).unwrap();
+        let r5 = engine
+            .generate(&QwenImage21GenerationRequest {
+                prompt: "Turn this scene into a watercolor painting".to_string(),
+                negative_prompt: None,
+                condition_images: vec![cond_coco],
+                width: Some(576),
+                height: Some(448),
+                output_resolution: 512,
+                num_inference_steps: Some(8),
+                sigmas: None,
+                true_cfg_scale: 1.0,
+                seed: 42,
+                initial_latents_chw_f16: None,
+                rgba_output: false,
+                use_cuda_graph: true,
+            })
+            .unwrap();
+        let psnr5 = compute_psnr_u8(
+            &r5.pixels_u8,
+            &load_golden_rgb("diffusers_raw_640x480_edit.png"),
+        );
+        assert!(
+            psnr5 >= 45.0,
+            "Raw 640x480 single-image edit PSNR {psnr5:.2} dB < 45.0 dB"
+        );
+
+        // 6. Multi-Image Edit ([coco_512x512, coco_576x448] -> 512x512)
+        if golden_dir.join("diffusers_512_576_seed123.png").is_file() {
+            let c1 =
+                QwenImage21ConditionImage::from_path(&golden_dir.join("coco_512x512.png")).unwrap();
+            let c2 =
+                QwenImage21ConditionImage::from_path(&golden_dir.join("coco_576x448.png")).unwrap();
+            let r6 = engine
+                .generate(&QwenImage21GenerationRequest {
+                    prompt: "Combine lighting from image 2 onto image 1".to_string(),
+                    negative_prompt: None,
+                    condition_images: vec![c1, c2],
+                    width: Some(512),
+                    height: Some(512),
+                    output_resolution: 512,
+                    num_inference_steps: Some(8),
+                    sigmas: None,
+                    true_cfg_scale: 1.0,
+                    seed: 123,
+                    initial_latents_chw_f16: None,
+                    rgba_output: false,
+                    use_cuda_graph: true,
+                })
+                .unwrap();
+            let psnr6 = compute_psnr_u8(
+                &r6.pixels_u8,
+                &load_golden_rgb("diffusers_512_576_seed123.png"),
+            );
+            assert!(
+                psnr6 >= 45.0,
+                "Multi-image edit PSNR {psnr6:.2} dB < 45.0 dB"
+            );
+        }
     }
 }

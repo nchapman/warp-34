@@ -665,7 +665,7 @@ pub(crate) fn run_greedy_diff(
 }
 
 #[cfg(feature = "cuda")]
-fn compute_image_psnr(a: &[u8], b: &[u8]) -> Result<(f64, u8), String> {
+fn compute_image_psnr(a: &[u8], b: &[u8], channels: u8) -> Result<(f64, u8), String> {
     if a.len() != b.len() || a.is_empty() {
         return Err(format!(
             "image pixel length mismatch: {} vs {}",
@@ -675,11 +675,29 @@ fn compute_image_psnr(a: &[u8], b: &[u8]) -> Result<(f64, u8), String> {
     }
     let mut sum_sq = 0.0f64;
     let mut max_diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let diff = x.abs_diff(y);
-        max_diff = max_diff.max(diff);
-        let d = diff as f64;
-        sum_sq += d * d;
+    if channels == 4 && a.len().is_multiple_of(4) {
+        for (px_a, px_b) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
+            let aa = (px_a[3] as f64) / 255.0;
+            let ab = (px_b[3] as f64) / 255.0;
+            for c in 0..3 {
+                let va = (px_a[c] as f64) * aa;
+                let vb = (px_b[c] as f64) * ab;
+                let d = (va - vb).abs();
+                max_diff = max_diff.max(d.round() as u8);
+                sum_sq += d * d;
+            }
+            let da = px_a[3].abs_diff(px_b[3]);
+            max_diff = max_diff.max(da);
+            let daf = da as f64;
+            sum_sq += daf * daf;
+        }
+    } else {
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let diff = x.abs_diff(y);
+            max_diff = max_diff.max(diff);
+            let d = diff as f64;
+            sum_sq += d * d;
+        }
     }
     let mse = sum_sq / (a.len() as f64);
     let psnr = if mse <= 1e-12 {
@@ -746,8 +764,13 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             .map(|s| s.len().max(1))
             .unwrap_or(40)
     });
+    let effective_prompt = if rgba_output && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
     let req = crate::qwen_image::QwenImage21GenerationRequest {
-        prompt,
+        prompt: effective_prompt,
         negative_prompt,
         condition_images,
         width,
@@ -770,7 +793,8 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         )
         .map_err(|e| e.to_string())?;
         let res_tp2 = engine_tp2.generate(&req).map_err(|e| e.to_string())?;
-        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, &res_tp2.pixels_u8)?;
+        let (psnr, max_diff) =
+            compute_image_psnr(&res.pixels_u8, &res_tp2.pixels_u8, res.channels)?;
         println!(
             "[warp34 dump-diff tp1-vs-tp2] model={model} size={}x{}x{} steps={steps} psnr={psnr:.2}dB max_px_diff={max_diff} tp1_ms={:.2} tp2_ms={:.2}",
             res.width, res.height, res.channels, res.timings.total_ms, res_tp2.timings.total_ms,
@@ -789,7 +813,7 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
                 res.width, res.height
             ));
         }
-        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, ref_pixels)?;
+        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, ref_pixels, res.channels)?;
         println!(
             "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} golden={golden} psnr={psnr:.2}dB max_px_diff={max_diff} total_ms={:.2}",
             engine.tp_size(),

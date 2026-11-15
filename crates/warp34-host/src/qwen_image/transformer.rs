@@ -900,6 +900,39 @@ impl QwenImage21TransformerEngine {
     where
         F: FnMut(u64, usize, &CudaStream) -> Result<()>,
     {
+        self.forward_extract_with_allreduce_gated(
+            cond_latents_f16,
+            target_latents_f16,
+            encoder_hidden_f16,
+            vlm_img_mask,
+            img_shapes,
+            timestep,
+            kv_cache,
+            cublas,
+            stream,
+            allreduce_fn,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    fn forward_extract_with_allreduce_gated<F>(
+        &self,
+        cond_latents_f16: &[u16],
+        target_latents_f16: &[u16],
+        encoder_hidden_f16: &[u16],
+        vlm_img_mask: &[bool],
+        img_shapes: &[(usize, usize, usize)],
+        timestep: f32,
+        kv_cache: Option<&mut QwenImage21KvCacheGpu>,
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        allreduce_fn: Option<F>,
+        capture_gate: Option<&Tp2CaptureGate>,
+    ) -> Result<QwenImage21ExtractOutput>
+    where
+        F: FnMut(u64, usize, &CudaStream) -> Result<()>,
+    {
         let mut ws_guard = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
         let (total_seq_len, prefix_len, target_tokens, d_out) = self.forward_extract_device_inner(
             &mut ws_guard,
@@ -914,6 +947,7 @@ impl QwenImage21TransformerEngine {
             cublas,
             stream,
             allreduce_fn,
+            capture_gate,
         )?;
         let out_dim = self.cfg.out_channels * self.cfg.patch_size * self.cfg.patch_size;
         let mut full_output_f16 = vec![0u16; total_seq_len * out_dim];
@@ -955,10 +989,12 @@ impl QwenImage21TransformerEngine {
         cublas: &CublasHandle,
         stream: &CudaStream,
         mut allreduce_fn: Option<F>,
+        capture_gate: Option<&Tp2CaptureGate>,
     ) -> Result<(usize, usize, usize, u64)>
     where
         F: FnMut(u64, usize, &CudaStream) -> Result<()>,
     {
+        let mut gate_guard = capture_gate.map(Tp2CaptureGate::enter_step);
         let _dev = CudaDevice::set_current(self.device_id)?;
         if img_shapes.is_empty() {
             return Err(CudaError::new(
@@ -1312,6 +1348,14 @@ impl QwenImage21TransformerEngine {
             self.device_id,
             total_seq_len * out_dim * 2,
         )?;
+        if let Some(gate) = capture_gate
+            && gate.agree_min_u8(1)? == 0
+        {
+            return Err(CudaError::new(
+                -10,
+                "peer TP=2 rank failed forward_extract allocation or setup",
+            ));
+        }
 
         if let Some(tgt_host) = target_latents_host_f16 {
             let mut img_all_f16 = Vec::with_capacity(img_tokens * in_dim);
@@ -1892,6 +1936,9 @@ impl QwenImage21TransformerEngine {
                 d_out,
                 total_seq_len,
             )?;
+        }
+        if let Some(ref mut g) = gate_guard {
+            g.disarm();
         }
         Ok((total_seq_len, prefix_len, target_tokens, d_out))
     }
@@ -2835,6 +2882,7 @@ impl QwenImage21TransformerEngine {
             cublas,
             stream,
             allreduce_fn.as_mut(),
+            capture_gate,
         )?;
         if target_tokens * out_dim != target_elems {
             return Err(CudaError::new(
@@ -2872,6 +2920,7 @@ impl QwenImage21TransformerEngine {
                 cublas,
                 stream,
                 allreduce_fn.as_mut(),
+                capture_gate,
             )?;
             let d_tgt_u = d_out_u + (prefix_len_u * out_dim * 2) as u64;
             check_rc(
@@ -3311,6 +3360,19 @@ impl QwenImage21TransformerTp2Engine {
         (self.rank0.new_kv_cache(), self.rank1.new_kv_cache())
     }
 
+    pub fn release_workspaces(&self) {
+        *self
+            .rank0
+            .workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = QwenImage21Workspace::default();
+        *self
+            .rank1
+            .workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = QwenImage21Workspace::default();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward_extract(
         &self,
@@ -3328,10 +3390,11 @@ impl QwenImage21TransformerTp2Engine {
             Some((a, b)) => (Some(a), Some(b)),
             None => (None, None),
         };
+        let gate = &self.capture_gate;
         let (r0, r1) = self.worker1.run_parallel(
             || {
                 let _dev = CudaDevice::set_current(0)?;
-                self.rank0.forward_extract_with_allreduce(
+                self.rank0.forward_extract_with_allreduce_gated(
                     cond_latents_f16,
                     target_latents_f16,
                     encoder_hidden_f16,
@@ -3345,11 +3408,12 @@ impl QwenImage21TransformerTp2Engine {
                         let ex = st.exec(0, 0);
                         chunked_all_reduce_f16(comm0, &ex, d_buf, 0, n_elems)
                     }),
+                    Some(gate),
                 )
             },
             || {
                 let _dev = CudaDevice::set_current(1)?;
-                self.rank1.forward_extract_with_allreduce(
+                self.rank1.forward_extract_with_allreduce_gated(
                     cond_latents_f16,
                     target_latents_f16,
                     encoder_hidden_f16,
@@ -3363,6 +3427,7 @@ impl QwenImage21TransformerTp2Engine {
                         let ex = st.exec(0, 0);
                         chunked_all_reduce_f16(comm1, &ex, d_buf, 1, n_elems)
                     }),
+                    Some(gate),
                 )
             },
         )?;

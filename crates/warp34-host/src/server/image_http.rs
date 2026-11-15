@@ -529,15 +529,7 @@ pub fn parse_json_image_request(
 
     let background = obj.get("background").and_then(Value::as_str);
     let rgba_flag = obj.get("rgba").and_then(Value::as_bool).unwrap_or(false);
-    let rgba_output = match background {
-        Some("transparent") => true,
-        Some("opaque" | "auto") | None => rgba_flag,
-        Some(other) => {
-            return Err(format!(
-                "invalid 'background' value '{other}': expected 'transparent', 'opaque', or 'auto'"
-            ));
-        }
-    };
+    let rgba_output = resolve_rgba_output(background, rgba_flag, &condition_images)?;
 
     let n = obj.get("n").and_then(Value::as_u64).unwrap_or(1) as usize;
     if !(1..=MAX_BATCH_IMAGES).contains(&n) {
@@ -571,6 +563,32 @@ pub fn parse_json_image_request(
     })
 }
 
+fn resolve_rgba_output(
+    background: Option<&str>,
+    rgba_flag: bool,
+    condition_images: &[QwenImage21ConditionImage],
+) -> Result<bool, String> {
+    let all_cond_transparent = !condition_images.is_empty()
+        && condition_images.iter().all(|img| {
+            let total_px = img.rgba.len() / 4;
+            let transparent_px = img
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|px| px[3] < 128)
+                .count();
+            total_px > 0 && transparent_px * 10 > total_px
+        });
+    match background {
+        Some("transparent") => Ok(true),
+        Some("opaque") => Ok(rgba_flag),
+        Some("auto") | None => Ok(rgba_flag || all_cond_transparent),
+        Some(other) => Err(format!(
+            "invalid 'background' value '{other}': expected 'transparent', 'opaque', or 'auto'"
+        )),
+    }
+}
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -752,15 +770,7 @@ pub fn parse_multipart_image_request(
         return Err("'guidance_scale' must be in 0.0..=30.0".into());
     }
     let (w, h) = parse_size_spec(size.as_deref(), width, height)?;
-    let rgba_output = match background.as_deref() {
-        Some("transparent") => true,
-        Some("opaque" | "auto") | None => rgba_flag,
-        Some(other) => {
-            return Err(format!(
-                "invalid 'background' value '{other}': expected 'transparent', 'opaque', or 'auto'"
-            ));
-        }
-    };
+    let rgba_output = resolve_rgba_output(background.as_deref(), rgba_flag, &condition_images)?;
     if !(1..=MAX_BATCH_IMAGES).contains(&n) {
         return Err(format!("'n' must be in 1..={MAX_BATCH_IMAGES}"));
     }
@@ -1140,5 +1150,29 @@ mod tests {
         assert_eq!(mp_parsed.width, Some(512));
         assert_eq!(mp_parsed.height, Some(512));
         assert_eq!(mp_parsed.condition_images.len(), 1);
+        assert!(!mp_parsed.rgba_output);
+
+        // Editing a transparent RGBA sticker with default background ("auto" / omitted) preserves RGBA output,
+        // whereas mixed transparent + opaque multi-image composition defaults to opaque RGB unless requested.
+        let mut rgba_sticker = vec![0u8; 4 * 4 * 4];
+        rgba_sticker[0..4].copy_from_slice(&[255, 100, 50, 255]); // 1 opaque pixel, 15 transparent pixels
+        let sticker_png = encode_png_bytes(&rgba_sticker, 4, 4, 4).unwrap();
+        let sticker_b64 = encode_base64(&sticker_png);
+        let edit_sticker_body = serde_json::to_vec(&json!({
+            "prompt": "Change the potion to emerald green",
+            "image": sticker_b64,
+        }))
+        .unwrap();
+        let edit_sticker = parse_json_image_request(&edit_sticker_body, false, true).unwrap();
+        assert!(edit_sticker.rgba_output);
+
+        let opaque_b64 = encode_base64(&png);
+        let edit_mixed_body = serde_json::to_vec(&json!({
+            "prompt": "Place image 1 next to image 2",
+            "images": [sticker_b64, opaque_b64],
+        }))
+        .unwrap();
+        let edit_mixed = parse_json_image_request(&edit_mixed_body, false, true).unwrap();
+        assert!(!edit_mixed.rgba_output);
     }
 }
