@@ -39,6 +39,50 @@ pub struct SafetensorsArchive {
     base_dir: Option<PathBuf>,
     files: HashMap<String, File>,
     entries: HashMap<String, TensorInfo>,
+    ple_shards: std::collections::HashSet<String>,
+}
+
+/// Streaming deserializer that extracts unique shard filenames from `weight_map`
+/// in `model.safetensors.index.json` without allocating hundreds of thousands of
+/// intermediate tensor-key `String`s or `serde_json::Value` tree nodes.
+struct UniqueShardValues(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for UniqueShardValues {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueShardValues;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a weight_map object mapping tensor names to shard filenames")
+            }
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut seen = std::collections::HashSet::new();
+                let mut ordered = Vec::new();
+                while let Some((_, shard)) =
+                    access.next_entry::<serde::de::IgnoredAny, std::borrow::Cow<'de, str>>()?
+                {
+                    if !seen.contains(shard.as_ref()) {
+                        let owned = shard.into_owned();
+                        seen.insert(owned.clone());
+                        ordered.push(owned);
+                    }
+                }
+                Ok(UniqueShardValues(ordered))
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct IndexedSafetensorsManifest {
+    weight_map: Option<UniqueShardValues>,
 }
 
 impl SafetensorsArchive {
@@ -51,14 +95,7 @@ impl SafetensorsArchive {
         {
             use std::os::fd::AsRawFd as _;
             for (name, file) in &self.files {
-                if name.contains("ple")
-                    || self.entries.values().any(|info| {
-                        info.shard_file == *name
-                            && info
-                                .name
-                                .contains(".ple.ple_embedding.ngram_embedding.shard_")
-                    })
-                {
+                if self.ple_shards.contains(name) {
                     continue;
                 }
                 // SAFETY: `file.as_raw_fd()` is a valid open file descriptor owned by `self`,
@@ -126,22 +163,26 @@ impl SafetensorsArchive {
         Ok((data_base, file_len, header))
     }
 
-    fn insert_entries_from_header(
+    fn parse_entries_from_header(
         shard_key: &str,
         data_base: u64,
         file_len: u64,
         header: &Json,
-        entries: &mut HashMap<String, TensorInfo>,
-    ) -> io::Result<()> {
+    ) -> io::Result<(Vec<(String, TensorInfo)>, bool)> {
         let obj = header.as_object().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "safetensors header is not an object",
             )
         })?;
+        let mut is_ple = shard_key.contains("ple");
+        let mut parsed = Vec::with_capacity(obj.len());
         for (name, meta) in obj {
             if name == "__metadata__" || meta.get("dtype").is_none() {
                 continue;
+            }
+            if !is_ple && name.contains(".ple.ple_embedding.ngram_embedding.shard_") {
+                is_ple = true;
             }
             let dtype = meta["dtype"]
                 .as_str()
@@ -183,7 +224,7 @@ impl SafetensorsArchive {
                     format!("tensor {name} exceeds file end"),
                 ));
             }
-            entries.insert(
+            parsed.push((
                 name.clone(),
                 TensorInfo {
                     name: name.clone(),
@@ -193,9 +234,9 @@ impl SafetensorsArchive {
                     dtype,
                     shape,
                 },
-            );
+            ));
         }
-        Ok(())
+        Ok((parsed, is_ple))
     }
 
     fn open_single_file(file_path: &Path) -> io::Result<Self> {
@@ -206,70 +247,102 @@ impl SafetensorsArchive {
             .and_then(|s| s.to_str())
             .unwrap_or("model.safetensors")
             .to_string();
-        let mut entries = HashMap::new();
-        Self::insert_entries_from_header(&shard_key, data_base, file_len, &header, &mut entries)?;
-        let mut files = HashMap::new();
+        let (parsed, is_ple) =
+            Self::parse_entries_from_header(&shard_key, data_base, file_len, &header)?;
+        let mut entries = HashMap::with_capacity(parsed.len());
+        entries.extend(parsed);
+        let mut ple_shards = std::collections::HashSet::new();
+        if is_ple {
+            ple_shards.insert(shard_key.clone());
+        }
+        let mut files = HashMap::with_capacity(1);
         files.insert(shard_key, f);
         Ok(Self {
             base_dir: file_path.parent().map(Path::to_path_buf),
             files,
             entries,
+            ple_shards,
         })
     }
 
     fn open_indexed_dir(dir: &Path, index_path: &Path) -> io::Result<Self> {
-        let index_text = fs::read_to_string(index_path)?;
-        let index_json: Json = serde_json::from_str(&index_text).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad model.safetensors.index.json: {e}"),
-            )
-        })?;
-        let weight_map = index_json["weight_map"].as_object().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing weight_map in safetensors index",
-            )
-        })?;
-        let mut files = HashMap::new();
-        let mut entries = HashMap::new();
-        for shard_val in weight_map.values() {
-            let shard_name = shard_val.as_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "shard filename not a string")
+        let index_bytes = fs::read(index_path)?;
+        let manifest: IndexedSafetensorsManifest =
+            serde_json::from_slice(&index_bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad model.safetensors.index.json: {e}"),
+                )
             })?;
-            if files.contains_key(shard_name) {
-                continue;
-            }
+        let mut shard_names = manifest
+            .weight_map
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing weight_map in safetensors index",
+                )
+            })?
+            .0;
+        let extra_name = "model_extra_tensors.safetensors";
+        if !shard_names.iter().any(|s| s == extra_name) && dir.join(extra_name).exists() {
+            shard_names.push(extra_name.to_string());
+        }
+
+        type ShardParseResult = (String, File, Vec<(String, TensorInfo)>, bool);
+        let parse_one = |shard_name: &str| -> io::Result<ShardParseResult> {
             let shard_path = dir.join(shard_name);
             let f = File::open(&shard_path)?;
             let (data_base, file_len, header) = Self::parse_safetensors_header(&f)?;
-            Self::insert_entries_from_header(
-                shard_name,
-                data_base,
-                file_len,
-                &header,
-                &mut entries,
-            )?;
-            files.insert(shard_name.to_string(), f);
-        }
-        let extra_name = "model_extra_tensors.safetensors";
-        let extra_path = dir.join(extra_name);
-        if !files.contains_key(extra_name) && extra_path.exists() {
-            let f = File::open(&extra_path)?;
-            let (data_base, file_len, header) = Self::parse_safetensors_header(&f)?;
-            Self::insert_entries_from_header(
-                extra_name,
-                data_base,
-                file_len,
-                &header,
-                &mut entries,
-            )?;
-            files.insert(extra_name.to_string(), f);
+            let (parsed, is_ple) =
+                Self::parse_entries_from_header(shard_name, data_base, file_len, &header)?;
+            Ok((shard_name.to_string(), f, parsed, is_ple))
+        };
+
+        let shard_results: Vec<ShardParseResult> = if shard_names.len() <= 1 {
+            shard_names
+                .iter()
+                .map(|s| parse_one(s))
+                .collect::<io::Result<Vec<_>>>()?
+        } else {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 8))
+                .unwrap_or(4)
+                .min(shard_names.len());
+            let chunk_len = shard_names.len().div_ceil(workers).max(1);
+            std::thread::scope(|s| -> io::Result<Vec<ShardParseResult>> {
+                let mut handles = Vec::with_capacity(workers);
+                for chunk in shard_names.chunks(chunk_len) {
+                    handles.push(s.spawn(move || -> io::Result<Vec<ShardParseResult>> {
+                        chunk.iter().map(|name| parse_one(name)).collect()
+                    }));
+                }
+                let mut out = Vec::with_capacity(shard_names.len());
+                for h in handles {
+                    let sub = h
+                        .join()
+                        .map_err(|_| io::Error::other("safetensors header thread panicked"))??;
+                    out.extend(sub);
+                }
+                Ok(out)
+            })?
+        };
+
+        let total_entries: usize = shard_results.iter().map(|(_, _, p, _)| p.len()).sum();
+        let mut files = HashMap::with_capacity(shard_results.len());
+        let mut entries = HashMap::with_capacity(total_entries);
+        let mut ple_shards = std::collections::HashSet::new();
+        for (shard_name, f, parsed, is_ple) in shard_results {
+            if is_ple {
+                ple_shards.insert(shard_name.clone());
+            }
+            entries.extend(parsed);
+            files.insert(shard_name, f);
         }
         Ok(Self {
             base_dir: Some(dir.to_path_buf()),
             files,
             entries,
+            ple_shards,
         })
     }
 
@@ -333,6 +406,82 @@ impl SafetensorsArchive {
         f.read_exact_at(dst, info.offset)
     }
 
+    /// Reads the raw bytes of `info` directly into a raw `dst` pointer of `len` bytes
+    /// without requiring `dst` to be pre-initialized (safe for `MappedHostBuffer::alloc_unzeroed`).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `len` bytes and exclusively owned for the call duration.
+    #[cfg(feature = "cuda")]
+    pub(crate) unsafe fn read_exact_info_raw(
+        &self,
+        info: &TensorInfo,
+        dst: *mut u8,
+        len: usize,
+    ) -> io::Result<()> {
+        if len as u64 != info.len_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tensor {} byte length mismatch: expected {}, got {}",
+                    info.name, info.len_bytes, len
+                ),
+            ));
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = f.as_raw_fd();
+            let mut done = 0usize;
+            while done < len {
+                let off = info.offset.checked_add(done as u64).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "pread offset overflow")
+                })?;
+                let off_i64 = libc::off_t::try_from(off).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "pread offset exceeds off_t")
+                })?;
+                // SAFETY: `dst.add(done)` is valid for `len - done` writable bytes.
+                let rc = unsafe {
+                    libc::pread(
+                        fd,
+                        dst.add(done).cast::<libc::c_void>(),
+                        len - done,
+                        off_i64,
+                    )
+                };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if rc == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("unexpected EOF reading tensor '{}'", info.name),
+                    ));
+                }
+                done += rc as usize;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            // SAFETY: Zero-initialize on non-Unix before forming `&mut [u8]`.
+            unsafe {
+                core::ptr::write_bytes(dst, 0, len);
+                let slice = std::slice::from_raw_parts_mut(dst, len);
+                f.read_exact_at(slice, info.offset)
+            }
+        }
+    }
+
     /// Reads the raw bytes of `name` directly into `dst` via `pread` (`read_exact_at`)
     /// without allocating an intermediate `Vec<u8>`.
     pub fn read_exact_into(&self, name: &str, dst: &mut [u8]) -> io::Result<()> {
@@ -371,13 +520,48 @@ impl SafetensorsArchive {
         Ok(buf)
     }
 
-    fn read_le_u16_vec(&self, name: &str, info: &TensorInfo) -> io::Result<Vec<u16>> {
-        let len_bytes = info.len_bytes as usize;
-        if !len_bytes.is_multiple_of(2) {
+    fn read_le_u16_subslice_conv(
+        &self,
+        name: &str,
+        info: &TensorInfo,
+        elem_offset: usize,
+        elem_len: usize,
+        convert_bf16: bool,
+    ) -> io::Result<Vec<u16>> {
+        let mut out = vec![0u16; elem_len];
+        self.read_le_u16_subslice_conv_into(name, info, elem_offset, &mut out, convert_bf16)?;
+        Ok(out)
+    }
+
+    fn read_le_u16_subslice_conv_into(
+        &self,
+        name: &str,
+        info: &TensorInfo,
+        elem_offset: usize,
+        dst: &mut [u16],
+        convert_bf16: bool,
+    ) -> io::Result<()> {
+        let total_bytes = info.len_bytes as usize;
+        if !total_bytes.is_multiple_of(2) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("tensor {name} byte length not a multiple of 2"),
             ));
+        }
+        let total_elems = total_bytes / 2;
+        let end_elem = elem_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "u16 subslice overflow"))?;
+        if end_elem > total_elems {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tensor {name} u16 subslice {elem_offset}..{end_elem} exceeds {total_elems}"
+                ),
+            ));
+        }
+        if dst.is_empty() {
+            return Ok(());
         }
         let f = self.files.get(&info.shard_file).ok_or_else(|| {
             io::Error::new(
@@ -385,44 +569,42 @@ impl SafetensorsArchive {
                 format!("shard '{}' not open", info.shard_file),
             )
         })?;
-        let num_elems = len_bytes / 2;
-        let mut out = vec![0u16; num_elems];
-        if len_bytes < 8 * 1024 * 1024 {
-            // SAFETY: `out` is an initialized contiguous `u16` buffer of `len_bytes` bytes,
-            // and any bit pattern is valid for `u16`.
-            let byte_slice =
-                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len_bytes) };
-            f.read_exact_at(byte_slice, info.offset)?;
-            #[cfg(target_endian = "big")]
-            for w in &mut out {
-                *w = u16::from_le(*w);
+        const L2_BLOCK_ELEMS: usize = 512 * 1024; // 1 MiB L2-resident conversion window
+        let read_and_convert = |slice: &mut [u16], mut file_off: u64| -> io::Result<()> {
+            for block in slice.chunks_mut(L2_BLOCK_ELEMS) {
+                let block_bytes = block.len() * 2;
+                // SAFETY: `block` is a valid mutable `[u16]` slice of `block_bytes` bytes.
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(block.as_mut_ptr().cast::<u8>(), block_bytes)
+                };
+                f.read_exact_at(byte_slice, file_off)?;
+                #[cfg(target_endian = "big")]
+                for w in block.iter_mut() {
+                    *w = u16::from_le(*w);
+                }
+                if convert_bf16 {
+                    bf16_to_f16_slice_inplace(block);
+                }
+                file_off += block_bytes as u64;
             }
+            Ok(())
+        };
+
+        let base_offset = info.offset + (elem_offset as u64) * 2;
+        if dst.len() < 2 * 1024 * 1024 {
+            read_and_convert(dst, base_offset)?;
         } else {
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get().clamp(1, 8))
                 .unwrap_or(4);
-            let chunk_elems = num_elems.div_ceil(num_threads).max(1);
-            let base_offset = info.offset;
+            let chunk_elems = dst.len().div_ceil(num_threads).max(1);
             std::thread::scope(|s| -> io::Result<()> {
                 let mut handles = Vec::with_capacity(num_threads);
-                for (chunk_idx, dst_chunk) in out.chunks_mut(chunk_elems).enumerate() {
-                    let elem_offset = chunk_idx * chunk_elems;
-                    let byte_offset = base_offset + (elem_offset as u64) * 2;
+                for (chunk_idx, dst_chunk) in dst.chunks_mut(chunk_elems).enumerate() {
+                    let rel_elem = chunk_idx * chunk_elems;
+                    let byte_offset = base_offset + (rel_elem as u64) * 2;
                     handles.push(s.spawn(move || -> io::Result<()> {
-                        let chunk_bytes = dst_chunk.len() * 2;
-                        // SAFETY: `dst_chunk` is a disjoint mutable `[u16]` slice of `chunk_bytes` bytes.
-                        let byte_slice = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                dst_chunk.as_mut_ptr().cast::<u8>(),
-                                chunk_bytes,
-                            )
-                        };
-                        f.read_exact_at(byte_slice, byte_offset)?;
-                        #[cfg(target_endian = "big")]
-                        for w in dst_chunk.iter_mut() {
-                            *w = u16::from_le(*w);
-                        }
-                        Ok(())
+                        read_and_convert(dst_chunk, byte_offset)
                     }));
                 }
                 for h in handles {
@@ -433,7 +615,102 @@ impl SafetensorsArchive {
                 Ok(())
             })?;
         }
-        Ok(out)
+        Ok(())
+    }
+
+    fn read_le_u16_vec(&self, name: &str, info: &TensorInfo) -> io::Result<Vec<u16>> {
+        let len_bytes = info.len_bytes as usize;
+        if !len_bytes.is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {name} byte length not a multiple of 2"),
+            ));
+        }
+        self.read_le_u16_subslice_conv(name, info, 0, len_bytes / 2, false)
+    }
+
+    pub fn read_u32_info_subslice_into(
+        &self,
+        info: &TensorInfo,
+        elem_offset: usize,
+        dst: &mut [u32],
+    ) -> io::Result<()> {
+        let total_bytes = info.len_bytes as usize;
+        if !total_bytes.is_multiple_of(4) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {} byte length not a multiple of 4", info.name),
+            ));
+        }
+        let total_elems = total_bytes / 4;
+        let end_elem = elem_offset
+            .checked_add(dst.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "u32 subslice overflow"))?;
+        if end_elem > total_elems {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tensor {} u32 subslice {elem_offset}..{end_elem} exceeds {total_elems}",
+                    info.name
+                ),
+            ));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let base_offset = info.offset + (elem_offset as u64) * 4;
+        if dst.len() < 2 * 1024 * 1024 {
+            let len_bytes = dst.len() * 4;
+            // SAFETY: `dst` is a valid mutable `[u32]` slice of `len_bytes` bytes.
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), len_bytes) };
+            f.read_exact_at(byte_slice, base_offset)?;
+            #[cfg(target_endian = "big")]
+            for w in dst.iter_mut() {
+                *w = u32::from_le(*w);
+            }
+        } else {
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 8))
+                .unwrap_or(4);
+            let chunk_elems = dst.len().div_ceil(num_threads).max(1);
+            std::thread::scope(|s| -> io::Result<()> {
+                let mut handles = Vec::with_capacity(num_threads);
+                for (chunk_idx, dst_chunk) in dst.chunks_mut(chunk_elems).enumerate() {
+                    let rel_elem = chunk_idx * chunk_elems;
+                    let byte_offset = base_offset + (rel_elem as u64) * 4;
+                    handles.push(s.spawn(move || -> io::Result<()> {
+                        let chunk_bytes = dst_chunk.len() * 4;
+                        // SAFETY: `dst_chunk` is a disjoint mutable `[u32]` slice of `chunk_bytes` bytes.
+                        let byte_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                dst_chunk.as_mut_ptr().cast::<u8>(),
+                                chunk_bytes,
+                            )
+                        };
+                        f.read_exact_at(byte_slice, byte_offset)?;
+                        #[cfg(target_endian = "big")]
+                        for w in dst_chunk.iter_mut() {
+                            *w = u32::from_le(*w);
+                        }
+                        Ok(())
+                    }));
+                }
+                for h in handles {
+                    h.join().map_err(|_| {
+                        io::Error::other("safetensors u32 reader thread panicked")
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     fn read_le_u32_vec(&self, name: &str, info: &TensorInfo) -> io::Result<Vec<u32>> {
@@ -444,22 +721,20 @@ impl SafetensorsArchive {
                 format!("tensor {name} byte length not a multiple of 4"),
             ));
         }
-        let f = self.files.get(&info.shard_file).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("shard '{}' not open", info.shard_file),
-            )
-        })?;
         let mut out = vec![0u32; len_bytes / 4];
-        // SAFETY: `out` is an initialized contiguous `u32` buffer of `len_bytes` bytes,
-        // and any bit pattern is valid for `u32`.
-        let byte_slice =
-            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len_bytes) };
-        f.read_exact_at(byte_slice, info.offset)?;
-        #[cfg(target_endian = "big")]
-        for w in &mut out {
-            *w = u32::from_le(*w);
-        }
+        self.read_u32_info_subslice_into(info, 0, &mut out)?;
+        Ok(out)
+    }
+
+    pub fn read_u32_subslice(
+        &self,
+        name: &str,
+        elem_offset: usize,
+        elem_len: usize,
+    ) -> io::Result<Vec<u32>> {
+        let info = self.tensor_info(name)?;
+        let mut out = vec![0u32; elem_len];
+        self.read_u32_info_subslice_into(info, elem_offset, &mut out)?;
         Ok(out)
     }
 
@@ -639,25 +914,23 @@ impl SafetensorsArchive {
     pub fn read_f16_bits(&self, name: &str) -> io::Result<Vec<u16>> {
         let info = self.tensor_info(name)?;
         match info.dtype.as_str() {
-            "F16" => self.read_le_u16_vec(name, info),
-            "BF16" => {
-                let mut words = self.read_le_u16_vec(name, info)?;
-                if words.len() < 4 * 1024 * 1024 {
-                    bf16_to_f16_slice_inplace(&mut words);
-                } else {
-                    let num_threads = std::thread::available_parallelism()
-                        .map(|n| n.get().clamp(1, 8))
-                        .unwrap_or(4);
-                    let chunk_elems = words.len().div_ceil(num_threads).max(1);
-                    std::thread::scope(|s| {
-                        for chunk in words.chunks_mut(chunk_elems) {
-                            s.spawn(move || {
-                                bf16_to_f16_slice_inplace(chunk);
-                            });
-                        }
-                    });
+            "F16" => {
+                if !info.len_bytes.is_multiple_of(2) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tensor {name} byte length not a multiple of 2"),
+                    ));
                 }
-                Ok(words)
+                self.read_le_u16_subslice_conv(name, info, 0, (info.len_bytes / 2) as usize, false)
+            }
+            "BF16" => {
+                if !info.len_bytes.is_multiple_of(2) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tensor {name} byte length not a multiple of 2"),
+                    ));
+                }
+                self.read_le_u16_subslice_conv(name, info, 0, (info.len_bytes / 2) as usize, true)
             }
             "F32" => {
                 let words = self.read_le_u32_vec(name, info)?;
@@ -669,6 +942,49 @@ impl SafetensorsArchive {
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported dtype {other} for read_f16_bits({name})"),
+            )),
+        }
+    }
+
+    /// Reads a contiguous element subslice `[elem_offset..elem_offset + elem_len]` of any
+    /// floating-point tensor (`F16`, `BF16`, `F32`) as IEEE-754 `FP16` bits.
+    pub fn read_f16_bits_subslice(
+        &self,
+        name: &str,
+        elem_offset: usize,
+        elem_len: usize,
+    ) -> io::Result<Vec<u16>> {
+        let info = self.tensor_info(name)?;
+        let mut out = vec![0u16; elem_len];
+        self.read_f16_bits_info_subslice_into(info, elem_offset, &mut out)?;
+        Ok(out)
+    }
+
+    /// Reads a contiguous element subslice `[elem_offset..elem_offset + dst.len()]` of `info`
+    /// into `dst` as IEEE-754 `FP16` bits without repeating a `HashMap` lookup.
+    pub fn read_f16_bits_info_subslice_into(
+        &self,
+        info: &TensorInfo,
+        elem_offset: usize,
+        dst: &mut [u16],
+    ) -> io::Result<()> {
+        match info.dtype.as_str() {
+            "F16" => self.read_le_u16_subslice_conv_into(&info.name, info, elem_offset, dst, false),
+            "BF16" => self.read_le_u16_subslice_conv_into(&info.name, info, elem_offset, dst, true),
+            "F32" => {
+                let mut raw_u32 = vec![0u32; dst.len()];
+                self.read_u32_info_subslice_into(info, elem_offset, &mut raw_u32)?;
+                for (out, &bits) in dst.iter_mut().zip(&raw_u32) {
+                    *out = f32_to_f16(f32::from_bits(bits));
+                }
+                Ok(())
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported dtype {other} for read_f16_bits_subslice({})",
+                    info.name
+                ),
             )),
         }
     }

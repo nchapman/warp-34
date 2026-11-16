@@ -345,6 +345,33 @@ pub struct Qwen3_5MtpRank {
     pub batch_hidden_rows: usize,
     max_batch_rows: usize,
 }
+pub(crate) fn load_mtp_linear_rows(
+    archive: &SafetensorsArchive,
+    quant: &crate::loader::QuantScheme,
+    name: &str,
+    full_n: usize,
+    k: usize,
+    row_start: usize,
+    row_end: usize,
+) -> Result<RawLinearHost> {
+    let pfx_key = format!("mtp.{name}");
+    let (raw, actual_full_n) =
+        RawLinearHost::load_row_shard_with_full_n(archive, &pfx_key, quant, row_start, row_end)?;
+    if actual_full_n == full_n && raw.dims() == (row_end - row_start, k) {
+        Ok(raw)
+    } else {
+        Err(crate::cuda::CudaError::with_detail(
+            -301,
+            "MTP requires correctly shaped weights",
+            format!(
+                "mtp.{name} has full_n={actual_full_n} shard dims {:?}, expected ({}, {k}) from full ({full_n}, {k})",
+                raw.dims(),
+                row_end - row_start
+            ),
+        ))
+    }
+}
+
 impl Qwen3_5MtpRank {
     fn concat_fc(&self) -> Result<&LinearProj> {
         match &self.input_fusion {
@@ -475,9 +502,14 @@ impl Qwen3_5MtpRank {
             capacity
         };
         let bytes = weight_arena_bytes(c, tp, mtp_capacity, ffn_weight_bytes);
-        let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
+        let mut weights =
+            DeviceArena::new_on_stream(target.device.device_id, bytes, &target.stream)?;
         let staging_bytes = repack_staging_bytes(c, tp);
-        let staging = DeviceBuffer::alloc(target.device.device_id, staging_bytes)?;
+        let mut upload_ring = crate::cuda::PinnedUploadRing::new(
+            target.device.device_id,
+            staging_bytes,
+            &target.stream,
+        )?;
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
             let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;
             if raw.dims() == (n, k) {
@@ -490,38 +522,65 @@ impl Qwen3_5MtpRank {
                 ))
             }
         };
+        let load_rows = |name: &str,
+                         full_n: usize,
+                         k: usize,
+                         row_start: usize,
+                         row_end: usize|
+         -> Result<RawLinearHost> {
+            load_mtp_linear_rows(&archive, &c.quant, name, full_n, k, row_start, row_end)
+        };
         let input_fusion = if uses_hc {
             MtpInputFusion::DualStreamBroadcast {
-                fc_embedding: load("fc_embedding", h, h)?.upload(
+                fc_embedding: load("fc_embedding", h, h)?.upload_pipelined(
                     &mut weights,
                     &target.stream,
-                    &staging,
+                    &mut upload_ring,
                 )?,
-                fc_hidden: load("fc_hidden", h, h)?.upload(
+                fc_hidden: load("fc_hidden", h, h)?.upload_pipelined(
                     &mut weights,
                     &target.stream,
-                    &staging,
+                    &mut upload_ring,
                 )?,
             }
         } else {
             MtpInputFusion::ConcatLinear {
-                fc: load("fc", h, 2 * h)?.upload(&mut weights, &target.stream, &staging)?,
+                fc: load("fc", h, 2 * h)?.upload_pipelined(
+                    &mut weights,
+                    &target.stream,
+                    &mut upload_ring,
+                )?,
             }
         };
-        let qs = load("layers.0.self_attn.q_proj", 2 * q, h)?
-            .slice_rows(r * 2 * q / tp, (r + 1) * 2 * q / tp);
-        let ks = load("layers.0.self_attn.k_proj", kv, h)?
-            .slice_rows(kv_shard_idx * local_kv, (kv_shard_idx + 1) * local_kv);
-        let vs = load("layers.0.self_attn.v_proj", kv, h)?
-            .slice_rows(kv_shard_idx * local_kv, (kv_shard_idx + 1) * local_kv);
-        let qkv_proj = RawLinearHost::concat_rows(&[qs, ks, vs])?.upload(
+        let qs = load_rows(
+            "layers.0.self_attn.q_proj",
+            2 * q,
+            h,
+            r * 2 * q / tp,
+            (r + 1) * 2 * q / tp,
+        )?;
+        let ks = load_rows(
+            "layers.0.self_attn.k_proj",
+            kv,
+            h,
+            kv_shard_idx * local_kv,
+            (kv_shard_idx + 1) * local_kv,
+        )?;
+        let vs = load_rows(
+            "layers.0.self_attn.v_proj",
+            kv,
+            h,
+            kv_shard_idx * local_kv,
+            (kv_shard_idx + 1) * local_kv,
+        )?;
+        let qkv_proj = RawLinearHost::concat_rows(&[qs, ks, vs])?.upload_pipelined(
             &mut weights,
             &target.stream,
-            &staging,
+            &mut upload_ring,
         )?;
         let o_proj = load("layers.0.self_attn.o_proj", h, q)?
-            .slice_cols(r * q / tp, (r + 1) * q / tp)?
-            .upload(&mut weights, &target.stream, &staging)?;
+            .into_slice_cols(r * q / tp, (r + 1) * q / tp)?
+            .upload_pipelined(&mut weights, &target.stream, &mut upload_ring)?;
         let ffn = if is_moe_mtp {
             FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
                 &archive,
@@ -530,19 +589,19 @@ impl Qwen3_5MtpRank {
                 "mtp.layers.0",
                 [r, tp],
                 &mut weights,
-                (&target.stream, &staging),
+                (&target.stream, &mut upload_ring),
             )?))
         } else {
-            let gs = load("layers.0.mlp.gate_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
-            let us = load("layers.0.mlp.up_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
-            let gate_up_proj = RawLinearHost::concat_rows(&[gs, us])?.upload(
+            let gs = load_rows("layers.0.mlp.gate_proj", i, h, r * i / tp, (r + 1) * i / tp)?;
+            let us = load_rows("layers.0.mlp.up_proj", i, h, r * i / tp, (r + 1) * i / tp)?;
+            let gate_up_proj = RawLinearHost::concat_rows(&[gs, us])?.upload_pipelined(
                 &mut weights,
                 &target.stream,
-                &staging,
+                &mut upload_ring,
             )?;
             let down_proj = load("layers.0.mlp.down_proj", h, i)?
-                .slice_cols(r * i / tp, (r + 1) * i / tp)?
-                .upload(&mut weights, &target.stream, &staging)?;
+                .into_slice_cols(r * i / tp, (r + 1) * i / tp)?
+                .upload_pipelined(&mut weights, &target.stream, &mut upload_ring)?;
             FfnBlockWeights::Dense {
                 gate_up_proj,
                 down_proj,
@@ -555,12 +614,16 @@ impl Qwen3_5MtpRank {
                 "mtp.layers.0",
                 &mut weights,
                 &target.stream,
-                &staging,
+                &mut upload_ring,
             )?)
         } else {
             None
         };
-        let norm = |weights: &mut DeviceArena, name: &str, size: usize| -> Result<u64> {
+        let norm = |weights: &mut DeviceArena,
+                    ring: &mut crate::cuda::PinnedUploadRing,
+                    name: &str,
+                    size: usize|
+         -> Result<u64> {
             let key = archive
                 .resolve_name(&format!("mtp.{name}.weight"))
                 .ok_or_else(|| loader_err("missing MTP norm"))?;
@@ -570,7 +633,7 @@ impl Qwen3_5MtpRank {
             if v.len() != size {
                 return Err(loader_err("MTP norm shape"));
             }
-            weights.upload_slice(&v, &target.stream)
+            ring.upload_slice(weights, &v, &target.stream)
         };
         let max_batch_rows = capacity.min(256);
         let (norms, residual, final_residual) = if uses_hc {
@@ -581,7 +644,7 @@ impl Qwen3_5MtpRank {
                 true,
                 &mut weights,
                 &target.stream,
-                &staging,
+                &mut upload_ring,
             )?;
             let mlp_hc = load_hc_block_weights(
                 &archive,
@@ -590,7 +653,7 @@ impl Qwen3_5MtpRank {
                 true,
                 &mut weights,
                 &target.stream,
-                &staging,
+                &mut upload_ring,
             )?;
             let final_hc_mixer = load_hc_block_weights(
                 &archive,
@@ -599,11 +662,16 @@ impl Qwen3_5MtpRank {
                 false,
                 &mut weights,
                 &target.stream,
-                &staging,
+                &mut upload_ring,
             )?;
-            drop(staging);
-            let pre_fc_norm_embedding_ptr = norm(&mut weights, "pre_fc_norm_embedding", h)?;
-            let pre_fc_norm_hidden_ptr = norm(&mut weights, "pre_fc_norm_hidden", hc_count * h)?;
+            let pre_fc_norm_embedding_ptr =
+                norm(&mut weights, &mut upload_ring, "pre_fc_norm_embedding", h)?;
+            let pre_fc_norm_hidden_ptr = norm(
+                &mut weights,
+                &mut upload_ring,
+                "pre_fc_norm_hidden",
+                hc_count * h,
+            )?;
             (
                 [pre_fc_norm_embedding_ptr, pre_fc_norm_hidden_ptr, 0, 0, 0],
                 LayerResidual::HyperConnection { attn_hc, mlp_hc },
@@ -612,13 +680,22 @@ impl Qwen3_5MtpRank {
                 },
             )
         } else {
-            drop(staging);
             let norms = [
-                norm(&mut weights, "pre_fc_norm_embedding", h)?,
-                norm(&mut weights, "pre_fc_norm_hidden", h)?,
-                norm(&mut weights, "layers.0.input_layernorm", h)?,
-                norm(&mut weights, "layers.0.post_attention_layernorm", h)?,
-                norm(&mut weights, "norm", h)?,
+                norm(&mut weights, &mut upload_ring, "pre_fc_norm_embedding", h)?,
+                norm(&mut weights, &mut upload_ring, "pre_fc_norm_hidden", h)?,
+                norm(
+                    &mut weights,
+                    &mut upload_ring,
+                    "layers.0.input_layernorm",
+                    h,
+                )?,
+                norm(
+                    &mut weights,
+                    &mut upload_ring,
+                    "layers.0.post_attention_layernorm",
+                    h,
+                )?,
+                norm(&mut weights, &mut upload_ring, "norm", h)?,
             ];
             (
                 norms,
@@ -658,10 +735,21 @@ impl Qwen3_5MtpRank {
             kv_layer_ordinal: 0,
             qkv_proj,
             o_proj,
-            q_norm_ptr: norm(&mut weights, "layers.0.self_attn.q_norm", c.head_dim)?,
-            k_norm_ptr: norm(&mut weights, "layers.0.self_attn.k_norm", c.head_dim)?,
+            q_norm_ptr: norm(
+                &mut weights,
+                &mut upload_ring,
+                "layers.0.self_attn.q_norm",
+                c.head_dim,
+            )?,
+            k_norm_ptr: norm(
+                &mut weights,
+                &mut upload_ring,
+                "layers.0.self_attn.k_norm",
+                c.head_dim,
+            )?,
             qsa_indexer,
         };
+        drop(upload_ring);
         let mut kv = KvPool::new(
             target.device.device_id,
             WARP34_KV_NAMESPACE_MTP_FULL_ATTN,

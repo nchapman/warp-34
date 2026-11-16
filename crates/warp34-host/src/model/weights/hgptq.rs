@@ -14,6 +14,15 @@ impl RawLinearHost {
         prefix: &str,
         quant: &QuantScheme,
     ) -> Result<Self> {
+        Self::load_with_transform_row_range(archive, prefix, quant, None).map(|(raw, _)| raw)
+    }
+
+    pub(super) fn load_with_transform_row_range(
+        archive: &SafetensorsArchive,
+        prefix: &str,
+        quant: &QuantScheme,
+        row_range: Option<(usize, usize)>,
+    ) -> Result<(Self, usize)> {
         let name = ["weight_packed", "qweight", "weight"]
             .into_iter()
             .find_map(|suffix| {
@@ -28,9 +37,10 @@ impl RawLinearHost {
         let block = quant
             .input_hadamard(&name)
             .map_err(|e| loader_err_msg(e.to_string()))?;
-        let raw = Self::load_untransformed(archive, prefix, &resolved)?;
+        let (raw, full_n) =
+            Self::load_untransformed_row_range(archive, prefix, &resolved, row_range)?;
         let Some(block_size) = block else {
-            return Ok(raw);
+            return Ok((raw, full_n));
         };
         let (n, k, group_size) = match &raw {
             Self::U2B2NMajor {
@@ -56,10 +66,13 @@ impl RawLinearHost {
                 "HGPTQ geometry/group mismatch for {name}: N={n} K={k} group={group_size} block={block_size}"
             )));
         }
-        Ok(Self::Hadamard {
-            inner: Box::new(raw),
-            block_size,
-        })
+        Ok((
+            Self::Hadamard {
+                inner: Box::new(raw),
+                block_size,
+            },
+            full_n,
+        ))
     }
 
     pub(super) fn concat_transformed_rows(parts: &[&Self]) -> Result<Self> {
@@ -87,12 +100,12 @@ impl RawLinearHost {
     }
 
     #[cfg(feature = "cuda")]
-    pub(super) fn upload_hadamard(
+    pub(super) fn upload_hadamard_with(
         &self,
         block_size: usize,
         arena: &mut DeviceArena,
         stream: &CudaStream,
-        staging: &DeviceBuffer,
+        staging: &mut UploadStaging<'_>,
     ) -> Result<LinearProj> {
         let (n, k) = self.dims();
         let padded;
@@ -102,7 +115,7 @@ impl RawLinearHost {
             padded = self.pad_hadamard_weight()?;
             &padded
         };
-        let inner = storage.upload(arena, stream, staging)?;
+        let inner = storage.upload_with(arena, stream, staging)?;
         if !matches!(
             inner,
             LinearProj::MarlinW2A16 { .. } | LinearProj::MarlinW4A16 { .. }

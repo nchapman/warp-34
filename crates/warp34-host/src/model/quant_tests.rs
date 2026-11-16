@@ -902,3 +902,96 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
             srv.await.unwrap().unwrap();
         });
 }
+
+#[test]
+fn mtp_load_rows_validates_full_n_across_all_encodings() {
+    let (actual_n, wrong_expected_n, k, group) = (32usize, 16usize, 128usize, 128usize);
+    let ng = k / group;
+    // AWQ `qweight` `[K, N / 8]` + `scales` `[K / g, N]` + `qzeros` `[K / g, N / 8]`:
+    // neither `.weight_packed` nor `.weight` exists, and `row_end = 8 <= actual_n = 32`.
+    let awq_quant = QuantScheme::Awq {
+        bits: 4,
+        group_size: group,
+        zero_point: true,
+    };
+    let awq_fixture = Fixture::new(vec![
+        (
+            "mtp.layers.0.self_attn.q_proj.qweight",
+            "I32",
+            vec![k, actual_n / 8],
+            words(&vec![0u32; k * (actual_n / 8)]),
+        ),
+        (
+            "mtp.layers.0.self_attn.q_proj.scales",
+            "F16",
+            vec![ng, actual_n],
+            halves(&vec![f32_to_f16(1.0); ng * actual_n]),
+        ),
+        (
+            "mtp.layers.0.self_attn.q_proj.qzeros",
+            "I32",
+            vec![ng, actual_n / 8],
+            words(&vec![0u32; ng * (actual_n / 8)]),
+        ),
+    ]);
+    let err = crate::mtp::load_mtp_linear_rows(
+        &awq_fixture.archive(),
+        &awq_quant,
+        "layers.0.self_attn.q_proj",
+        wrong_expected_n,
+        k,
+        0,
+        8,
+    )
+    .err()
+    .expect("mismatched full_n on qweight shard must fail closed");
+    assert_eq!(err.code, -301);
+
+    // Valid AWQ shard with matching `full_n` succeeds.
+    let ok = crate::mtp::load_mtp_linear_rows(
+        &awq_fixture.archive(),
+        &awq_quant,
+        "layers.0.self_attn.q_proj",
+        actual_n,
+        k,
+        0,
+        8,
+    )
+    .unwrap();
+    assert_eq!(ok.dims(), (8, k));
+
+    // Ignored / unquantized 2D BF16 `.weight` alongside a 1D U8 `.weight_packed` sidecar
+    // validates `full_n` against the active `.weight` tensor rather than the 1D sidecar.
+    let bf16_val = (1.5f32.to_bits() >> 16) as u16;
+    let sidecar_fixture = Fixture::new(vec![
+        (
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "BF16",
+            vec![16, k],
+            halves(&vec![bf16_val; 16 * k]),
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_packed",
+            "U8",
+            vec![16 * k / 2],
+            vec![0u8; 16 * k / 2],
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_scale",
+            "U8",
+            vec![16, 2],
+            vec![0u8; 16 * 2],
+        ),
+    ]);
+    let sidecar_ok = crate::mtp::load_mtp_linear_rows(
+        &sidecar_fixture.archive(),
+        &ct(4, 128, true),
+        "layers.0.mlp.gate_proj",
+        16,
+        k,
+        0,
+        8,
+    )
+    .unwrap();
+    assert_eq!(sidecar_ok.dims(), (8, k));
+}

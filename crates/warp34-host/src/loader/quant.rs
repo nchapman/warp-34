@@ -106,21 +106,42 @@ pub fn dequant_u2b2_n_major_to_f16(
             let n = row_start + rel_n;
             let row_words = &packed_n_by_k16[n * words_per_row..(n + 1) * words_per_row];
             let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
-            for (w_idx, &word) in row_words.iter().enumerate() {
-                for b in 0..16 {
-                    let k = w_idx * 16 + b;
-                    let crumb = ((word >> (b * 2)) & 0x3) as i32 - 2;
-                    let scale = f16_to_f32(row_scales[k / eff_gs]);
-                    dst_row[k] = f32_to_f16((crumb as f32) * scale);
+            if eff_gs.is_multiple_of(16) {
+                let words_per_group = eff_gs / 16;
+                for (g, &sc_bits) in row_scales.iter().enumerate() {
+                    let scale = f16_to_f32(sc_bits);
+                    let lut = [
+                        f32_to_f16(-2.0 * scale),
+                        f32_to_f16(-scale),
+                        0u16,
+                        f32_to_f16(scale),
+                    ];
+                    let g_words = &row_words[g * words_per_group..(g + 1) * words_per_group];
+                    let g_dst = &mut dst_row[g * eff_gs..(g + 1) * eff_gs];
+                    for (w_idx, &word) in g_words.iter().enumerate() {
+                        let base = w_idx * 16;
+                        for b in 0..16 {
+                            g_dst[base + b] = lut[((word >> (b * 2)) & 0x3) as usize];
+                        }
+                    }
+                }
+            } else {
+                for (w_idx, &word) in row_words.iter().enumerate() {
+                    for b in 0..16 {
+                        let k = w_idx * 16 + b;
+                        let crumb = ((word >> (b * 2)) & 0x3) as i32 - 2;
+                        let scale = f16_to_f32(row_scales[k / eff_gs]);
+                        dst_row[k] = f32_to_f16((crumb as f32) * scale);
+                    }
                 }
             }
         }
     };
-    if size_n < 2048 {
+    if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
         let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
+            .map(|n| n.get().clamp(1, 16))
             .unwrap_or(4);
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {
@@ -152,21 +173,40 @@ pub fn dequant_u4b8_n_major_to_f16(
             let n = row_start + rel_n;
             let row_words = &packed_n_by_k8[n * words_per_row..(n + 1) * words_per_row];
             let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
-            for (w_idx, &word) in row_words.iter().enumerate() {
-                for b in 0..8 {
-                    let k = w_idx * 8 + b;
-                    let nib = ((word >> (b * 4)) & 0xF) as i32 - 8;
-                    let scale = f16_to_f32(row_scales[k / group_size]);
-                    dst_row[k] = f32_to_f16((nib as f32) * scale);
+            if group_size.is_multiple_of(8) {
+                let words_per_group = group_size / 8;
+                for (g, &sc_bits) in row_scales.iter().enumerate() {
+                    let scale = f16_to_f32(sc_bits);
+                    let mut lut = [0u16; 16];
+                    for (u, slot) in lut.iter_mut().enumerate() {
+                        *slot = f32_to_f16(((u as i32 - 8) as f32) * scale);
+                    }
+                    let g_words = &row_words[g * words_per_group..(g + 1) * words_per_group];
+                    let g_dst = &mut dst_row[g * group_size..(g + 1) * group_size];
+                    for (w_idx, &word) in g_words.iter().enumerate() {
+                        let base = w_idx * 8;
+                        for b in 0..8 {
+                            g_dst[base + b] = lut[((word >> (b * 4)) & 0xF) as usize];
+                        }
+                    }
+                }
+            } else {
+                for (w_idx, &word) in row_words.iter().enumerate() {
+                    for b in 0..8 {
+                        let k = w_idx * 8 + b;
+                        let nib = ((word >> (b * 4)) & 0xF) as i32 - 8;
+                        let scale = f16_to_f32(row_scales[k / group_size]);
+                        dst_row[k] = f32_to_f16((nib as f32) * scale);
+                    }
                 }
             }
         }
     };
-    if size_n < 2048 {
+    if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
         let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
+            .map(|n| n.get().clamp(1, 16))
             .unwrap_or(4);
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {
@@ -407,21 +447,57 @@ pub fn dequant_u8b128_n_major_to_f16(
             let n = row_start + rel_n;
             let row_words = &packed_n_by_k4[n * words_per_row..(n + 1) * words_per_row];
             let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
-            for (w_idx, &word) in row_words.iter().enumerate() {
-                for b in 0..4 {
-                    let k = w_idx * 4 + b;
-                    let q = ((word >> (b * 8)) & 0xFF) as i32 - 128;
-                    let scale = f16_to_f32(row_scales[k / eff_gs]);
-                    dst_row[k] = f32_to_f16((q as f32) * scale);
+            if eff_gs >= 256 && eff_gs.is_multiple_of(4) {
+                let words_per_group = eff_gs / 4;
+                for (g, &sc_bits) in row_scales.iter().enumerate() {
+                    let scale = f16_to_f32(sc_bits);
+                    let mut lut = [0u16; 256];
+                    for (u, slot) in lut.iter_mut().enumerate() {
+                        *slot = f32_to_f16(((u as i32 - 128) as f32) * scale);
+                    }
+                    let g_words = &row_words[g * words_per_group..(g + 1) * words_per_group];
+                    let g_dst = &mut dst_row[g * eff_gs..(g + 1) * eff_gs];
+                    for (w_idx, &word) in g_words.iter().enumerate() {
+                        let base = w_idx * 4;
+                        let bytes = word.to_le_bytes();
+                        g_dst[base] = lut[bytes[0] as usize];
+                        g_dst[base + 1] = lut[bytes[1] as usize];
+                        g_dst[base + 2] = lut[bytes[2] as usize];
+                        g_dst[base + 3] = lut[bytes[3] as usize];
+                    }
+                }
+            } else if eff_gs.is_multiple_of(4) {
+                let words_per_group = eff_gs / 4;
+                for (g, &sc_bits) in row_scales.iter().enumerate() {
+                    let scale = f16_to_f32(sc_bits);
+                    let g_words = &row_words[g * words_per_group..(g + 1) * words_per_group];
+                    let g_dst = &mut dst_row[g * eff_gs..(g + 1) * eff_gs];
+                    for (w_idx, &word) in g_words.iter().enumerate() {
+                        let base = w_idx * 4;
+                        let bytes = word.to_le_bytes();
+                        for b in 0..4 {
+                            let q = bytes[b] as i32 - 128;
+                            g_dst[base + b] = f32_to_f16((q as f32) * scale);
+                        }
+                    }
+                }
+            } else {
+                for (w_idx, &word) in row_words.iter().enumerate() {
+                    for b in 0..4 {
+                        let k = w_idx * 4 + b;
+                        let q = ((word >> (b * 8)) & 0xFF) as i32 - 128;
+                        let scale = f16_to_f32(row_scales[k / eff_gs]);
+                        dst_row[k] = f32_to_f16((q as f32) * scale);
+                    }
                 }
             }
         }
     };
-    if size_n < 2048 {
+    if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
         let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 8))
+            .map(|n| n.get().clamp(1, 16))
             .unwrap_or(4);
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {

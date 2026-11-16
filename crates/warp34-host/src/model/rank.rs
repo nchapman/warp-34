@@ -154,20 +154,26 @@ fn prepare_layer_linear_shards(
     std::thread::scope(|s| -> Result<PreloadedLayerShards> {
         let ffn_handle = (!is_moe_layer).then(|| {
             let gate_h = s.spawn(move || -> Result<RawLinearHost> {
-                Ok(
-                    RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.gate_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_interm, (rank + 1) * local_interm),
+                RawLinearHost::load_row_shard(
+                    archive,
+                    &format!("{pfx_ref}.mlp.gate_proj"),
+                    &cfg.quant,
+                    rank * local_interm,
+                    (rank + 1) * local_interm,
                 )
             });
             let up_h = s.spawn(move || -> Result<RawLinearHost> {
-                Ok(
-                    RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.up_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_interm, (rank + 1) * local_interm),
+                RawLinearHost::load_row_shard(
+                    archive,
+                    &format!("{pfx_ref}.mlp.up_proj"),
+                    &cfg.quant,
+                    rank * local_interm,
+                    (rank + 1) * local_interm,
                 )
             });
             let down_h = s.spawn(move || -> Result<RawLinearHost> {
                 RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.down_proj"), &cfg.quant)?
-                    .slice_cols(rank * local_interm, (rank + 1) * local_interm)
+                    .into_slice_cols(rank * local_interm, (rank + 1) * local_interm)
             });
             (gate_h, up_h, down_h)
         });
@@ -175,29 +181,33 @@ fn prepare_layer_linear_shards(
         let attn = match cfg.layer_types[layer_id] {
             LayerKind::FullAttention => {
                 let q_h = s.spawn(move || -> Result<RawLinearHost> {
-                    let raw_q = RawLinearHost::load(
+                    let q_shard = RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.q_proj"),
                         &cfg.quant,
+                        rank * q_gate_local,
+                        (rank + 1) * q_gate_local,
                     )?;
-                    debug_assert_eq!(raw_q.slice_rows(0, q_gate_total).size_check(), q_gate_total);
-                    Ok(raw_q.slice_rows(rank * q_gate_local, (rank + 1) * q_gate_local))
+                    debug_assert_eq!(q_shard.size_check() * tp_size, q_gate_total);
+                    Ok(q_shard)
                 });
                 let k_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.k_proj"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local))
+                        kv_shard_idx * kv_local,
+                        (kv_shard_idx + 1) * kv_local,
+                    )
                 });
                 let v_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.v_proj"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local))
+                        kv_shard_idx * kv_local,
+                        (kv_shard_idx + 1) * kv_local,
+                    )
                 });
                 let o_cols = local_q_heads * cfg.head_dim;
                 let o_h = s.spawn(move || -> Result<RawLinearHost> {
@@ -206,7 +216,7 @@ fn prepare_layer_linear_shards(
                         &format!("{pfx_ref}.self_attn.o_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * o_cols, (rank + 1) * o_cols)
+                    .into_slice_cols(rank * o_cols, (rank + 1) * o_cols)
                 });
                 let q_shard = q_h
                     .join()
@@ -224,49 +234,68 @@ fn prepare_layer_linear_shards(
                 PreloadedAttnShards::FullAttention { qkv_shard, o_shard }
             }
             LayerKind::LinearAttention => {
-                let qkv_h = s.spawn(
-                    move || -> Result<(RawLinearHost, RawLinearHost, RawLinearHost)> {
-                        let raw_qkv = RawLinearHost::load(
-                            archive,
-                            &format!("{pfx_ref}.linear_attn.in_proj_qkv"),
-                            &cfg.quant,
-                        )?;
-                        let q_part =
-                            raw_qkv.slice_rows(rank * gdn_k_local, (rank + 1) * gdn_k_local);
-                        let k_part = raw_qkv.slice_rows(
-                            gdn_k_total + rank * gdn_k_local,
-                            gdn_k_total + (rank + 1) * gdn_k_local,
-                        );
-                        let v_part = raw_qkv.slice_rows(
-                            2 * gdn_k_total + rank * gdn_v_local,
-                            2 * gdn_k_total + (rank + 1) * gdn_v_local,
-                        );
-                        Ok((q_part, k_part, v_part))
-                    },
-                );
+                let qkv_h = s.spawn(move || -> Result<Vec<RawLinearHost>> {
+                    let qkv_pfx = format!("{pfx_ref}.linear_attn.in_proj_qkv");
+                    if tp_size == 1 {
+                        let raw_qkv = RawLinearHost::load(archive, &qkv_pfx, &cfg.quant)?;
+                        if raw_qkv.dims().0 == 2 * gdn_k_total + gdn_v_total {
+                            return Ok(vec![raw_qkv]);
+                        }
+                        let q_part = raw_qkv.slice_rows(0, gdn_k_local);
+                        let k_part = raw_qkv.slice_rows(gdn_k_total, gdn_k_total + gdn_k_local);
+                        let v_part =
+                            raw_qkv.slice_rows(2 * gdn_k_total, 2 * gdn_k_total + gdn_v_local);
+                        return Ok(vec![q_part, k_part, v_part]);
+                    }
+                    let q_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        rank * gdn_k_local,
+                        (rank + 1) * gdn_k_local,
+                    )?;
+                    let k_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        gdn_k_total + rank * gdn_k_local,
+                        gdn_k_total + (rank + 1) * gdn_k_local,
+                    )?;
+                    let v_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        2 * gdn_k_total + rank * gdn_v_local,
+                        2 * gdn_k_total + (rank + 1) * gdn_v_local,
+                    )?;
+                    Ok(vec![q_part, k_part, v_part])
+                });
                 let z_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_z"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * gdn_v_local, (rank + 1) * gdn_v_local))
+                        rank * gdn_v_local,
+                        (rank + 1) * gdn_v_local,
+                    )
                 });
                 let b_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_b"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                        rank * local_v_heads,
+                        (rank + 1) * local_v_heads,
+                    )
                 });
                 let a_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_a"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                        rank * local_v_heads,
+                        (rank + 1) * local_v_heads,
+                    )
                 });
                 let out_h = s.spawn(move || -> Result<RawLinearHost> {
                     RawLinearHost::load(
@@ -274,9 +303,9 @@ fn prepare_layer_linear_shards(
                         &format!("{pfx_ref}.linear_attn.out_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local)
+                    .into_slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local)
                 });
-                let (q_part, k_part, v_part) = qkv_h
+                let mut qkvz_parts = qkv_h
                     .join()
                     .map_err(|_| loader_err("in_proj_qkv loader panicked"))??;
                 let z_shard = z_h
@@ -291,7 +320,8 @@ fn prepare_layer_linear_shards(
                 let out_shard = out_h
                     .join()
                     .map_err(|_| loader_err("out_proj loader panicked"))??;
-                let qkvz_shard = RawLinearHost::concat_rows(&[q_part, k_part, v_part, z_shard])?;
+                qkvz_parts.push(z_shard);
+                let qkvz_shard = RawLinearHost::concat_rows(&qkvz_parts)?;
                 let ba_shard = RawLinearHost::concat_rows(&[b_shard, a_shard])?;
                 PreloadedAttnShards::LinearAttention {
                     qkvz_shard,
@@ -857,6 +887,14 @@ impl Qwen3_5ModelRank {
         Err(loader_err_msg("missing model.embed_tokens.weight"))
     }
 
+    pub(super) fn populate_shared_vocab(
+        cell: &SharedVocabHost,
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+    ) {
+        let _ = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));
+    }
+
     #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
     pub(super) fn load_rank_with_capacity(
         archive: &SafetensorsArchive,
@@ -1039,41 +1077,33 @@ impl Qwen3_5ModelRank {
             )));
         }
 
-        let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
-        let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
+        let mut weight_arena = DeviceArena::new_on_stream(device_id, est_weight_bytes, &stream)?;
+        let scratch_arena = DeviceArena::new_on_stream(device_id, scratch_bytes, &stream)?;
         let _ = stream
             .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
-        let batch_meta_arena = DeviceArena::new(device_id, BATCH_META_ARENA_BYTES)?;
-        let marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
-        let repack_staging = DeviceBuffer::alloc(device_id, staging_bytes)?;
+        let batch_meta_arena =
+            DeviceArena::new_on_stream(device_id, BATCH_META_ARENA_BYTES, &stream)?;
+        let marlin_ws = DeviceBuffer::alloc_on_stream(device_id, marlin_ws_bytes, &stream)?;
+        let mut upload_ring =
+            crate::cuda::PinnedUploadRing::new(device_id, staging_bytes, &stream)?;
 
-        // 1. embed_tokens (replicated in FP16; dequantized on host when packed)
-        //    and optional untied lm_head (loaded once and shared across TP ranks when `shared_vocab` is provided).
+        // 1. embed_tokens (replicated in FP16; dequantized on host when packed, and optionally
+        //    preloaded in parallel with GPU warmup via `shared_vocab`).
         let has_untied_lm_head = !cfg.tie_word_embeddings
             && ["lm_head.weight", "lm_head.weight_packed", "lm_head.qweight"]
                 .iter()
                 .any(|k| archive.resolve_name(k).is_some());
         let owned_vocab;
-        let (embed_f16, shared_lm_opt): (&[u16], Option<&RawLinearHost>) =
-            if let Some(cell) = shared_vocab {
-                let res = cell.get_or_init(|| {
-                    let emb = Self::load_embed_tokens_f16(archive, cfg)?;
-                    let lm = if has_untied_lm_head {
-                        Some(RawLinearHost::load(archive, "lm_head", &cfg.quant)?)
-                    } else {
-                        None
-                    };
-                    Ok((emb, lm))
-                });
-                let (emb, lm) = res.as_ref().map_err(Clone::clone)?;
-                (emb.as_slice(), lm.as_ref())
-            } else {
-                owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
-                (owned_vocab.as_slice(), None)
-            };
+        let embed_f16: &[u16] = if let Some(cell) = shared_vocab {
+            let res = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));
+            res.as_ref().map_err(Clone::clone)?.as_slice()
+        } else {
+            owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
+            owned_vocab.as_slice()
+        };
         let (embed_tokens_ptr, host_embed_tokens) = if use_host_embed {
             let bytes = core::mem::size_of_val(embed_f16);
-            let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
+            let buf = crate::cuda::MappedHostBuffer::alloc_unzeroed(bytes)?;
             // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -1084,7 +1114,10 @@ impl Qwen3_5ModelRank {
             }
             (buf.dev_ptr as u64, Some(buf))
         } else {
-            (weight_arena.upload_slice(embed_f16, &stream)?, None)
+            (
+                upload_ring.upload_slice(&mut weight_arena, embed_f16, &stream)?,
+                None,
+            )
         };
 
         // 2. final norm or multi-stream HyperConnection mixer
@@ -1096,7 +1129,7 @@ impl Qwen3_5ModelRank {
                 false,
                 &mut weight_arena,
                 &stream,
-                &repack_staging,
+                &mut upload_ring,
             )?;
             FinalResidual::HyperConnection { mixer }
         } else {
@@ -1107,7 +1140,7 @@ impl Qwen3_5ModelRank {
                 .read_f16_bits(&norm_key)
                 .map_err(|_| loader_err("read model.norm.weight"))?;
             FinalResidual::SingleStream {
-                norm_ptr: weight_arena.upload_slice(&norm_f16, &stream)?,
+                norm_ptr: upload_ring.upload_slice(&mut weight_arena, &norm_f16, &stream)?,
             }
         };
 
@@ -1121,25 +1154,34 @@ impl Qwen3_5ModelRank {
             let ptr = if tp_size == 1 {
                 embed_tokens_ptr
             } else {
-                weight_arena.upload_slice(slice, &stream)?
+                upload_ring.upload_slice(&mut weight_arena, slice, &stream)?
             };
             Some(LinearProj::DenseF16 {
                 weight_ptr: ptr,
                 size_n: local_vocab_size,
                 size_k: cfg.hidden_size,
             })
-        } else if let Some(raw_lm) = shared_lm_opt {
-            let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
         } else if has_untied_lm_head {
-            let raw_lm = RawLinearHost::load(archive, "lm_head", &cfg.quant)?;
-            let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
+            let sharded = RawLinearHost::load_row_shard(
+                archive,
+                "lm_head",
+                &cfg.quant,
+                vocab_offset,
+                vocab_offset + local_vocab_size,
+            )?;
+            if sharded.dims() != (local_vocab_size, cfg.hidden_size) {
+                return Err(loader_err_msg(format!(
+                    "lm_head shard dims {:?} do not match expected ({local_vocab_size}, {})",
+                    sharded.dims(),
+                    cfg.hidden_size
+                )));
+            }
+            Some(sharded.upload_pipelined(&mut weight_arena, &stream, &mut upload_ring)?)
         } else {
             None
         };
 
-        // 4. Decoder layers
+        // 4. Decoder layers (1-layer-ahead host prefetch overlapped with pinned DMA + Marlin repack)
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let mut full_attn_layer_ids = Vec::new();
         let mut gdn_layer_ids = Vec::new();
@@ -1151,229 +1193,295 @@ impl Qwen3_5ModelRank {
         let gdn_v_local = gdn_v_total / tp_size;
         let local_v_heads = cfg.linear_num_value_heads / tp_size;
 
-        for layer_id in 0..cfg.num_hidden_layers {
-            let preloaded = prepare_layer_linear_shards(archive, cfg, layer_id, rank, tp_size)?;
-            {
-                let pfx = format!("model.layers.{layer_id}");
-                let residual = if cfg.uses_hyper_connection() {
-                    let attn_hc = load_hc_block_weights(
-                        archive,
-                        cfg,
-                        &format!("{pfx}.attn_hyper_connection"),
-                        true,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?;
-                    let mlp_hc = load_hc_block_weights(
-                        archive,
-                        cfg,
-                        &format!("{pfx}.mlp_hyper_connection"),
-                        true,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?;
-                    LayerResidual::HyperConnection { attn_hc, mlp_hc }
-                } else {
-                    let in_ln_key = archive
-                        .resolve_name(&format!("{pfx}.input_layernorm.weight"))
-                        .ok_or_else(|| loader_err("missing input_layernorm"))?;
-                    let in_ln = archive
-                        .read_f16_bits(&in_ln_key)
-                        .map_err(|_| loader_err("read input_layernorm"))?;
-                    let input_layernorm_ptr = weight_arena.upload_slice(&in_ln, &stream)?;
-
-                    let post_ln_key = archive
-                        .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
-                        .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
-                    let post_ln = archive
-                        .read_f16_bits(&post_ln_key)
-                        .map_err(|_| loader_err("read post_attention_layernorm"))?;
-                    let post_attention_layernorm_ptr =
-                        weight_arena.upload_slice(&post_ln, &stream)?;
-                    LayerResidual::SingleStream {
-                        input_layernorm_ptr,
-                        post_attention_layernorm_ptr,
+        std::thread::scope(|layer_scope| -> Result<()> {
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<Result<(usize, PreloadedLayerShards)>>(1);
+            let num_layers = cfg.num_hidden_layers;
+            let producer = layer_scope.spawn(move || {
+                for lid in 0..num_layers {
+                    let res = prepare_layer_linear_shards(archive, cfg, lid, rank, tp_size)
+                        .map(|p| (lid, p));
+                    let is_err = res.is_err();
+                    if tx.send(res).is_err() || is_err {
+                        break;
                     }
-                };
-                let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
-                    Some(load_ple_layer_weights(
-                        archive,
-                        cfg,
-                        &pfx,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?)
-                } else {
-                    None
-                };
+                }
+            });
 
-                let block = match preloaded.attn {
-                    PreloadedAttnShards::FullAttention { qkv_shard, o_shard } => {
-                        let kv_ord = full_attn_layer_ids.len();
-                        full_attn_layer_ids.push(layer_id);
+            let consume_res = (|| -> Result<()> {
+                for expected_lid in 0..num_layers {
+                    let (layer_id, preloaded) = rx
+                        .recv()
+                        .map_err(|_| loader_err("layer shard prefetch channel closed"))??;
+                    debug_assert_eq!(layer_id, expected_lid);
+                    let pfx = format!("model.layers.{layer_id}");
+                    let residual = if cfg.uses_hyper_connection() {
+                        let attn_hc = load_hc_block_weights(
+                            archive,
+                            cfg,
+                            &format!("{pfx}.attn_hyper_connection"),
+                            true,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        let mlp_hc = load_hc_block_weights(
+                            archive,
+                            cfg,
+                            &format!("{pfx}.mlp_hyper_connection"),
+                            true,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        LayerResidual::HyperConnection { attn_hc, mlp_hc }
+                    } else {
+                        let in_ln_key = archive
+                            .resolve_name(&format!("{pfx}.input_layernorm.weight"))
+                            .ok_or_else(|| loader_err("missing input_layernorm"))?;
+                        let in_ln = archive
+                            .read_f16_bits(&in_ln_key)
+                            .map_err(|_| loader_err("read input_layernorm"))?;
+                        let input_layernorm_ptr =
+                            upload_ring.upload_slice(&mut weight_arena, &in_ln, &stream)?;
 
-                        let qkv_proj =
-                            qkv_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let o_proj = o_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                        let post_ln_key = archive
+                            .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
+                            .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
+                        let post_ln = archive
+                            .read_f16_bits(&post_ln_key)
+                            .map_err(|_| loader_err("read post_attention_layernorm"))?;
+                        let post_attention_layernorm_ptr =
+                            upload_ring.upload_slice(&mut weight_arena, &post_ln, &stream)?;
+                        LayerResidual::SingleStream {
+                            input_layernorm_ptr,
+                            post_attention_layernorm_ptr,
+                        }
+                    };
+                    let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
+                        Some(load_ple_layer_weights(
+                            archive,
+                            cfg,
+                            &pfx,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?)
+                    } else {
+                        None
+                    };
 
-                        let q_norm_key = archive
-                            .resolve_name(&format!("{pfx}.self_attn.q_norm.weight"))
-                            .ok_or_else(|| loader_err("missing q_norm"))?;
-                        let q_norm = archive
-                            .read_f16_bits(&q_norm_key)
-                            .map_err(|_| loader_err("read q_norm"))?;
-                        let q_norm_ptr = weight_arena.upload_slice(&q_norm, &stream)?;
+                    let block = match preloaded.attn {
+                        PreloadedAttnShards::FullAttention { qkv_shard, o_shard } => {
+                            let kv_ord = full_attn_layer_ids.len();
+                            full_attn_layer_ids.push(layer_id);
 
-                        let k_norm_key = archive
-                            .resolve_name(&format!("{pfx}.self_attn.k_norm.weight"))
-                            .ok_or_else(|| loader_err("missing k_norm"))?;
-                        let k_norm = archive
-                            .read_f16_bits(&k_norm_key)
-                            .map_err(|_| loader_err("read k_norm"))?;
-                        let k_norm_ptr = weight_arena.upload_slice(&k_norm, &stream)?;
-
-                        let qsa_indexer = if cfg.uses_qsa() {
-                            Some(load_qsa_indexer_weights(
-                                archive,
-                                cfg,
-                                &pfx,
+                            let qkv_proj = qkv_shard.upload_pipelined(
                                 &mut weight_arena,
                                 &stream,
-                                &repack_staging,
-                            )?)
-                        } else {
-                            None
-                        };
+                                &mut upload_ring,
+                            )?;
+                            let o_proj = o_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
 
-                        LayerBlockWeights::FullAttention(FullAttentionLayerWeights {
-                            layer_id,
-                            kv_layer_ordinal: kv_ord,
-                            qkv_proj,
-                            o_proj,
-                            q_norm_ptr,
-                            k_norm_ptr,
-                            qsa_indexer,
-                        })
-                    }
-                    PreloadedAttnShards::LinearAttention {
-                        qkvz_shard,
-                        ba_shard,
-                        out_shard,
-                    } => {
-                        let gdn_ord = gdn_layer_ids.len();
-                        gdn_layer_ids.push(layer_id);
+                            let q_norm_key = archive
+                                .resolve_name(&format!("{pfx}.self_attn.q_norm.weight"))
+                                .ok_or_else(|| loader_err("missing q_norm"))?;
+                            let q_norm = archive
+                                .read_f16_bits(&q_norm_key)
+                                .map_err(|_| loader_err("read q_norm"))?;
+                            let q_norm_ptr =
+                                upload_ring.upload_slice(&mut weight_arena, &q_norm, &stream)?;
 
-                        let in_proj_qkvz =
-                            qkvz_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let in_proj_ba =
-                            ba_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let out_proj =
-                            out_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                            let k_norm_key = archive
+                                .resolve_name(&format!("{pfx}.self_attn.k_norm.weight"))
+                                .ok_or_else(|| loader_err("missing k_norm"))?;
+                            let k_norm = archive
+                                .read_f16_bits(&k_norm_key)
+                                .map_err(|_| loader_err("read k_norm"))?;
+                            let k_norm_ptr =
+                                upload_ring.upload_slice(&mut weight_arena, &k_norm, &stream)?;
 
-                        let conv_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.conv1d.weight"))
-                            .ok_or_else(|| loader_err("missing conv1d.weight"))?;
-                        let conv_all = archive
-                            .read_f16_bits(&conv_key)
-                            .map_err(|_| loader_err("read conv1d.weight"))?;
-                        let k_sz = cfg.linear_conv_kernel_dim;
-                        let mut conv_local =
-                            Vec::with_capacity((2 * gdn_k_local + gdn_v_local) * k_sz);
-                        conv_local.extend_from_slice(
-                            &conv_all[rank * gdn_k_local * k_sz..(rank + 1) * gdn_k_local * k_sz],
-                        );
-                        conv_local.extend_from_slice(
-                            &conv_all[(gdn_k_total + rank * gdn_k_local) * k_sz
-                                ..(gdn_k_total + (rank + 1) * gdn_k_local) * k_sz],
-                        );
-                        conv_local.extend_from_slice(
-                            &conv_all[(2 * gdn_k_total + rank * gdn_v_local) * k_sz
-                                ..(2 * gdn_k_total + (rank + 1) * gdn_v_local) * k_sz],
-                        );
-                        let conv_weight_ptr = weight_arena.upload_slice(&conv_local, &stream)?;
+                            let qsa_indexer = if cfg.uses_qsa() {
+                                Some(load_qsa_indexer_weights(
+                                    archive,
+                                    cfg,
+                                    &pfx,
+                                    &mut weight_arena,
+                                    &stream,
+                                    &mut upload_ring,
+                                )?)
+                            } else {
+                                None
+                            };
 
-                        let a_log_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.A_log"))
-                            .ok_or_else(|| loader_err("missing A_log"))?;
-                        let a_log_all = archive
-                            .read_f32(&a_log_key)
-                            .map_err(|_| loader_err("read A_log"))?;
-                        let a_log_local =
-                            &a_log_all[rank * local_v_heads..(rank + 1) * local_v_heads];
-                        let a_log_ptr = weight_arena.upload_slice(a_log_local, &stream)?;
+                            LayerBlockWeights::FullAttention(FullAttentionLayerWeights {
+                                layer_id,
+                                kv_layer_ordinal: kv_ord,
+                                qkv_proj,
+                                o_proj,
+                                q_norm_ptr,
+                                k_norm_ptr,
+                                qsa_indexer,
+                            })
+                        }
+                        PreloadedAttnShards::LinearAttention {
+                            qkvz_shard,
+                            ba_shard,
+                            out_shard,
+                        } => {
+                            let gdn_ord = gdn_layer_ids.len();
+                            gdn_layer_ids.push(layer_id);
 
-                        let dt_bias_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.dt_bias"))
-                            .ok_or_else(|| loader_err("missing dt_bias"))?;
-                        let dt_bias_all = archive
-                            .read_f32(&dt_bias_key)
-                            .map_err(|_| loader_err("read dt_bias"))?;
-                        let dt_bias_local =
-                            &dt_bias_all[rank * local_v_heads..(rank + 1) * local_v_heads];
-                        let dt_bias_ptr = weight_arena.upload_slice(dt_bias_local, &stream)?;
+                            let in_proj_qkvz = qkvz_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
+                            let in_proj_ba = ba_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
+                            let out_proj = out_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
 
-                        let norm_w_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.norm.weight"))
-                            .ok_or_else(|| loader_err("missing linear_attn.norm.weight"))?;
-                        let norm_w_all = archive
-                            .read_f16_bits(&norm_w_key)
-                            .map_err(|_| loader_err("read linear_attn.norm.weight"))?;
-                        let norm_weight_ptr = weight_arena.upload_slice(&norm_w_all, &stream)?;
+                            let conv_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.conv1d.weight"))
+                                .ok_or_else(|| loader_err("missing conv1d.weight"))?;
+                            let conv_all = archive
+                                .read_f16_bits(&conv_key)
+                                .map_err(|_| loader_err("read conv1d.weight"))?;
+                            let k_sz = cfg.linear_conv_kernel_dim;
+                            let mut conv_local =
+                                Vec::with_capacity((2 * gdn_k_local + gdn_v_local) * k_sz);
+                            conv_local.extend_from_slice(
+                                &conv_all
+                                    [rank * gdn_k_local * k_sz..(rank + 1) * gdn_k_local * k_sz],
+                            );
+                            conv_local.extend_from_slice(
+                                &conv_all[(gdn_k_total + rank * gdn_k_local) * k_sz
+                                    ..(gdn_k_total + (rank + 1) * gdn_k_local) * k_sz],
+                            );
+                            conv_local.extend_from_slice(
+                                &conv_all[(2 * gdn_k_total + rank * gdn_v_local) * k_sz
+                                    ..(2 * gdn_k_total + (rank + 1) * gdn_v_local) * k_sz],
+                            );
+                            let conv_weight_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                &conv_local,
+                                &stream,
+                            )?;
 
-                        LayerBlockWeights::LinearAttention(GdnLayerWeights {
-                            layer_id,
-                            gdn_layer_ordinal: gdn_ord,
-                            in_proj_qkvz,
-                            in_proj_ba,
-                            out_proj,
-                            conv_weight_ptr,
-                            a_log_ptr,
-                            dt_bias_ptr,
-                            norm_weight_ptr,
-                        })
-                    }
-                };
+                            let a_log_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.A_log"))
+                                .ok_or_else(|| loader_err("missing A_log"))?;
+                            let a_log_all = archive
+                                .read_f32(&a_log_key)
+                                .map_err(|_| loader_err("read A_log"))?;
+                            let a_log_local =
+                                &a_log_all[rank * local_v_heads..(rank + 1) * local_v_heads];
+                            let a_log_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                a_log_local,
+                                &stream,
+                            )?;
 
-                let ffn = if let Some((gate_up_shard, down_shard)) = preloaded.dense_ffn {
-                    let gate_up_proj =
-                        gate_up_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                    let down_proj =
-                        down_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                    FfnBlockWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    }
-                } else {
-                    FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
-                        archive,
-                        cfg,
-                        cfg.uses_tiered_moe().then_some(layer_id),
-                        &pfx,
-                        [rank, tp_size],
-                        &mut weight_arena,
-                        (&stream, &repack_staging),
-                    )?))
-                };
+                            let dt_bias_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.dt_bias"))
+                                .ok_or_else(|| loader_err("missing dt_bias"))?;
+                            let dt_bias_all = archive
+                                .read_f32(&dt_bias_key)
+                                .map_err(|_| loader_err("read dt_bias"))?;
+                            let dt_bias_local =
+                                &dt_bias_all[rank * local_v_heads..(rank + 1) * local_v_heads];
+                            let dt_bias_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                dt_bias_local,
+                                &stream,
+                            )?;
 
-                layers.push(DecoderLayerWeights {
-                    layer_id,
-                    residual,
-                    ple,
-                    block,
-                    ffn,
-                });
-            }
-        }
+                            let norm_w_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.norm.weight"))
+                                .ok_or_else(|| loader_err("missing linear_attn.norm.weight"))?;
+                            let norm_w_all = archive
+                                .read_f16_bits(&norm_w_key)
+                                .map_err(|_| loader_err("read linear_attn.norm.weight"))?;
+                            let norm_weight_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                &norm_w_all,
+                                &stream,
+                            )?;
 
-        drop(repack_staging);
+                            LayerBlockWeights::LinearAttention(GdnLayerWeights {
+                                layer_id,
+                                gdn_layer_ordinal: gdn_ord,
+                                in_proj_qkvz,
+                                in_proj_ba,
+                                out_proj,
+                                conv_weight_ptr,
+                                a_log_ptr,
+                                dt_bias_ptr,
+                                norm_weight_ptr,
+                            })
+                        }
+                    };
+
+                    let ffn = if let Some((gate_up_shard, down_shard)) = preloaded.dense_ffn {
+                        let gate_up_proj = gate_up_shard.upload_pipelined(
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        let down_proj = down_shard.upload_pipelined(
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        FfnBlockWeights::Dense {
+                            gate_up_proj,
+                            down_proj,
+                        }
+                    } else {
+                        FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
+                            archive,
+                            cfg,
+                            cfg.uses_tiered_moe().then_some(layer_id),
+                            &pfx,
+                            [rank, tp_size],
+                            &mut weight_arena,
+                            (&stream, &mut upload_ring),
+                        )?))
+                    };
+
+                    layers.push(DecoderLayerWeights {
+                        layer_id,
+                        residual,
+                        ple,
+                        block,
+                        ffn,
+                    });
+                }
+                Ok(())
+            })();
+            drop(rx);
+            let _ = producer.join();
+            consume_res
+        })?;
+
+        drop(upload_ring);
         let aux_stream = CudaStream::new(device_id)?;
-        let aux_marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
+        let aux_marlin_ws = DeviceBuffer::alloc_on_stream(device_id, marlin_ws_bytes, &aux_stream)?;
         let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
         let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         stream.synchronize()?;
+        aux_stream.synchronize()?;
 
         Ok(PrePoolModelRank {
             rank,

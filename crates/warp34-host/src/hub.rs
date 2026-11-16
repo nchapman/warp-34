@@ -366,6 +366,12 @@ fn download(
 ) -> io::Result<PathBuf> {
     let lock = repo_download_lock(repo_dir);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if is_commit(revision) && manifest_path(repo_dir, revision).is_file() {
+        let pinned_dir = repo_dir.join("snapshots").join(revision);
+        if let Ok(dir) = validate_offline_snapshot(repo_dir, &pinned_dir, role) {
+            return Ok(dir);
+        }
+    }
     let info = repo.info().revision(revision).send().map_err(hub_error)?;
     let commit = info
         .sha
@@ -386,6 +392,40 @@ fn download(
         return Err(invalid(
             "checkpoint has no tokenizer.json required by warp34",
         ));
+    }
+    let cached_dir = repo_dir.join("snapshots").join(&commit);
+    if cached_dir.is_dir()
+        && files::validate_files(&cached_dir, &metadata).is_ok()
+        && files::validate_config(&cached_dir, role).is_ok()
+        && let Ok(weights) = files::weight_files(&cached_dir, &available)
+    {
+        let mut selected = metadata.clone();
+        selected.extend(weights);
+        if files::validate_files(&cached_dir, &selected).is_ok()
+            && files::validate_checkpoint(&cached_dir, role, &available).is_ok()
+        {
+            let mpath = manifest_path(repo_dir, &commit);
+            let manifest_ok = fs::read(&mpath)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+                .is_some_and(|m| m.version == 1 && m.commit == commit && m.files == selected);
+            if !manifest_ok {
+                let manifest = Manifest {
+                    version: 1,
+                    commit: commit.clone(),
+                    files: selected,
+                };
+                atomic_write(&mpath, &serde_json::to_vec(&manifest)?)?;
+            }
+            if !is_commit(revision) {
+                let ref_path = repo_dir.join("refs").join(revision);
+                if fs::read_to_string(&ref_path).ok().as_deref().map(str::trim) != Some(&commit) {
+                    atomic_write(&ref_path, commit.as_bytes())?;
+                }
+            }
+            eprintln!("Model ready: {id}@{commit} ({})", cached_dir.display());
+            return Ok(cached_dir);
+        }
     }
     let reporter = progress::Reporter::new(progress)?;
     let dir = fetch_files(repo, &commit, &metadata, &reporter)?;

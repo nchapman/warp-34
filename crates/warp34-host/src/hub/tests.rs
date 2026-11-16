@@ -440,11 +440,42 @@ fn downloads_pinned_selected_assets_reuses_cache_and_works_offline() {
             .all(|(_, path, _)| path.contains(SHA))
     );
     let count = server.gets("model.safetensors");
+    assert_eq!(count, 1);
+    server.state.requests.lock().unwrap().clear();
     assert_eq!(
         resolve_remote("test/model", &options, ModelRole::Target, &s).unwrap(),
         dir
     );
-    assert_eq!(server.gets("model.safetensors"), count);
+    assert_eq!(server.gets("model.safetensors"), 0);
+    let warm_requests = server.state.requests.lock().unwrap().clone();
+    assert_eq!(
+        warm_requests.len(),
+        1,
+        "warm mutable-revision lookup should only query /api/models/.../revision/... once: {warm_requests:?}"
+    );
+    assert!(
+        warm_requests[0]
+            .1
+            .contains("/api/models/test/model/revision/")
+    );
+    server.state.requests.lock().unwrap().clear();
+    assert_eq!(
+        resolve_remote(
+            "test/model",
+            &HubOptions {
+                revision: Some(SHA.into()),
+                offline: false,
+            },
+            ModelRole::Target,
+            &s
+        )
+        .unwrap(),
+        dir
+    );
+    assert!(
+        server.state.requests.lock().unwrap().is_empty(),
+        "warm immutable-SHA lookup with valid manifest should make zero HTTP requests"
+    );
     drop(server);
     assert_eq!(
         resolve_remote(

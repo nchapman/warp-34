@@ -1085,3 +1085,99 @@ fn test_resolve_name_language_model_prefix_and_decision_config_midloop_validatio
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_indexed_parallel_open_ple_detection_and_subslice_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Shard A: BF16 [4, 2] + I32 [4, 2]
+    let bf16_vals: [f32; 8] = [0.5, -1.0, 2.25, 4.0, -0.125, 8.5, 16.0, -3.5];
+    let mut shard_a_data = Vec::new();
+    for &v in &bf16_vals {
+        shard_a_data.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+    }
+    let u32_vals: [u32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+    for &w in &u32_vals {
+        shard_a_data.extend_from_slice(&w.to_le_bytes());
+    }
+    let hdr_a = serde_json::json!({
+        "model.layers.0.bf16": {"dtype": "BF16", "shape": [4, 2], "data_offsets": [0, 16]},
+        "model.layers.0.packed": {"dtype": "I32", "shape": [4, 2], "data_offsets": [16, 48]},
+    })
+    .to_string();
+    let mut bytes_a = (hdr_a.len() as u64).to_le_bytes().to_vec();
+    bytes_a.extend_from_slice(hdr_a.as_bytes());
+    bytes_a.extend_from_slice(&shard_a_data);
+    std::fs::write(dir.join("model-00001-of-00002.safetensors"), &bytes_a).unwrap();
+
+    // Shard B: F32 [2, 2] + PLE ngram shard marker
+    let f32_vals: [f32; 4] = [1.5, -2.5, 3.5, -4.5];
+    let mut shard_b_data = Vec::new();
+    for &v in &f32_vals {
+        shard_b_data.extend_from_slice(&v.to_le_bytes());
+    }
+    shard_b_data.extend_from_slice(&[0u8; 8]);
+    let hdr_b = serde_json::json!({
+        "model.layers.1.f32": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
+        "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": {"dtype": "U8", "shape": [8], "data_offsets": [16, 24]},
+    })
+    .to_string();
+    let mut bytes_b = (hdr_b.len() as u64).to_le_bytes().to_vec();
+    bytes_b.extend_from_slice(hdr_b.as_bytes());
+    bytes_b.extend_from_slice(&shard_b_data);
+    std::fs::write(dir.join("model-00002-of-00002.safetensors"), &bytes_b).unwrap();
+
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "weight_map": {
+                "model.layers.0.bf16": "model-00001-of-00002.safetensors",
+                "model.layers.0.packed": "model-00001-of-00002.safetensors",
+                "model.layers.1.f32": "model-00002-of-00002.safetensors",
+                "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": "model-00002-of-00002.safetensors"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let archive = SafetensorsArchive::open(dir).unwrap();
+    assert!(
+        !archive
+            .ple_shards
+            .contains("model-00001-of-00002.safetensors")
+    );
+    assert!(
+        archive
+            .ple_shards
+            .contains("model-00002-of-00002.safetensors")
+    );
+    archive.drop_page_cache();
+
+    let full_bf16 = archive.read_f16_bits("model.layers.0.bf16").unwrap();
+    let mid_bf16 = archive
+        .read_f16_bits_subslice("model.layers.0.bf16", 2, 4)
+        .unwrap();
+    assert_eq!(&full_bf16[2..6], mid_bf16.as_slice());
+    assert!(
+        archive
+            .read_f16_bits_subslice("model.layers.0.bf16", 6, 3)
+            .is_err()
+    );
+
+    let mid_u32 = archive
+        .read_u32_subslice("model.layers.0.packed", 4, 4)
+        .unwrap();
+    assert_eq!(mid_u32, vec![50, 60, 70, 80]);
+    assert!(
+        archive
+            .read_u32_subslice("model.layers.0.packed", 7, 2)
+            .is_err()
+    );
+
+    let row1_f32 = archive
+        .read_f16_bits_subslice("model.layers.1.f32", 2, 2)
+        .unwrap();
+    assert_eq!(row1_f32, vec![f32_to_f16(3.5), f32_to_f16(-4.5)]);
+}

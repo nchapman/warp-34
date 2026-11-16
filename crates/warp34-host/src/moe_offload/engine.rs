@@ -1243,15 +1243,37 @@ impl RankTieredMoe {
             .and_then(HotExpertRankings::from_model_dir);
         let mut stores = Vec::with_capacity(cfg.num_hidden_layers);
         let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
-        let mut bridge_runtime = None;
         let local_experts = cfg.num_experts / ep_size.max(1);
         let fully_resident = k_hot >= local_experts;
+        let mut slab_pool = host_store::PinnedSlabPool::new(cfg.num_hidden_layers.max(1));
         for layer_id in 0..cfg.num_hidden_layers {
             let prefix = format!("model.layers.{layer_id}.mlp.experts");
             let layer_layout = cfg
                 .layer_moe_expert_pack_layout(layer_id)
                 .unwrap_or_else(|| base_layout.clone());
-            let mut store = HostExpertStore::load_with_pin(
+            let remaining_layers = cfg.num_hidden_layers - layer_id;
+            let preallocated = if fully_resident {
+                None
+            } else {
+                let bytes = layer_layout
+                    .stride
+                    .checked_mul(local_experts)
+                    .ok_or_else(|| {
+                        crate::cuda::CudaError::new(-1, "tiered MoE layer size overflow")
+                    })?;
+                Some(
+                    slab_pool
+                        .alloc_layer(bytes, remaining_layers, true)
+                        .map_err(|e| {
+                            crate::cuda::CudaError::with_detail(
+                                -1,
+                                "PinnedSlabPool::alloc_layer",
+                                e.to_string(),
+                            )
+                        })?,
+                )
+            };
+            let mut store = HostExpertStore::load_with_storage(
                 archive,
                 &prefix,
                 &cfg.quant,
@@ -1261,36 +1283,55 @@ impl RankTieredMoe {
                 ep_size,
                 usize::MAX,
                 !fully_resident,
+                preallocated,
             )
             .map_err(|e| {
                 crate::cuda::CudaError::with_detail(-1, "HostExpertStore::load", e.to_string())
             })?;
-            let mut cache =
-                HotExpertCache::new(device_id, k_hot, store.expert_ids(), store.layout().clone())?;
+            let mut cache = HotExpertCache::new_on_stream(
+                device_id,
+                k_hot,
+                store.expert_ids(),
+                store.layout().clone(),
+                stream,
+            )?;
             let initial = rankings
                 .as_ref()
                 .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), k_hot));
-            cache.populate_initial(&store, initial.as_deref(), &mut ws, stream)?;
+            cache.populate_initial_async(&store, initial.as_deref(), &mut ws, stream)?;
             if fully_resident {
                 stream.synchronize()?;
                 store.release_host_storage();
-            } else if k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
-                && store.layout().supports_cpu_bridge()
-                && HotExpertCache::auto_cpu_bridge_preferred()
-            {
+            }
+            stores.push(store);
+            caches.push(cache);
+        }
+        drop(slab_pool);
+        archive.drop_page_cache();
+
+        // Defer spinning up the CPU MoE bridge (`moe-responder` busy-polls CPU 0) until all
+        // 48 layers have finished `pread`ing and packing so loader threads never contend with it.
+        if !fully_resident
+            && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
+            && HotExpertCache::auto_cpu_bridge_preferred()
+        {
+            let mut bridge_runtime = None;
+            let k_static =
+                if (64..=crate::model::TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT).contains(&k_hot) {
+                    k_hot - 16
+                } else {
+                    k_hot
+                };
+            for (store, cache) in stores.iter().zip(&mut caches) {
+                if !store.layout().supports_cpu_bridge() {
+                    continue;
+                }
                 if ep_size == 1 {
-                    let k_static = if (64..=crate::model::TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT)
-                        .contains(&k_hot)
-                    {
-                        k_hot - 16
-                    } else {
-                        k_hot
-                    };
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }
                     cache.bridge_runtime = bridge_runtime.clone();
-                    cache.register_cpu_bridge(&store, k_static, stream)?;
+                    cache.register_cpu_bridge_async(store, k_static, stream)?;
                 } else {
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_prefill_only(
@@ -1300,9 +1341,8 @@ impl RankTieredMoe {
                     cache.bridge_runtime = bridge_runtime.clone();
                 }
             }
-            stores.push(store);
-            caches.push(cache);
         }
+        stream.synchronize()?;
         Ok(Self {
             stores,
             caches,

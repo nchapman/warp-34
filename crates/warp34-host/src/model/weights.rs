@@ -600,6 +600,314 @@ impl RawLinearHost {
         Self::load_with_transform(archive, base_prefix, quant)
     }
 
+    pub(crate) fn load_row_shard(
+        archive: &SafetensorsArchive,
+        base_prefix: &str,
+        quant: &QuantScheme,
+        row_start: usize,
+        row_end: usize,
+    ) -> Result<Self> {
+        Self::load_with_transform_row_range(archive, base_prefix, quant, Some((row_start, row_end)))
+            .map(|(shard, _)| shard)
+    }
+
+    pub(crate) fn load_row_shard_with_full_n(
+        archive: &SafetensorsArchive,
+        base_prefix: &str,
+        quant: &QuantScheme,
+        row_start: usize,
+        row_end: usize,
+    ) -> Result<(Self, usize)> {
+        Self::load_with_transform_row_range(archive, base_prefix, quant, Some((row_start, row_end)))
+    }
+
+    pub(super) fn load_untransformed_row_range(
+        archive: &SafetensorsArchive,
+        base_prefix: &str,
+        quant: &QuantScheme,
+        row_range: Option<(usize, usize)>,
+    ) -> Result<(Self, usize)> {
+        let Some((row_start, row_end)) = row_range else {
+            let full = Self::load_untransformed(archive, base_prefix, quant)?;
+            let full_n = full.dims().0;
+            return Ok((full, full_n));
+        };
+        if row_start >= row_end {
+            return Err(loader_err("invalid linear N shard"));
+        }
+        let has_unquantized_weight = archive
+            .resolve_name(&format!("{base_prefix}.weight"))
+            .and_then(|k| archive.tensor_info(&k).ok())
+            .is_some_and(|info| {
+                info.shape.len() == 2
+                    && matches!(info.dtype.as_str(), "F16" | "BF16" | "F32")
+                    && archive
+                        .resolve_name(&format!("{base_prefix}.weight_scale_inv"))
+                        .is_none()
+                    && (archive
+                        .resolve_name(&format!("{base_prefix}.weight_scale"))
+                        .is_none()
+                        || archive
+                            .resolve_name(&format!("{base_prefix}.weight_packed"))
+                            .is_some())
+            });
+
+        // Fast path A: compressed-tensors row-major `weight_packed` + `weight_scale` without g_idx.
+        let packed_key = format!("{base_prefix}.weight_packed");
+        if !has_unquantized_weight
+            && let Some(real_packed) = archive.resolve_name(&packed_key)
+            && archive
+                .resolve_name(&format!("{base_prefix}.weight_g_idx"))
+                .is_none()
+            && archive
+                .resolve_name(&format!("{base_prefix}.g_idx"))
+                .is_none()
+            && let Some(scale_key) = archive.resolve_name(&format!("{base_prefix}.weight_scale"))
+        {
+            let p_info = archive
+                .tensor_info(&real_packed)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{real_packed}') failed: {e}")))?;
+            let s_info = archive
+                .tensor_info(&scale_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
+            let zp_key = archive.resolve_name(&format!("{base_prefix}.weight_zero_point"));
+            let zp_aligned =
+                zp_key.is_none() || (row_start.is_multiple_of(8) && row_end.is_multiple_of(8));
+            if p_info.shape.len() == 2
+                && s_info.shape.len() == 2
+                && s_info.shape[1] != 0
+                && matches!(p_info.dtype.as_str(), "I32" | "U32")
+                && matches!(s_info.dtype.as_str(), "F16" | "BF16" | "F32")
+                && zp_aligned
+            {
+                let shape_override = archive
+                    .resolve_name(&format!("{base_prefix}.weight_shape"))
+                    .map(|sk| {
+                        archive.read_weight_shape_2d(&sk).map_err(|e| {
+                            loader_err_msg(format!("read_weight_shape_2d('{sk}') failed: {e}"))
+                        })
+                    })
+                    .transpose()?;
+                let bits_opt = if let Some([shape_n, shape_k]) = shape_override {
+                    if shape_n == p_info.shape[0]
+                        && p_info.shape[1] != 0
+                        && shape_k.is_multiple_of(p_info.shape[1])
+                    {
+                        match shape_k / p_info.shape[1] {
+                            16 => Some(2usize),
+                            8 => Some(4usize),
+                            4 => Some(8usize),
+                            _ => None,
+                        }
+                        .filter(|&inf| {
+                            quant.bits() == 0
+                                || quant.bits() == inf
+                                || base_prefix.ends_with("embed_tokens")
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    match quant.bits() {
+                        8 => Some(8usize),
+                        4 | 0 => Some(4usize),
+                        2 => Some(2usize),
+                        _ => None,
+                    }
+                };
+                if let Some(bits) = bits_opt {
+                    let pack_factor = 32 / bits;
+                    let n = p_info.shape[0];
+                    if let Some(k) = p_info.shape[1].checked_mul(pack_factor) {
+                        let num_groups = s_info.shape[1];
+                        let words_per_row = p_info.shape[1];
+                        let expected_packed_bytes =
+                            n.checked_mul(words_per_row).and_then(|v| v.checked_mul(4));
+                        let s_elem_bytes: usize = if s_info.dtype == "F32" { 4 } else { 2 };
+                        let expected_scale_bytes = n
+                            .checked_mul(num_groups)
+                            .and_then(|v| v.checked_mul(s_elem_bytes));
+                        if n > 0
+                            && k > 0
+                            && num_groups > 0
+                            && s_info.shape[0] == n
+                            && k.is_multiple_of(num_groups)
+                            && row_end <= n
+                            && expected_packed_bytes == Some(p_info.len_bytes as usize)
+                            && expected_scale_bytes == Some(s_info.len_bytes as usize)
+                            && zp_key.is_some()
+                                >= (quant.expects_zero_points()
+                                    && !base_prefix.ends_with("embed_tokens"))
+                        {
+                            let out_n = row_end - row_start;
+                            let group_size = k / num_groups;
+                            let channelwise =
+                                num_groups == 1 && (quant.is_channelwise() || k > 128);
+                            if let Some(zp_k) = zp_key {
+                                let zp_info = archive.tensor_info(&zp_k).map_err(|e| {
+                                    loader_err_msg(format!("tensor_info('{zp_k}') failed: {e}"))
+                                })?;
+                                if bits == 4
+                                    && matches!(zp_info.dtype.as_str(), "I32" | "U32")
+                                    && n.is_multiple_of(8)
+                                    && zp_info.shape.as_slice() == [n / 8, num_groups]
+                                    && (n / 8)
+                                        .checked_mul(num_groups)
+                                        .and_then(|v| v.checked_mul(4))
+                                        == Some(zp_info.len_bytes as usize)
+                                {
+                                    let packed = archive
+                                        .read_u32_subslice(
+                                            &real_packed,
+                                            row_start * words_per_row,
+                                            out_n * words_per_row,
+                                        )
+                                        .map_err(|e| {
+                                            loader_err_msg(format!(
+                                                "read_u32_subslice('{real_packed}') failed: {e}"
+                                            ))
+                                        })?;
+                                    let scales = archive
+                                        .read_f16_bits_subslice(
+                                            &scale_key,
+                                            row_start * num_groups,
+                                            out_n * num_groups,
+                                        )
+                                        .map_err(|e| {
+                                            loader_err_msg(format!(
+                                                "read_f16_bits_subslice('{scale_key}') failed: {e}"
+                                            ))
+                                        })?;
+                                    let qzeros = archive
+                                        .read_u32_subslice(
+                                            &zp_k,
+                                            (row_start / 8) * num_groups,
+                                            (out_n / 8) * num_groups,
+                                        )
+                                        .map_err(|e| {
+                                            loader_err_msg(format!(
+                                                "read_u32_subslice('{zp_k}') failed: {e}"
+                                            ))
+                                        })?;
+                                    return Ok((
+                                        Self::U4ZpNMajor {
+                                            packed,
+                                            scales,
+                                            qzeros,
+                                            n: out_n,
+                                            k,
+                                            group_size,
+                                        },
+                                        n,
+                                    ));
+                                }
+                            } else {
+                                let packed = archive
+                                    .read_u32_subslice(
+                                        &real_packed,
+                                        row_start * words_per_row,
+                                        out_n * words_per_row,
+                                    )
+                                    .map_err(|e| {
+                                        loader_err_msg(format!(
+                                            "read_u32_subslice('{real_packed}') failed: {e}"
+                                        ))
+                                    })?;
+                                let scales = archive
+                                    .read_f16_bits_subslice(
+                                        &scale_key,
+                                        row_start * num_groups,
+                                        out_n * num_groups,
+                                    )
+                                    .map_err(|e| {
+                                        loader_err_msg(format!(
+                                            "read_f16_bits_subslice('{scale_key}') failed: {e}"
+                                        ))
+                                    })?;
+                                let shard = if bits == 8 {
+                                    Self::U8B128NMajor {
+                                        packed,
+                                        scales,
+                                        n: out_n,
+                                        k,
+                                        group_size,
+                                        channelwise,
+                                    }
+                                } else if bits == 2 {
+                                    Self::U2B2NMajor {
+                                        packed,
+                                        scales,
+                                        n: out_n,
+                                        k,
+                                        group_size,
+                                    }
+                                } else {
+                                    Self::U4B8NMajor {
+                                        packed,
+                                        scales,
+                                        n: out_n,
+                                        k,
+                                        group_size,
+                                    }
+                                };
+                                return Ok((shard, n));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fast path B: unquantized row-major 2D `*.weight` (`F16` / `BF16` / `F32`).
+        if has_unquantized_weight
+            && archive
+                .resolve_name(&format!("{base_prefix}.qweight"))
+                .is_none()
+            && archive
+                .resolve_name(&format!("{base_prefix}.weight_packed"))
+                .is_none()
+            && let Some(weight_key) = archive.resolve_name(&format!("{base_prefix}.weight"))
+        {
+            let w_info = archive
+                .tensor_info(&weight_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{weight_key}') failed: {e}")))?;
+            if w_info.shape.len() == 2 {
+                let n = w_info.shape[0];
+                let k = w_info.shape[1];
+                let elem_bytes: usize = if w_info.dtype == "F32" { 4 } else { 2 };
+                if let Some(expected_bytes) =
+                    n.checked_mul(k).and_then(|v| v.checked_mul(elem_bytes))
+                    && expected_bytes == w_info.len_bytes as usize
+                    && row_end <= n
+                {
+                    let out_n = row_end - row_start;
+                    let weight = archive
+                        .read_f16_bits_subslice(&weight_key, row_start * k, out_n * k)
+                        .map_err(|e| {
+                            loader_err_msg(format!(
+                                "read_f16_bits_subslice('{weight_key}') failed: {e}"
+                            ))
+                        })?;
+                    return Ok((
+                        Self::DenseF16 {
+                            weight,
+                            n: out_n,
+                            k,
+                        },
+                        n,
+                    ));
+                }
+            }
+        }
+
+        let full = Self::load_untransformed(archive, base_prefix, quant)?;
+        let full_n = full.dims().0;
+        if row_end > full_n {
+            return Err(loader_err("invalid linear N shard"));
+        }
+        Ok((full.into_slice_rows(row_start, row_end), full_n))
+    }
+
     fn load_untransformed(
         archive: &SafetensorsArchive,
         base_prefix: &str,
@@ -1140,6 +1448,29 @@ impl RawLinearHost {
         Ok(Self::DenseF16 { weight, n, k })
     }
 
+    pub(crate) fn into_slice_rows(self, row_start: usize, row_end: usize) -> Self {
+        if row_start == 0 && row_end == self.dims().0 {
+            return self;
+        }
+        self.slice_rows(row_start, row_end)
+    }
+
+    pub(crate) fn into_slice_cols(self, col_start: usize, col_end: usize) -> Result<Self> {
+        let full_k = self.dims().1;
+        if col_start >= col_end || col_end > full_k {
+            return Err(loader_err("invalid linear K shard"));
+        }
+        if let Self::Hadamard { block_size, .. } = &self
+            && (!col_start.is_multiple_of(*block_size) || !col_end.is_multiple_of(*block_size))
+        {
+            return Err(loader_err("K shard splits a Hadamard block"));
+        }
+        if col_start == 0 && col_end == full_k {
+            return Ok(self);
+        }
+        Ok(self.slice_cols_inner(col_start, col_end))
+    }
+
     pub(crate) fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
         let out_n = row_end - row_start;
         match self {
@@ -1239,6 +1570,7 @@ impl RawLinearHost {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn slice_cols(&self, col_start: usize, col_end: usize) -> Result<Self> {
         if col_start >= col_end || col_end > self.dims().1 {
             return Err(loader_err("invalid linear K shard"));
@@ -1525,8 +1857,22 @@ impl RawLinearHost {
                 .iter()
                 .all(|p| matches!(p, Self::U2B2NMajor { group_size, .. } if group_size == gs0))
         {
-            let mut packed = Vec::new();
-            let mut scales = Vec::new();
+            let cap_pk: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U2B2NMajor { packed, .. } => packed.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_sc: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U2B2NMajor { scales, .. } => scales.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut packed = Vec::with_capacity(cap_pk);
+            let mut scales = Vec::with_capacity(cap_sc);
             let mut total_n = 0;
             for p in parts {
                 if let Self::U2B2NMajor {
@@ -1557,8 +1903,22 @@ impl RawLinearHost {
                 .iter()
                 .all(|p| matches!(p, Self::U4B8NMajor { group_size, .. } if group_size == gs0))
         {
-            let mut packed = Vec::new();
-            let mut scales = Vec::new();
+            let cap_pk: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U4B8NMajor { packed, .. } => packed.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_sc: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U4B8NMajor { scales, .. } => scales.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut packed = Vec::with_capacity(cap_pk);
+            let mut scales = Vec::with_capacity(cap_sc);
             let mut total_n = 0;
             for p in parts {
                 if let Self::U4B8NMajor {
@@ -1596,8 +1956,25 @@ impl RawLinearHost {
                 )
             })
         {
-            let mut packed = Vec::new();
-            let mut scales = Vec::new();
+            let cap_pk: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U2B2NMajor { packed, .. } => packed.len() * 2,
+                    Self::U4B8NMajor { packed, .. } => packed.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_sc: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U2B2NMajor { scales, .. } | Self::U4B8NMajor { scales, .. } => {
+                        scales.len()
+                    }
+                    _ => 0,
+                })
+                .sum();
+            let mut packed = Vec::with_capacity(cap_pk);
+            let mut scales = Vec::with_capacity(cap_sc);
             let mut total_n = 0;
             for p in parts {
                 match p {
@@ -1640,9 +2017,30 @@ impl RawLinearHost {
                 |p| matches!(p, Self::U4ZpNMajor { group_size, n, .. } if group_size == gs0 && n.is_multiple_of(8)),
             )
         {
-            let mut packed = Vec::new();
-            let mut scales = Vec::new();
-            let mut qzeros = Vec::new();
+            let cap_pk: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U4ZpNMajor { packed, .. } => packed.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_sc: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U4ZpNMajor { scales, .. } => scales.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_qz: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U4ZpNMajor { qzeros, .. } => qzeros.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut packed = Vec::with_capacity(cap_pk);
+            let mut scales = Vec::with_capacity(cap_sc);
+            let mut qzeros = Vec::with_capacity(cap_qz);
             let mut total_n = 0;
             for p in parts {
                 if let Self::U4ZpNMajor {
@@ -1685,8 +2083,22 @@ impl RawLinearHost {
                 )
             })
         {
-            let mut packed = Vec::new();
-            let mut scales = Vec::new();
+            let cap_pk: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U8B128NMajor { packed, .. } => packed.len(),
+                    _ => 0,
+                })
+                .sum();
+            let cap_sc: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::U8B128NMajor { scales, .. } => scales.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut packed = Vec::with_capacity(cap_pk);
+            let mut scales = Vec::with_capacity(cap_sc);
             let mut total_n = 0;
             for p in parts {
                 if let Self::U8B128NMajor {
@@ -1711,12 +2123,18 @@ impl RawLinearHost {
             });
         }
 
-        let mut weight = Vec::new();
+        let total_rows: usize = parts.iter().map(|p| p.dims().0).sum();
+        let mut weight = Vec::with_capacity(total_rows.saturating_mul(k));
         let mut total_n = 0;
         for p in parts {
-            let dq = p.to_f16_vec();
-            weight.extend_from_slice(&dq);
-            total_n += p.dims().0;
+            if let Self::DenseF16 { weight: w, n, .. } = p {
+                weight.extend_from_slice(w);
+                total_n += *n;
+            } else {
+                let dq = p.to_f16_vec();
+                weight.extend_from_slice(&dq);
+                total_n += p.dims().0;
+            }
         }
         Ok(Self::DenseF16 {
             weight,
@@ -1733,18 +2151,34 @@ impl RawLinearHost {
         bits: usize,
         arena: &mut DeviceArena,
         stream: &CudaStream,
-        repack_staging: &DeviceBuffer,
+        staging: &mut UploadStaging<'_>,
     ) -> Result<u64> {
         let bytes = packed.len() * 4;
         let b_q_weight_ptr = arena.alloc_aligned(bytes)?;
         let ex = stream.exec(0, 0);
-        if bytes > repack_staging.len_bytes {
-            return Err(loader_err_msg(format!(
-                "packed weight size {} exceeds repack staging buffer {}",
-                bytes, repack_staging.len_bytes
-            )));
-        }
-        repack_staging.copy_from_host(packed, stream)?;
+        let (r_slot, staging_addr) = match staging {
+            UploadStaging::Single(repack_staging) => {
+                if bytes > repack_staging.len_bytes {
+                    return Err(loader_err_msg(format!(
+                        "packed weight size {} exceeds repack staging buffer {}",
+                        bytes, repack_staging.len_bytes
+                    )));
+                }
+                repack_staging.copy_from_host(packed, stream)?;
+                (None, repack_staging.addr())
+            }
+            UploadStaging::Pipelined(ring) => {
+                if bytes > ring.repack_capacity() {
+                    return Err(loader_err_msg(format!(
+                        "packed weight size {} exceeds repack staging buffer {}",
+                        bytes,
+                        ring.repack_capacity()
+                    )));
+                }
+                let (idx, addr) = ring.stage_repack_input(packed, stream)?;
+                (Some(idx), addr)
+            }
+        };
         // SAFETY: staging capacity is checked and the destination reserves the
         // same packed byte count. Upload/repack are ordered on stream. The loader
         // supplies packed length and N/K consistent with the selected bit width.
@@ -1752,7 +2186,7 @@ impl RawLinearHost {
             if bits == 8 {
                 ffi::warp34_marlin_repack_int8(
                     &ex,
-                    repack_staging.addr() as *const u32,
+                    staging_addr as *const u32,
                     b_q_weight_ptr as *mut u32,
                     k as i64,
                     n as i64,
@@ -1760,7 +2194,7 @@ impl RawLinearHost {
             } else if bits == 2 {
                 ffi::warp34_marlin_repack_int2(
                     &ex,
-                    repack_staging.addr() as *const u32,
+                    staging_addr as *const u32,
                     b_q_weight_ptr as *mut u32,
                     k as i64,
                     n as i64,
@@ -1768,7 +2202,7 @@ impl RawLinearHost {
             } else {
                 ffi::warp34_marlin_repack_int4(
                     &ex,
-                    repack_staging.addr() as *const u32,
+                    staging_addr as *const u32,
                     b_q_weight_ptr as *mut u32,
                     k as i64,
                     n as i64,
@@ -1776,6 +2210,9 @@ impl RawLinearHost {
             }
         };
         check_rc(rc, "warp34_marlin_repack")?;
+        if let (UploadStaging::Pipelined(ring), Some(idx)) = (staging, r_slot) {
+            ring.finish_repack_stage(idx, stream)?;
+        }
         Ok(b_q_weight_ptr)
     }
 
@@ -1786,13 +2223,35 @@ impl RawLinearHost {
         stream: &CudaStream,
         repack_staging: &DeviceBuffer,
     ) -> Result<LinearProj> {
+        let mut staging = UploadStaging::Single(repack_staging);
+        self.upload_with(arena, stream, &mut staging)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn upload_pipelined(
+        &self,
+        arena: &mut DeviceArena,
+        stream: &CudaStream,
+        ring: &mut crate::cuda::PinnedUploadRing,
+    ) -> Result<LinearProj> {
+        let mut staging = UploadStaging::Pipelined(ring);
+        self.upload_with(arena, stream, &mut staging)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn upload_with(
+        &self,
+        arena: &mut DeviceArena,
+        stream: &CudaStream,
+        staging: &mut UploadStaging<'_>,
+    ) -> Result<LinearProj> {
         let marlin_geom_ok = |n: usize, k: usize| {
             (n.is_multiple_of(MARLIN_TILE_N) && k.is_multiple_of(MARLIN_TILE_K_W4))
                 || (n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N))
         };
         match self {
             Self::Hadamard { inner, block_size } => {
-                inner.upload_hadamard(*block_size, arena, stream, repack_staging)
+                inner.upload_hadamard_with(*block_size, arena, stream, staging)
             }
             Self::U2B2NMajor {
                 packed,
@@ -1806,22 +2265,15 @@ impl RawLinearHost {
                     && k.is_multiple_of(64)
                     && (channelwise || matches!(*group_size, 32 | 64 | 128))
                 {
-                    let b_q_weight_ptr = Self::repack_with_staging(
-                        packed,
-                        *n,
-                        *k,
-                        2,
-                        arena,
-                        stream,
-                        repack_staging,
-                    )?;
+                    let b_q_weight_ptr =
+                        Self::repack_with_staging(packed, *n, *k, 2, arena, stream, staging)?;
                     let perm_scales = marlin_permute_scales_from_n_major(
                         scales,
                         *k,
                         *n,
                         if channelwise { 0 } else { *group_size },
                     );
-                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let b_scales_ptr = staging.upload_slice(arena, &perm_scales, stream)?;
                     Ok(LinearProj::MarlinW2A16 {
                         b_q_weight_ptr,
                         b_scales_ptr,
@@ -1835,7 +2287,7 @@ impl RawLinearHost {
                     })
                 } else {
                     let f16_w = dequant_u2b2_n_major_to_f16(packed, scales, *n, *k, *group_size);
-                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    let weight_ptr = staging.upload_slice(arena, &f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,
                         size_n: *n,
@@ -1852,22 +2304,15 @@ impl RawLinearHost {
             } => {
                 let channelwise = *group_size == *k && *group_size > MARLIN_TILE_K_W4;
                 if marlin_geom_ok(*n, *k) && (channelwise || matches!(*group_size, 32 | 64 | 128)) {
-                    let b_q_weight_ptr = Self::repack_with_staging(
-                        packed,
-                        *n,
-                        *k,
-                        4,
-                        arena,
-                        stream,
-                        repack_staging,
-                    )?;
+                    let b_q_weight_ptr =
+                        Self::repack_with_staging(packed, *n, *k, 4, arena, stream, staging)?;
                     let perm_scales = marlin_permute_scales_from_n_major(
                         scales,
                         *k,
                         *n,
                         if channelwise { 0 } else { *group_size },
                     );
-                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let b_scales_ptr = staging.upload_slice(arena, &perm_scales, stream)?;
                     Ok(LinearProj::MarlinW4A16 {
                         b_q_weight_ptr,
                         b_scales_ptr,
@@ -1881,7 +2326,7 @@ impl RawLinearHost {
                     })
                 } else {
                     let f16_w = dequant_u4b8_n_major_to_f16(packed, scales, *n, *k, *group_size);
-                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    let weight_ptr = staging.upload_slice(arena, &f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,
                         size_n: *n,
@@ -1898,21 +2343,14 @@ impl RawLinearHost {
                 group_size,
             } => {
                 if marlin_geom_ok(*n, *k) && matches!(*group_size, 32 | 64 | 128) {
-                    let b_q_weight_ptr = Self::repack_with_staging(
-                        packed,
-                        *n,
-                        *k,
-                        4,
-                        arena,
-                        stream,
-                        repack_staging,
-                    )?;
+                    let b_q_weight_ptr =
+                        Self::repack_with_staging(packed, *n, *k, 4, arena, stream, staging)?;
                     let perm_scales =
                         marlin_permute_scales_from_n_major(scales, *k, *n, *group_size);
-                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let b_scales_ptr = staging.upload_slice(arena, &perm_scales, stream)?;
                     let perm_zeros =
                         marlin_permute_zero_points_from_n_major(qzeros, *k, *n, *group_size);
-                    let b_zeros_ptr = arena.upload_slice(&perm_zeros, stream)?;
+                    let b_zeros_ptr = staging.upload_slice(arena, &perm_zeros, stream)?;
                     Ok(LinearProj::MarlinW4A16Zp {
                         b_q_weight_ptr,
                         b_scales_ptr,
@@ -1924,7 +2362,7 @@ impl RawLinearHost {
                 } else {
                     let f16_w =
                         dequant_u4_zp_n_major_to_f16(packed, scales, qzeros, *n, *k, *group_size);
-                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    let weight_ptr = staging.upload_slice(arena, &f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,
                         size_n: *n,
@@ -1943,18 +2381,11 @@ impl RawLinearHost {
                 let gs_ok = *channelwise || matches!(*group_size, 32 | 64 | 128);
                 let eff_gs = if *channelwise { *k } else { *group_size };
                 if marlin_geom_ok(*n, *k) && gs_ok {
-                    let b_q_weight_ptr = Self::repack_with_staging(
-                        packed,
-                        *n,
-                        *k,
-                        8,
-                        arena,
-                        stream,
-                        repack_staging,
-                    )?;
+                    let b_q_weight_ptr =
+                        Self::repack_with_staging(packed, *n, *k, 8, arena, stream, staging)?;
                     let perm_gs = if *channelwise { 0 } else { *group_size };
                     let perm_scales = marlin_permute_scales_from_n_major(scales, *k, *n, perm_gs);
-                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let b_scales_ptr = staging.upload_slice(arena, &perm_scales, stream)?;
                     let group_blocks = if *channelwise {
                         -1
                     } else {
@@ -1969,7 +2400,7 @@ impl RawLinearHost {
                     })
                 } else {
                     let f16_w = dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, eff_gs);
-                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    let weight_ptr = staging.upload_slice(arena, &f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,
                         size_n: *n,
@@ -1978,13 +2409,34 @@ impl RawLinearHost {
                 }
             }
             Self::DenseF16 { weight, n, k } => {
-                let weight_ptr = arena.upload_slice(weight, stream)?;
+                let weight_ptr = staging.upload_slice(arena, weight, stream)?;
                 Ok(LinearProj::DenseF16 {
                     weight_ptr,
                     size_n: *n,
                     size_k: *k,
                 })
             }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) enum UploadStaging<'a> {
+    Single(&'a DeviceBuffer),
+    Pipelined(&'a mut crate::cuda::PinnedUploadRing),
+}
+
+#[cfg(feature = "cuda")]
+impl UploadStaging<'_> {
+    pub(crate) fn upload_slice<T: Copy>(
+        &mut self,
+        arena: &mut DeviceArena,
+        src: &[T],
+        stream: &CudaStream,
+    ) -> Result<u64> {
+        match self {
+            Self::Single(_) => arena.upload_slice(src, stream),
+            Self::Pipelined(ring) => ring.upload_slice(arena, src, stream),
         }
     }
 }

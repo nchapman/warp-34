@@ -788,7 +788,14 @@ impl DFlash2Rank {
         );
         let coeff = 2 * cfg.taps * (h / cfg.group);
         let rope_rows = capacity + cfg.block_size;
-        let mut weights = DeviceArena::new(t.device.device_id, total_weight_bytes)?;
+        let mut weights =
+            DeviceArena::new_on_stream(t.device.device_id, total_weight_bytes, &t.stream)?;
+        let max_repack_bytes = (2 * i.max(q + 2 * kv))
+            .saturating_mul(h.saturating_mul(cfg.target_layers.len().max(1)))
+            .div_ceil(2)
+            .max(16 * 1024 * 1024);
+        let mut upload_ring =
+            crate::cuda::PinnedUploadRing::new(t.device.device_id, max_repack_bytes, &t.stream)?;
         fn read(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
             let info = a
                 .tensor_info(name)
@@ -830,6 +837,12 @@ impl DFlash2Rank {
             {
                 QuantScheme::Unquantized => {
                     let full = read(&archive, &format!("{name}.weight"), &[n, k])?;
+                    if rs == 0 && rn == n && cs == 0 && cn == k {
+                        return Ok(HostSlice::DenseBf16(full));
+                    }
+                    if cs == 0 && cn == k {
+                        return Ok(HostSlice::DenseBf16(full[rs * k..(rs + rn) * k].to_vec()));
+                    }
                     let values: Vec<u16> = full[rs * k..(rs + rn) * k]
                         .chunks_exact(k)
                         .flat_map(|row| row[cs..cs + cn].iter().copied())
@@ -947,19 +960,37 @@ impl DFlash2Rank {
                     let full_s = archive
                         .read_bf16_bits(&s_key)
                         .map_err(|e| loader_err_ctx("read DFlash weight_scale", e.to_string()))?;
+                    if rs == 0 && rn == n && cs == 0 && cn == k {
+                        return Ok(HostSlice::U4B8 {
+                            packed: full_p,
+                            scales: full_s,
+                            eff_gs,
+                            group_blocks,
+                            hadamard_block,
+                        });
+                    }
                     let words_k = k / U4_NIBBLES_PER_U32;
                     let ws = cs / U4_NIBBLES_PER_U32;
                     let wn = cn / U4_NIBBLES_PER_U32;
-                    let packed: Vec<u32> = full_p[rs * words_k..(rs + rn) * words_k]
-                        .chunks_exact(words_k)
-                        .flat_map(|row| row[ws..ws + wn].iter().copied())
-                        .collect();
                     let gs = cs / eff_gs;
                     let gn = cn / eff_gs;
-                    let scales: Vec<u16> = full_s[rs * num_groups..(rs + rn) * num_groups]
-                        .chunks_exact(num_groups)
-                        .flat_map(|row| row[gs..gs + gn].iter().copied())
-                        .collect();
+                    let (packed, scales) = if cs == 0 && cn == k {
+                        (
+                            full_p[rs * words_k..(rs + rn) * words_k].to_vec(),
+                            full_s[rs * num_groups..(rs + rn) * num_groups].to_vec(),
+                        )
+                    } else {
+                        (
+                            full_p[rs * words_k..(rs + rn) * words_k]
+                                .chunks_exact(words_k)
+                                .flat_map(|row| row[ws..ws + wn].iter().copied())
+                                .collect(),
+                            full_s[rs * num_groups..(rs + rn) * num_groups]
+                                .chunks_exact(num_groups)
+                                .flat_map(|row| row[gs..gs + gn].iter().copied())
+                                .collect(),
+                        )
+                    };
                     Ok(HostSlice::U4B8 {
                         packed,
                         scales,
@@ -971,61 +1002,69 @@ impl DFlash2Rank {
                 _ => Err(loader_err("unsupported DFlash linear quantization")),
             }
         };
-        let upload_slice_linear =
-            |a: &mut DeviceArena, slice: HostSlice, rn: usize, cn: usize| -> Result<Linear> {
-                match slice {
-                    HostSlice::DenseBf16(values) => Ok(Linear::DenseBf16 {
-                        weight: a.upload_slice(&values, &t.stream)?,
+        let upload_slice_linear = |a: &mut DeviceArena,
+                                   ring: &mut crate::cuda::PinnedUploadRing,
+                                   slice: HostSlice,
+                                   rn: usize,
+                                   cn: usize|
+         -> Result<Linear> {
+            match slice {
+                HostSlice::DenseBf16(values) => Ok(Linear::DenseBf16 {
+                    weight: ring.upload_slice(a, &values, &t.stream)?,
+                    n: rn,
+                    k: cn,
+                }),
+                HostSlice::U4B8 {
+                    packed,
+                    scales,
+                    eff_gs,
+                    group_blocks,
+                    hadamard_block,
+                } => {
+                    let (r_idx, staging_addr) = ring.stage_repack_input(&packed, &t.stream)?;
+                    let weight = a.alloc_aligned(packed.len() * 4)?;
+                    let ex = t.stream.exec(0, 0);
+                    check_rc(
+                        // SAFETY: staging_addr and weight are valid device allocations of packed.len() u32 words on t.stream.
+                        unsafe {
+                            ffi::warp34_marlin_repack_int4(
+                                &ex,
+                                staging_addr as *const u32,
+                                weight as *mut u32,
+                                cn as i64,
+                                rn as i64,
+                            )
+                        },
+                        "DFlash marlin_repack_int4",
+                    )?;
+                    ring.finish_repack_stage(r_idx, &t.stream)?;
+                    let perm_scales = marlin_permute_scales_from_n_major(
+                        &scales,
+                        cn,
+                        rn,
+                        if group_blocks == -1 { 0 } else { eff_gs },
+                    );
+                    let scales_ptr = ring.upload_slice(a, &perm_scales, &t.stream)?;
+                    Ok(Linear::MarlinBf16U4B8 {
+                        weight,
+                        scales: scales_ptr,
                         n: rn,
                         k: cn,
-                    }),
-                    HostSlice::U4B8 {
-                        packed,
-                        scales,
-                        eff_gs,
                         group_blocks,
                         hadamard_block,
-                    } => {
-                        let tmp = DeviceBuffer::alloc(t.device.device_id, packed.len() * 4)?;
-                        tmp.copy_from_host(&packed, &t.stream)?;
-                        let weight = a.alloc_aligned(packed.len() * 4)?;
-                        let ex = t.stream.exec(0, 0);
-                        check_rc(
-                            // SAFETY: tmp and weight are valid device allocations of packed.len() u32 words on t.stream.
-                            unsafe {
-                                ffi::warp34_marlin_repack_int4(
-                                    &ex,
-                                    tmp.addr() as *const u32,
-                                    weight as *mut u32,
-                                    cn as i64,
-                                    rn as i64,
-                                )
-                            },
-                            "DFlash marlin_repack_int4",
-                        )?;
-                        t.stream.synchronize()?;
-                        let perm_scales = marlin_permute_scales_from_n_major(
-                            &scales,
-                            cn,
-                            rn,
-                            if group_blocks == -1 { 0 } else { eff_gs },
-                        );
-                        let scales_ptr = a.upload_slice(&perm_scales, &t.stream)?;
-                        Ok(Linear::MarlinBf16U4B8 {
-                            weight,
-                            scales: scales_ptr,
-                            n: rn,
-                            k: cn,
-                            group_blocks,
-                            hadamard_block,
-                        })
-                    }
+                    })
                 }
-            };
-        let upload = |a: &mut DeviceArena, name: &str, shape: &[usize]| -> Result<u64> {
-            a.upload_slice(&read(&archive, name, shape)?, &t.stream)
+            }
+        };
+        let upload = |a: &mut DeviceArena,
+                      ring: &mut crate::cuda::PinnedUploadRing,
+                      name: &str,
+                      shape: &[usize]|
+         -> Result<u64> {
+            ring.upload_slice(a, &read(&archive, name, shape)?, &t.stream)
         };
         let matrix = |a: &mut DeviceArena,
+                      ring: &mut crate::cuda::PinnedUploadRing,
                       name: &str,
                       n: usize,
                       k: usize,
@@ -1035,50 +1074,54 @@ impl DFlash2Rank {
                       cn: usize|
          -> Result<Linear> {
             let slice = read_slice(name, n, k, rs, rn, cs, cn)?;
-            upload_slice_linear(a, slice, rn, cn)
+            upload_slice_linear(a, ring, slice, rn, cn)
         };
-        let concat_n_matrix =
-            |a: &mut DeviceArena, parts: &[(&str, usize)], k: usize| -> Result<Linear> {
-                let mut total_rn = 0usize;
-                let mut acc: Option<HostSlice> = None;
-                for &(name, local) in parts {
-                    let part = read_slice(name, local * tp, k, r * local, local, 0, k)?;
-                    total_rn += local;
-                    match (&mut acc, part) {
-                        (None, p) => acc = Some(p),
-                        (Some(HostSlice::DenseBf16(dst)), HostSlice::DenseBf16(src)) => {
-                            dst.extend_from_slice(&src);
-                        }
-                        (
-                            Some(HostSlice::U4B8 {
-                                packed: dp,
-                                scales: ds,
-                                eff_gs: dg,
-                                group_blocks: dgb,
-                                hadamard_block: dhb,
-                            }),
-                            HostSlice::U4B8 {
-                                packed: sp,
-                                scales: ss,
-                                eff_gs: sg,
-                                group_blocks: sgb,
-                                hadamard_block: shb,
-                            },
-                        ) if *dg == sg && *dgb == sgb && *dhb == shb => {
-                            dp.extend_from_slice(&sp);
-                            ds.extend_from_slice(&ss);
-                        }
-                        _ => {
-                            return Err(loader_err(
-                                "mismatched quantization schemes across fused DFlash projections",
-                            ));
-                        }
+        let concat_n_matrix = |a: &mut DeviceArena,
+                               ring: &mut crate::cuda::PinnedUploadRing,
+                               parts: &[(&str, usize)],
+                               k: usize|
+         -> Result<Linear> {
+            let mut total_rn = 0usize;
+            let mut acc: Option<HostSlice> = None;
+            for &(name, local) in parts {
+                let part = read_slice(name, local * tp, k, r * local, local, 0, k)?;
+                total_rn += local;
+                match (&mut acc, part) {
+                    (None, p) => acc = Some(p),
+                    (Some(HostSlice::DenseBf16(dst)), HostSlice::DenseBf16(src)) => {
+                        dst.extend_from_slice(&src);
+                    }
+                    (
+                        Some(HostSlice::U4B8 {
+                            packed: dp,
+                            scales: ds,
+                            eff_gs: dg,
+                            group_blocks: dgb,
+                            hadamard_block: shb_dst,
+                        }),
+                        HostSlice::U4B8 {
+                            packed: sp,
+                            scales: ss,
+                            eff_gs: sg,
+                            group_blocks: sgb,
+                            hadamard_block: shb,
+                        },
+                    ) if *dg == sg && *dgb == sgb && *shb_dst == shb => {
+                        dp.extend_from_slice(&sp);
+                        ds.extend_from_slice(&ss);
+                    }
+                    _ => {
+                        return Err(loader_err(
+                            "mismatched quantization schemes across fused DFlash projections",
+                        ));
                     }
                 }
-                upload_slice_linear(a, acc.expect("non-empty parts"), total_rn, k)
-            };
+            }
+            upload_slice_linear(a, ring, acc.expect("non-empty parts"), total_rn, k)
+        };
         let fc = matrix(
             &mut weights,
+            &mut upload_ring,
             "fc",
             h,
             h * cfg.target_layers.len(),
@@ -1087,19 +1130,23 @@ impl DFlash2Rank {
             0,
             h * cfg.target_layers.len(),
         )?;
-        let hidden_norm = upload(&mut weights, "hidden_norm.weight", &[h])?;
-        let final_norm = upload(&mut weights, "norm.weight", &[h])?;
+        let hidden_norm = upload(&mut weights, &mut upload_ring, "hidden_norm.weight", &[h])?;
+        let final_norm = upload(&mut weights, &mut upload_ring, "norm.weight", &[h])?;
         let mut layers = Vec::with_capacity(c.num_hidden_layers);
         for l in 0..c.num_hidden_layers {
             let prefix = format!("layers.{l}");
-            let norm = |arena: &mut DeviceArena, name: &str, size: usize| {
-                upload(arena, &format!("{prefix}.{name}.weight"), &[size])
+            let norm = |arena: &mut DeviceArena,
+                        ring: &mut crate::cuda::PinnedUploadRing,
+                        name: &str,
+                        size: usize| {
+                upload(arena, ring, &format!("{prefix}.{name}.weight"), &[size])
             };
             let q_name = format!("{prefix}.self_attn.q_proj");
             let k_name = format!("{prefix}.self_attn.k_proj");
             let v_name = format!("{prefix}.self_attn.v_proj");
             let qkv = concat_n_matrix(
                 &mut weights,
+                &mut upload_ring,
                 &[(&q_name, q), (&k_name, kv), (&v_name, kv)],
                 h,
             )?;
@@ -1109,12 +1156,16 @@ impl DFlash2Rank {
                     n: 2 * kv,
                     k: h,
                 },
-                Linear::MarlinBf16U4B8 { .. } => {
-                    concat_n_matrix(&mut weights, &[(&k_name, kv), (&v_name, kv)], h)?
-                }
+                Linear::MarlinBf16U4B8 { .. } => concat_n_matrix(
+                    &mut weights,
+                    &mut upload_ring,
+                    &[(&k_name, kv), (&v_name, kv)],
+                    h,
+                )?,
             };
             let out = matrix(
                 &mut weights,
+                &mut upload_ring,
                 &format!("{prefix}.self_attn.o_proj"),
                 h,
                 q * tp,
@@ -1125,9 +1176,15 @@ impl DFlash2Rank {
             )?;
             let gate_name = format!("{prefix}.mlp.gate_proj");
             let up_name = format!("{prefix}.mlp.up_proj");
-            let gate_up = concat_n_matrix(&mut weights, &[(&gate_name, i), (&up_name, i)], h)?;
+            let gate_up = concat_n_matrix(
+                &mut weights,
+                &mut upload_ring,
+                &[(&gate_name, i), (&up_name, i)],
+                h,
+            )?;
             let down = matrix(
                 &mut weights,
+                &mut upload_ring,
                 &format!("{prefix}.mlp.down_proj"),
                 h,
                 i * tp,
@@ -1136,10 +1193,14 @@ impl DFlash2Rank {
                 r * i,
                 i,
             )?;
-            let conv = |arena: &mut DeviceArena, name: &str| -> Result<Conv> {
+            let conv = |arena: &mut DeviceArena,
+                        ring: &mut crate::cuda::PinnedUploadRing,
+                        name: &str|
+             -> Result<Conv> {
                 Ok(Conv {
                     projection: matrix(
                         arena,
+                        ring,
                         &format!("{prefix}.{name}.kernel_projection"),
                         coeff,
                         h,
@@ -1150,27 +1211,40 @@ impl DFlash2Rank {
                     )?,
                     base: upload(
                         arena,
+                        ring,
                         &format!("{prefix}.{name}.base_kernel"),
                         &[2, cfg.taps, h],
                     )?,
                 })
             };
+            let input_norm = norm(&mut weights, &mut upload_ring, "input_layernorm", h)?;
+            let post_norm = norm(
+                &mut weights,
+                &mut upload_ring,
+                "post_attention_layernorm",
+                h,
+            )?;
+            let q_norm = norm(&mut weights, &mut upload_ring, "self_attn.q_norm", d)?;
+            let k_norm = norm(&mut weights, &mut upload_ring, "self_attn.k_norm", d)?;
+            let attn_conv = conv(&mut weights, &mut upload_ring, "attention_conv")?;
+            let mlp_conv = conv(&mut weights, &mut upload_ring, "mlp_conv")?;
             layers.push(Layer {
-                input_norm: norm(&mut weights, "input_layernorm", h)?,
-                post_norm: norm(&mut weights, "post_attention_layernorm", h)?,
-                q_norm: norm(&mut weights, "self_attn.q_norm", d)?,
-                k_norm: norm(&mut weights, "self_attn.k_norm", d)?,
+                input_norm,
+                post_norm,
+                q_norm,
+                k_norm,
                 qkv,
                 kv: kv_proj,
                 out,
                 gate_up,
                 down,
-                attn_conv: conv(&mut weights, "attention_conv")?,
-                mlp_conv: conv(&mut weights, "mlp_conv")?,
+                attn_conv,
+                mlp_conv,
             });
         }
         let hp = matrix(
             &mut weights,
+            &mut upload_ring,
             "candidate_selector.hidden_projection",
             cfg.selector_rank,
             h,
@@ -1181,14 +1255,17 @@ impl DFlash2Rank {
         )?;
         let pred = upload(
             &mut weights,
+            &mut upload_ring,
             "candidate_selector.predecessor_codebook",
             &[c.vocab_size, cfg.selector_rank],
         )?;
         let succ = upload(
             &mut weights,
+            &mut upload_ring,
             "candidate_selector.successor_codebook",
             &[c.vocab_size, cfg.selector_rank],
         )?;
+        drop(upload_ring);
         // SGLang RotaryEmbedding deliberately retains its CUDA cache in FP32,
         // even when Q/K and model weights are BF16. Quantizing this table loses
         // ~0.2% at the first Q projection and amplifies across the five layers.

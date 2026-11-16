@@ -3,7 +3,7 @@
 use super::*;
 
 #[cfg(feature = "cuda")]
-pub(super) type SharedVocabHost = std::sync::OnceLock<Result<(Vec<u16>, Option<RawLinearHost>)>>;
+pub(super) type SharedVocabHost = std::sync::OnceLock<Result<Vec<u16>>>;
 
 pub use crate::lora::LoraCapacityReserve;
 

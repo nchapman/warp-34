@@ -415,6 +415,18 @@ impl QuantScheme {
             _ => Ok(None),
         }
     }
+
+    /// Whether this scheme carries any online/offline transform rules.
+    #[inline]
+    pub fn has_transforms(&self) -> bool {
+        matches!(
+            self,
+            Self::CompressedTensors {
+                rules: Some(rules),
+                ..
+            } if !rules.transforms.is_empty()
+        )
+    }
 }
 
 #[cfg(test)]

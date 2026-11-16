@@ -996,6 +996,33 @@ impl DeviceBuffer {
         })
     }
 
+    /// Allocates device memory and enqueues zero-initialization asynchronously onto `stream`
+    /// without synchronizing legacy stream 0.
+    pub fn alloc_on_stream(device_id: i32, len_bytes: usize, stream: &CudaStream) -> Result<Self> {
+        check_rc(
+            // SAFETY: selects `device_id` on this thread before `cudaMalloc` + async zero-init.
+            unsafe { ffi::warp34_set_device(device_id) },
+            "warp34_set_device",
+        )?;
+        let alloc_bytes = len_bytes.max(16);
+        let mut ptr: *mut c_void = core::ptr::null_mut();
+        check_rc(
+            // SAFETY: `ptr` is a stack out-parameter and `alloc_bytes >= 16`.
+            unsafe { ffi::warp34_malloc(&raw mut ptr, alloc_bytes) },
+            "warp34_malloc",
+        )?;
+        check_rc(
+            // SAFETY: `ptr` was just allocated for `alloc_bytes` on `device_id`; `stream` lives on `device_id`.
+            unsafe { ffi::warp34_memset_async(ptr, 0, alloc_bytes, stream.handle) },
+            "warp34_memset_async",
+        )?;
+        Ok(Self {
+            device_id,
+            ptr,
+            len_bytes,
+        })
+    }
+
     #[inline]
     pub fn addr(&self) -> u64 {
         self.ptr as u64
@@ -1101,6 +1128,15 @@ pub struct DeviceArena {
 impl DeviceArena {
     pub fn new(device_id: i32, capacity_bytes: usize) -> Result<Self> {
         let buf = DeviceBuffer::alloc(device_id, capacity_bytes)?;
+        Ok(Self { buf, offset: 0 })
+    }
+
+    pub fn new_on_stream(
+        device_id: i32,
+        capacity_bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        let buf = DeviceBuffer::alloc_on_stream(device_id, capacity_bytes, stream)?;
         Ok(Self { buf, offset: 0 })
     }
 
@@ -1211,6 +1247,18 @@ unsafe impl Sync for MappedHostBuffer {}
 #[cfg(feature = "cuda")]
 impl MappedHostBuffer {
     pub fn alloc(len_bytes: usize) -> Result<Self> {
+        let buf = Self::alloc_unzeroed(len_bytes)?;
+        let alloc_bytes = len_bytes.max(128);
+        // SAFETY: `buf.host_ptr` was just allocated by `warp34_host_alloc_mapped` for `alloc_bytes` bytes.
+        unsafe {
+            core::ptr::write_bytes(buf.host_ptr.cast::<u8>(), 0, alloc_bytes);
+        }
+        Ok(buf)
+    }
+
+    /// Allocates pinned portable mapped host memory without an extra single-threaded
+    /// user-space `memset` pass. Callers must overwrite all read regions before reading.
+    pub(crate) fn alloc_unzeroed(len_bytes: usize) -> Result<Self> {
         let alloc_bytes = len_bytes.max(128);
         let mut host_ptr: *mut c_void = core::ptr::null_mut();
         let mut dev_ptr: *mut c_void = core::ptr::null_mut();
@@ -1221,10 +1269,6 @@ impl MappedHostBuffer {
             },
             "warp34_host_alloc_mapped",
         )?;
-        // SAFETY: `host_ptr` was just allocated by `warp34_host_alloc_mapped` for `alloc_bytes` bytes.
-        unsafe {
-            core::ptr::write_bytes(host_ptr.cast::<u8>(), 0, alloc_bytes);
-        }
         Ok(Self {
             host_ptr,
             dev_ptr,
@@ -1235,6 +1279,193 @@ impl MappedHostBuffer {
     #[inline]
     pub fn dev_addr(&self) -> u64 {
         self.dev_ptr as u64
+    }
+}
+
+/// Double-buffered pinned H2D + Marlin repack staging pipeline used during model weight loading
+/// so `cudaMemcpyAsync` executes true asynchronous PCIe DMA without pageable bounce-buffer stalls.
+#[cfg(feature = "cuda")]
+pub(crate) struct PinnedUploadRing {
+    device_id: i32,
+    host_slots: [MappedHostBuffer; 2],
+    host_events: [CudaEvent; 2],
+    host_busy: [bool; 2],
+    host_used: [usize; 2],
+    host_cur: usize,
+    repack_slots: [DeviceBuffer; 2],
+    repack_events: [CudaEvent; 2],
+    repack_busy: [bool; 2],
+    repack_used: [usize; 2],
+    repack_cur: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl PinnedUploadRing {
+    const DEFAULT_HOST_SLOT_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(crate) fn new(
+        device_id: i32,
+        repack_staging_bytes: usize,
+        stream: &CudaStream,
+    ) -> Result<Self> {
+        let host_bytes = Self::DEFAULT_HOST_SLOT_BYTES;
+        let host_slots = [
+            MappedHostBuffer::alloc_unzeroed(host_bytes)?,
+            MappedHostBuffer::alloc_unzeroed(host_bytes)?,
+        ];
+        let host_events = [
+            CudaEvent::new(device_id, false)?,
+            CudaEvent::new(device_id, false)?,
+        ];
+        let repack_bytes = repack_staging_bytes.max(16);
+        let repack_slots = [
+            DeviceBuffer::alloc_on_stream(device_id, repack_bytes, stream)?,
+            DeviceBuffer::alloc_on_stream(device_id, repack_bytes, stream)?,
+        ];
+        let repack_events = [
+            CudaEvent::new(device_id, false)?,
+            CudaEvent::new(device_id, false)?,
+        ];
+        Ok(Self {
+            device_id,
+            host_slots,
+            host_events,
+            host_busy: [false; 2],
+            host_used: [0; 2],
+            host_cur: 0,
+            repack_slots,
+            repack_events,
+            repack_busy: [false; 2],
+            repack_used: [0; 2],
+            repack_cur: 0,
+        })
+    }
+
+    pub(crate) fn repack_capacity(&self) -> usize {
+        self.repack_slots[0].len_bytes
+    }
+
+    pub(crate) fn upload_to_addr<T: Copy>(
+        &mut self,
+        dst_addr: u64,
+        src: &[T],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let total_bytes = core::mem::size_of_val(src);
+        if total_bytes == 0 {
+            return Ok(());
+        }
+        check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before H2D DMA + event recording.
+            unsafe { ffi::warp34_set_device(self.device_id) },
+            "warp34_set_device",
+        )?;
+        // SAFETY: `src` is a live `Copy` slice of `total_bytes` initialized bytes.
+        let src_bytes =
+            unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), total_bytes) };
+        let slot_cap = self.host_slots[0].len_bytes;
+        let mut offset = 0usize;
+        while offset < total_bytes {
+            let mut idx = self.host_cur;
+            let mut slot_off = (self.host_used[idx] + 255) & !255;
+            if slot_off >= slot_cap {
+                idx ^= 1;
+                self.host_cur = idx;
+                if self.host_busy[idx] {
+                    self.host_events[idx].synchronize()?;
+                    self.host_busy[idx] = false;
+                }
+                self.host_used[idx] = 0;
+                slot_off = 0;
+            }
+            let chunk_len = (total_bytes - offset).min(slot_cap - slot_off);
+            // SAFETY: `slot_off..slot_off + chunk_len` lies within `0..slot_cap` and is idle.
+            unsafe {
+                let dst_host = self.host_slots[idx].host_ptr.cast::<u8>().add(slot_off);
+                core::ptr::copy_nonoverlapping(src_bytes.as_ptr().add(offset), dst_host, chunk_len);
+                check_rc(
+                    ffi::warp34_memcpy_h2d_async(
+                        (dst_addr + offset as u64) as *mut c_void,
+                        dst_host.cast::<c_void>(),
+                        chunk_len,
+                        stream.handle,
+                    ),
+                    "warp34_memcpy_h2d_async",
+                )?;
+            }
+            self.host_used[idx] = slot_off + chunk_len;
+            self.host_events[idx].record_in_current_ctx(stream)?;
+            self.host_busy[idx] = true;
+            offset += chunk_len;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn upload_slice<T: Copy>(
+        &mut self,
+        arena: &mut DeviceArena,
+        src: &[T],
+        stream: &CudaStream,
+    ) -> Result<u64> {
+        let bytes = core::mem::size_of_val(src);
+        let addr = arena.alloc_aligned(bytes.max(16))?;
+        self.upload_to_addr(addr, src, stream)?;
+        Ok(addr)
+    }
+
+    pub(crate) fn stage_repack_input(
+        &mut self,
+        packed: &[u32],
+        stream: &CudaStream,
+    ) -> Result<(usize, u64)> {
+        let bytes = core::mem::size_of_val(packed);
+        let repack_cap = self.repack_capacity();
+        if bytes > repack_cap {
+            return Err(CudaError::new(-11, "repack staging buffer overflow"));
+        }
+        let mut r_idx = self.repack_cur;
+        let mut slot_off = (self.repack_used[r_idx] + 255) & !255;
+        if slot_off.saturating_add(bytes) > repack_cap {
+            r_idx ^= 1;
+            self.repack_cur = r_idx;
+            if self.repack_busy[r_idx] {
+                self.repack_events[r_idx].synchronize()?;
+                self.repack_busy[r_idx] = false;
+            }
+            self.repack_used[r_idx] = 0;
+            slot_off = 0;
+        }
+        let staging_addr = self.repack_slots[r_idx].addr() + slot_off as u64;
+        self.repack_used[r_idx] = slot_off + bytes;
+        self.upload_to_addr(staging_addr, packed, stream)?;
+        Ok((r_idx, staging_addr))
+    }
+
+    pub(crate) fn finish_repack_stage(&mut self, r_idx: usize, stream: &CudaStream) -> Result<()> {
+        check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before recording `repack_events[r_idx]`.
+            unsafe { ffi::warp34_set_device(self.device_id) },
+            "warp34_set_device",
+        )?;
+        self.repack_events[r_idx].record_in_current_ctx(stream)?;
+        self.repack_busy[r_idx] = true;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PinnedUploadRing {
+    fn drop(&mut self) {
+        for idx in 0..2 {
+            if self.host_busy[idx] {
+                let _ = self.host_events[idx].synchronize();
+                self.host_busy[idx] = false;
+            }
+            if self.repack_busy[idx] {
+                let _ = self.repack_events[idx].synchronize();
+                self.repack_busy[idx] = false;
+            }
+        }
     }
 }
 
