@@ -5,7 +5,7 @@ import { Dashboard } from "./App";
 import { histogram, snapshot } from "./fixtures";
 
 describe("dashboard states", () => {
-  it("shows an intentional connecting state without invented data", () => {
+  it("shows an intentional connecting state without invented data", async () => {
     render(
       <Dashboard
         state={{ history: [], connection: "connecting", error: null }}
@@ -14,9 +14,11 @@ describe("dashboard states", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Connecting");
     expect(screen.getByText("Waiting for engine…")).toBeVisible();
     expect(screen.queryByText("0 ms")).not.toBeInTheDocument();
-    expect(screen.getAllByText("Collecting observations")).toHaveLength(3);
+    expect(await screen.findAllByText("Collecting observations")).toHaveLength(
+      3,
+    );
   });
-  it("shows real model, capacity and load with accessible chart descriptions", () => {
+  it("shows real model, capacity and load with accessible chart descriptions", async () => {
     render(
       <Dashboard
         state={{ history: [snapshot()], connection: "live", error: null }}
@@ -35,7 +37,7 @@ describe("dashboard states", () => {
       }),
     ).toBeVisible();
     expect(
-      screen.getByRole("img", { name: /Generation throughput/ }),
+      await screen.findByRole("img", { name: /Generation throughput/ }),
     ).toBeVisible();
     expect(screen.queryByText("Draft acceptance")).not.toBeInTheDocument();
   });

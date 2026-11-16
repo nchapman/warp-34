@@ -400,6 +400,26 @@ describe("playground wire helpers", () => {
 });
 
 describe("Playground UI integration", () => {
+  it("associates the preset hint without adding it to the selector name", async () => {
+    const user = userEvent.setup();
+    render(
+      <Dashboard
+        initialEntries={["/playground"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    const selector = screen.getByRole("combobox", {
+      name: "PRESET",
+    });
+    const presets = ENDPOINTS.find(
+      (endpoint) => endpoint.id === "chat-completions",
+    )!.presets;
+    expect(selector).toHaveAttribute("aria-describedby", "pg-preset-hint");
+    expect(selector).toHaveAccessibleDescription(presets[0].description);
+    await user.selectOptions(selector, presets[1].id);
+    expect(selector).toHaveAccessibleName("PRESET");
+    expect(selector).toHaveAccessibleDescription(presets[1].description);
+  });
   it("offers manual cURL copying when clipboard access is unavailable", async () => {
     const user = userEvent.setup();
     vi.spyOn(navigator, "clipboard", "get").mockReturnValue(

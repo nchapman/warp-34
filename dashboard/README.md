@@ -25,6 +25,11 @@ Rust: `dashboard/dist` is compiled into the binary, not read at runtime.
   for booleans, and labeled `Input`, `Textarea`, and `NativeSelect` controls.
   Native selects deliberately preserve browser keyboard and mobile picker behavior.
   Route navigation remains links, not tabs.
+- Use `Card` for shared panel surfaces, `Alert` for operational notices, `Badge`
+  for compact statuses, and `Field`/`FieldLabel`/`FieldDescription`/`FieldError`
+  for form composition. Keep explicit label and description associations.
+  Cards retain named regions and real headings; avoid duplicating their surfaces
+  in legacy CSS. Native scrolling and simple reasoning disclosures remain native.
 - `src/tokens.css` follows shadcn's **neutral dark** semantic tokens. `--accent`
   and `--muted` are surfaces; `--brand` (violet) and `--aqua` (cyan) are bright
   brand/data signals. Do not use `--muted` as a text color.
@@ -35,8 +40,26 @@ Rust: `dashboard/dist` is compiled into the binary, not read at runtime.
   accessible status/error feedback. Don't rely on color alone for state.
   Request editors and endpoint selection stay locked while a request is running.
 - Assets are same-origin and must work under the server CSP. No CDN styles,
-  external fonts, or inline scripts. Adding an asset type also requires support
+  external fonts, inline scripts, or inline `<style>` elements. Style attributes
+  are allowed. Adding an asset type also requires support
   in `crates/warp34-host/src/dashboard.rs`.
+
+## Telemetry charts
+
+`Chart.tsx` uses shadcn's Recharts integration, loaded through `LazyChart.tsx`
+only when Overview renders. The production chart chunk is approximately 104 KB
+compressed; Connect and Playground don't download or parse it. Check the Vite
+bundle report after changes rather than suppressing chunk warnings.
+
+- Keep the numeric five-minute engine-uptime axis, linear traces, real zero
+  observations, explicit nulls, and breaks across sampling gaps over eight seconds.
+  Do not interpolate missing observations or display stale samples as current.
+- Preserve empty/collecting states, accessible summaries, keyboard exploration,
+  and units/time in tooltips. Chart tests exercise real Recharts, not a mock.
+- The locally owned `components/ui/chart.tsx` intentionally replaces generated
+  `ChartStyle`/inline stylesheets with style-attribute CSS variables referencing
+  external `--chart-1`/`--chart-2` tokens. Preserve this CSP adaptation when updating
+  generated components; do not weaken the server policy to accommodate charts.
 
 ## Typography budget
 

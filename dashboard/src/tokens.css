@@ -18,33 +18,20 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
+  --chart-1: #a78bfa;
+  --chart-2: #22d3ee;
 
-  /* Legacy visualization aliases, deliberately separate from control surfaces. */
-  --text: var(--foreground);
-  --surface: var(--card);
-  --surface-raised: var(--secondary);
-  --surface-alt: var(--secondary);
-  --subtle: var(--muted-foreground);
+  /* Visualization signals stay separate from neutral control surfaces. */
   --border-strong: oklch(1 0 0 / 20%);
   --track: #292929;
   --track-border: #454545;
-  --grid-line: #333333;
-  --brand: #a78bfa;
+  --brand: var(--chart-1);
   --accent-bright: #c4b5fd;
   --accent-deep: #8b5cf6;
-  --accent-soft: var(--secondary);
-  --aqua: #22d3ee;
+  --aqua: var(--chart-2);
   --aqua-deep: #0891b2;
-  --aqua-soft: var(--secondary);
-  --aqua-tint: var(--secondary);
-  --aqua-border: var(--border-strong);
   --indigo: #737373;
   --red: #f87171;
-  --red-soft: var(--secondary);
-  --red-border: #7f3535;
-  --notice-bg: var(--card);
-  --notice-border: var(--red-border);
-  --notice-text: #fca5a5;
   --selection-bg: #a78bfa;
   --selection-text: #171717;
 }

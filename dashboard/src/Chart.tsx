@@ -1,10 +1,17 @@
 import { useId } from "react";
+import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+} from "@/components/ui/chart";
+import { WINDOW_SECONDS } from "./metrics";
 
 export interface Point {
   time: number;
   value: number | null;
 }
-interface ChartProps {
+export interface ChartProps {
   points: Point[];
   label: string;
   unit: string;
@@ -12,66 +19,36 @@ interface ChartProps {
   compact?: boolean;
 }
 
-/** Break the trace across missing samples rather than implying continuous observation. */
-export function chartPath(
-  points: Point[],
-  end: number,
-  max: number,
-  width: number,
-  height: number,
-): string {
-  let previous: Point | null = null;
-  return points
-    .map((point) => {
-      if (point.value === null) {
-        previous = null;
-        return "";
-      }
-      const x = width * (1 - (end - point.time) / 300);
-      const y = height * (1 - point.value / max);
-      const command = previous && point.time - previous.time <= 8 ? "L" : "M";
-      previous = point;
-      return `${command}${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(" ");
+/** Input is chronological engine uptime, not wall time. Separators are missing
+ * observations, never interpolated measurements. Invalid values also break traces. */
+export function normalizeChartPoints(points: Point[]): Point[] {
+  const validTimes = points.filter((point) => Number.isFinite(point.time));
+  const end = validTimes.at(-1)?.time ?? 0;
+  const result: Point[] = [];
+  for (const point of validTimes) {
+    if (point.time < end - WINDOW_SECONDS) continue;
+    const previous = result.at(-1);
+    if (previous && point.time - previous.time > 8) {
+      result.push({
+        time: previous.time + (point.time - previous.time) / 2,
+        value: null,
+      });
+    }
+    result.push({
+      time: point.time,
+      value:
+        point.value !== null && Number.isFinite(point.value)
+          ? point.value
+          : null,
+    });
+  }
+  return result;
 }
 
-/** Closed area polygons per contiguous observation segment; never bridges missing samples. */
-export function chartAreaPath(
-  points: Point[],
-  end: number,
-  max: number,
-  width: number,
-  height: number,
-): string {
-  const segments: Array<Array<{ x: number; y: number }>> = [];
-  let previous: Point | null = null;
-  for (const point of points) {
-    if (point.value === null) {
-      previous = null;
-      continue;
-    }
-    const x = width * (1 - (end - point.time) / 300);
-    const y = height * (1 - point.value / max);
-    if (previous && point.time - previous.time <= 8) {
-      segments.at(-1)!.push({ x, y });
-    } else {
-      segments.push([{ x, y }]);
-    }
-    previous = point;
-  }
-  return segments
-    .filter((seg) => seg.length >= 2)
-    .map((seg) => {
-      const first = seg[0];
-      const last = seg.at(-1)!;
-      const top = seg
-        .map((pt) => `L${pt.x.toFixed(2)},${pt.y.toFixed(2)}`)
-        .join(" ");
-      return `M${first.x.toFixed(2)},${height.toFixed(2)} ${top} L${last.x.toFixed(2)},${height.toFixed(2)} Z`;
-    })
-    .join(" ");
-}
+const tick = (n: number) =>
+  n >= 1000
+    ? `${(n / 1000).toFixed(1)}k`
+    : n.toLocaleString(undefined, { maximumFractionDigits: 1 });
 
 export function Chart({
   points,
@@ -80,85 +57,100 @@ export function Chart({
   color = "violet",
   compact = false,
 }: ChartProps) {
-  const titleId = useId();
-  const gradId = `${titleId}-area`;
-  const width = 800;
-  const height = compact ? 140 : 230;
-  const values = points.filter((p) => p.value !== null);
-  const peak = Math.max(0, ...values.map((p) => p.value ?? 0));
+  const summaryId = useId();
+  const data = normalizeChartPoints(points);
+  const values = data.flatMap((p) => (p.value === null ? [] : [p.value]));
+  const peak = Math.max(0, ...values);
   const magnitude = 10 ** Math.floor(Math.log10(peak || 1));
   const max = Math.max(1, Math.ceil(peak / magnitude) * magnitude);
-  const end = points.at(-1)?.time ?? 0;
-  const path = chartPath(points, end, max, width, height);
-  const area = chartAreaPath(points, end, max, width, height);
-  const tick = (n: number) =>
-    n >= 1000
-      ? `${(n / 1000).toFixed(1)}k`
-      : n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+  const end = data.at(-1)?.time ?? 0;
+  const latest = data.at(-1)?.value;
+  const collecting = values.length < 2;
+  const summary = `${label}. ${collecting ? "Collecting observations. " : ""}${latest == null ? "Latest observation unavailable." : `Latest ${tick(latest)} ${unit}.`}${values.length ? ` Peak ${tick(peak)} ${unit} in the observed window.` : ""}`;
+  const height = compact ? 130 : 200;
   return (
-    <div className={`chart ${compact ? "compact" : ""}`}>
-      <div className="chart-y" aria-hidden="true">
-        <span>{tick(max)}</span>
-        <span>{tick(max / 2)}</span>
-        <span>0</span>
-      </div>
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        preserveAspectRatio="none"
-        role="img"
-        aria-labelledby={titleId}
+    <div className="relative w-full min-w-0">
+      {/* A sibling summary preserves existing image semantics without hiding the
+          Recharts keyboard-accessible application inside an image role. */}
+      <div role="img" aria-label={summary} id={summaryId} className="sr-only" />
+      <ChartContainer
+        config={{
+          value: {
+            label,
+            color: color === "aqua" ? "var(--chart-2)" : "var(--chart-1)",
+          },
+        }}
+        className="w-full aspect-auto"
+        style={{ height, width: "100%", minWidth: 0 }}
+        initialDimension={{ width: 800, height }}
       >
-        <title id={titleId}>
-          {label}.{" "}
-          {values.length < 2
-            ? "Collecting observations."
-            : `Latest ${tick(values.at(-1)?.value ?? 0)} ${unit}; peak ${tick(peak)} ${unit} in the observed window.`}
-        </title>
-        <defs>
-          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-            <stop
-              offset="0%"
-              className={`chart-area-stop ${color}`}
-              stopOpacity="0.14"
-            />
-            <stop
-              offset="100%"
-              className={`chart-area-stop ${color}`}
-              stopOpacity="0"
-            />
-          </linearGradient>
-        </defs>
-        {[0, 0.5, 1].map((fraction) => (
-          <line
-            key={fraction}
-            x1="0"
-            x2={width}
-            y1={fraction * height}
-            y2={fraction * height}
-            className="chart-grid"
-            vectorEffect="non-scaling-stroke"
+        <LineChart
+          data={data}
+          accessibilityLayer
+          aria-label={`${label}: use arrow keys to explore observations`}
+          aria-describedby={summaryId}
+          margin={{ top: 8, right: 16, bottom: 0, left: 0 }}
+        >
+          <CartesianGrid vertical={false} />
+          <XAxis
+            dataKey="time"
+            type="number"
+            domain={[end - WINDOW_SECONDS, end]}
+            allowDataOverflow
+            ticks={[end - WINDOW_SECONDS, end]}
+            tickFormatter={(time: number) =>
+              time === end ? "Now" : "5 minutes ago"
+            }
+            tickLine={false}
+            axisLine={false}
+            height={28}
+            interval={0}
           />
-        ))}
-        {area && <path d={area} fill={`url(#${gradId})`} />}
-        <path
-          d={path}
-          fill="none"
-          className={`chart-line ${color}`}
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          vectorEffect="non-scaling-stroke"
-        />
-      </svg>
-      {values.length < 2 && (
-        <div className="chart-empty">
-          Collecting observations<span>Live history appears here</span>
+          <YAxis
+            domain={[0, max]}
+            ticks={[0, max / 2, max]}
+            tickFormatter={tick}
+            tickLine={false}
+            axisLine={false}
+            width={44}
+          />
+          <ChartTooltip
+            content={
+              <ChartTooltipContent
+                labelFormatter={(_label, payload) => {
+                  const time = payload[0]?.payload?.time as number | undefined;
+                  return time === undefined
+                    ? ""
+                    : `Engine uptime ${tick(time)} s (${tick(end - time)} s ago)`;
+                }}
+                formatter={(value) => (
+                  <span>
+                    {label}:{" "}
+                    {typeof value === "number" ? tick(value) : String(value)}{" "}
+                    {unit}
+                  </span>
+                )}
+              />
+            }
+          />
+          <Line
+            dataKey="value"
+            type="linear"
+            stroke="var(--color-value)"
+            strokeWidth={2}
+            connectNulls={false}
+            dot={{ r: 2, strokeWidth: 0, fill: "var(--color-value)" }}
+            activeDot={{ r: 4 }}
+            isAnimationActive={false}
+          />
+        </LineChart>
+      </ChartContainer>
+      {collecting && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-sm text-muted-foreground">
+          Collecting observations
+          <span className="text-xs">Live history appears here</span>
         </div>
       )}
-      <div className="chart-x" aria-hidden="true">
-        <span>5 minutes ago</span>
-        <span>Now</span>
-      </div>
     </div>
   );
 }
