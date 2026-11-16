@@ -23,7 +23,9 @@ use crate::cuda::{
 use crate::loader::SafetensorsArchive;
 use crate::qwen_image::QwenImage21VaeConfig;
 
-const MAX_IM2COL_ELEMS: usize = 192 * 1024 * 1024; // 384 MiB FP16 workspace cap per strip
+const MAX_IM2COL_ELEMS_DEFAULT: usize = 192 * 1024 * 1024; // 384 MiB FP16 workspace cap when L2 < 48 MiB
+const MAX_IM2COL_ELEMS_LARGE_L2: usize = 16 * 1024 * 1024; // 32 MiB FP16 L2-resident strip cap when L2 >= 48 MiB
+const LARGE_L2_THRESHOLD_BYTES: i32 = 48 * 1024 * 1024;
 
 /// Spatial tiling configuration for `AutoencoderKLQwenImage21`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1009,7 +1011,23 @@ impl QwenImage21VaeEngine {
         } else {
             let k_dim = conv.in_c * conv.k_h * conv.k_w;
             let row_col_elems = k_dim * w_out;
-            let max_chunk_h = (MAX_IM2COL_ELEMS / row_col_elems.max(1)).max(1).min(h_out);
+            let mut dev_props = ffi::Warp34DeviceProps::default();
+            let is_large_l2 = unsafe {
+                // SAFETY: `dev_props` is a valid stack `Warp34DeviceProps`.
+                ffi::warp34_get_current_device_props(&raw mut dev_props)
+            } == 0
+                && dev_props.l2_cache_bytes >= LARGE_L2_THRESHOLD_BYTES;
+            let max_im2col_elems = if is_large_l2 {
+                MAX_IM2COL_ELEMS_LARGE_L2
+            } else {
+                MAX_IM2COL_ELEMS_DEFAULT
+            };
+            let raw_chunk_h = (max_im2col_elems / row_col_elems.max(1)).max(1).min(h_out);
+            let max_chunk_h = if is_large_l2 && raw_chunk_h < h_out {
+                1usize << raw_chunk_h.ilog2()
+            } else {
+                raw_chunk_h
+            };
             let ws_needed = k_dim * max_chunk_h * w_out;
             Self::ensure_buf_u16(im2col_ws, ws_needed)?;
 

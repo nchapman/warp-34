@@ -741,14 +741,17 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
         let dyn_img = image::load_from_memory(&bytes)
             .map_err(|e| format!("failed to decode golden image '{golden}': {e}"))?;
-        let has_alpha = dyn_img.color().has_alpha();
+        let rgba8 = dyn_img.to_rgba8().into_raw();
+        let has_transparent_alpha =
+            dyn_img.color().has_alpha() && rgba8.as_chunks::<4>().0.iter().any(|px| px[3] < 255);
+        let use_rgba = rgba_output || has_transparent_alpha;
         let (gw, gh) = (dyn_img.width(), dyn_img.height());
-        let pixels = if rgba_output || has_alpha {
-            dyn_img.to_rgba8().into_raw()
+        let pixels = if use_rgba {
+            rgba8
         } else {
             dyn_img.to_rgb8().into_raw()
         };
-        Some((gw, gh, has_alpha, pixels))
+        Some((gw, gh, use_rgba, pixels))
     } else {
         None
     };

@@ -1239,6 +1239,38 @@ fn gpu_qwen_image_cli_commands_and_dump_diff_end_to_end() {
         ExitCode::SUCCESS
     );
 
+    // 3b. `run_dump_diff` without `--rgba` against a 4-channel RGBA golden PNG compares RGB
+    // without appending the RGBA transparency clause to `effective_prompt`.
+    let rgba_golden_path = tmp.path().join("cli_out_rgba_container.png");
+    let rgba_golden_str = rgba_golden_path.to_str().unwrap().to_string();
+    let rgba_png = crate::qwen_image::pipeline::encode_png_bytes(&decoded.rgba, 64, 64, 4).unwrap();
+    fs::write(&rgba_golden_path, rgba_png).unwrap();
+    let dump_rgba_json_path = tmp.path().join("dump_diff_rgba_container.json");
+    let dump_rgba_json_str = dump_rgba_json_path.to_str().unwrap().to_string();
+    let mut dump_rgba_opts = parse(&[
+        "dump-diff",
+        &model_str,
+        "--tp",
+        "1",
+        "-p",
+        "synth fox",
+        "--size",
+        "64x64",
+        "--resolution",
+        "64",
+        "--steps",
+        "2",
+        "--golden",
+        &rgba_golden_str,
+        "--out",
+        &dump_rgba_json_str,
+    ]);
+    dump_rgba_opts.resolved_model = model_str.clone();
+    assert_eq!(
+        super::oracle::run_dump_diff(dump_rgba_opts, super::KvFormatPolicy::Fp16, None).unwrap(),
+        ExitCode::SUCCESS
+    );
+
     // 4. `run_chat` and `run_greedy_diff` reject `ModelKind::Image` before loading LLM weights
     let mut chat_opts = parse(&["chat", &model_str]);
     chat_opts.resolved_model = model_str.clone();

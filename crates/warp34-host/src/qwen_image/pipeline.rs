@@ -1124,7 +1124,8 @@ impl QwenImage21PipelineEngine {
             .map(|n| (n.prompt_embeds_f16.as_slice(), n.image_pad_mask.as_slice()));
 
         let is_ondemand = matches!(self.conditioning, ConditioningBackend::OnDemand { .. });
-        if is_ondemand {
+        let is_ondemand_single = self.tp_size == 1 && is_ondemand;
+        if is_ondemand_single && target_tokens > 4096 {
             self.vae.release_workspace()?;
         }
 
@@ -1186,7 +1187,7 @@ impl QwenImage21PipelineEngine {
         let decoded_chw_f16 = self
             .vae
             .decode_denormalized(&latents_chw_f16, latent_h, latent_w)?;
-        if is_ondemand {
+        if is_ondemand_single && target_tokens > 4096 {
             self.vae.release_workspace()?;
         }
         let channels: u8 = if req.rgba_output { 4 } else { 3 };
