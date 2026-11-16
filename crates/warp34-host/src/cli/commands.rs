@@ -75,9 +75,9 @@ pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
 
 #[cfg(feature = "cuda")]
 pub(crate) fn is_qwen_image_model(resolved_model: &str) -> bool {
-    std::path::Path::new(resolved_model)
-        .join("model_index.json")
-        .is_file()
+    crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(std::path::Path::new(
+        resolved_model,
+    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -85,6 +85,9 @@ pub(crate) fn load_cli_condition_images(
     image_urls: &[String],
     allow_remote_images: bool,
 ) -> Result<Vec<crate::qwen_image::QwenImage21ConditionImage>, String> {
+    if image_urls.len() > 4 {
+        return Err("at most 4 --image inputs are supported".into());
+    }
     let mut out = Vec::with_capacity(image_urls.len());
     for spec in image_urls {
         let trimmed = spec.trim();
@@ -97,8 +100,17 @@ pub(crate) fn load_cli_condition_images(
                 allow_remote_images,
             )?);
         } else {
-            let bytes = std::fs::read(trimmed)
-                .map_err(|e| format!("failed to read image '{trimmed}': {e}"))?;
+            let path_str = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+            let meta = std::fs::metadata(path_str)
+                .map_err(|e| format!("failed to stat image '{path_str}': {e}"))?;
+            if meta.len() > 64 * 1024 * 1024 {
+                return Err(format!(
+                    "image '{path_str}' exceeds 64 MiB CLI limit ({} bytes)",
+                    meta.len()
+                ));
+            }
+            let bytes = std::fs::read(path_str)
+                .map_err(|e| format!("failed to read image '{path_str}': {e}"))?;
             out.push(crate::server::decode_condition_image_bytes(&bytes)?);
         }
     }
@@ -111,6 +123,7 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         model,
         resolved_model,
         tp,
+        tp_auto,
         prompt,
         negative_prompt,
         image_urls,
@@ -128,9 +141,10 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
     } = options;
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
     let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let requested_tp = if tp_auto { 0 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
-        tp,
+        requested_tp,
     )
     .map_err(|e| e.to_string())?;
     let steps = image_steps.unwrap_or_else(|| {
@@ -146,9 +160,10 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
     } else {
         prompt
     };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
     let req = crate::qwen_image::QwenImage21GenerationRequest {
         prompt: effective_prompt,
-        negative_prompt,
+        negative_prompt: effective_neg,
         condition_images,
         width,
         height,
@@ -187,6 +202,7 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
         model,
         resolved_model,
         tp,
+        tp_auto,
         prompt,
         negative_prompt,
         image_urls,
@@ -205,9 +221,10 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
     } = options;
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
     let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let requested_tp = if tp_auto { 0 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
-        tp,
+        requested_tp,
     )
     .map_err(|e| e.to_string())?;
     let steps = image_steps.unwrap_or_else(|| {
@@ -219,9 +236,15 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
             .unwrap_or(40)
     });
     let rounds = prof_rounds.max(1);
+    let effective_prompt = if rgba_output && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
     let req = crate::qwen_image::QwenImage21GenerationRequest {
-        prompt,
-        negative_prompt,
+        prompt: effective_prompt,
+        negative_prompt: effective_neg,
         condition_images,
         width,
         height,
@@ -898,6 +921,8 @@ pub(crate) fn run_serve(
         serve,
         resolved_model,
         tp,
+        tp_auto,
+        tp_explicit,
         host,
         port,
         allow_remote_images,
@@ -924,7 +949,18 @@ pub(crate) fn run_serve(
     };
     let bind_addr = format!("{host}:{port}");
     if is_qwen_image_model(&resolved_model) {
-        println!("[warp34 serve] loading QwenImage21 model={model} tp={tp} for http://{bind_addr}");
+        if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+            return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+        }
+        let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
+        println!(
+            "[warp34 serve] loading QwenImage21 model={model} tp={} for http://{bind_addr}",
+            if requested_tp == 0 {
+                "auto".to_string()
+            } else {
+                requested_tp.to_string()
+            }
+        );
         let worker_model = resolved_model;
         let state = crate::server::QwenImage21ServerState::from_loader_with_options(
             model,
@@ -934,7 +970,7 @@ pub(crate) fn run_serve(
             move || {
                 crate::qwen_image::QwenImage21PipelineEngine::load(
                     std::path::Path::new(&worker_model),
-                    tp,
+                    requested_tp,
                 )
                 .map_err(|e| e.to_string())
             },

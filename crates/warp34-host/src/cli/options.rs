@@ -413,6 +413,8 @@ pub(crate) struct CudaCliOptions {
     pub(crate) draft_revision: Option<String>,
     pub(crate) offline: bool,
     pub(crate) tp: usize,
+    pub(crate) tp_auto: bool,
+    pub(crate) tp_explicit: bool,
     pub(crate) prompt: String,
     pub(crate) prompt_explicit: bool,
     pub(crate) prompt_file: Option<String>,
@@ -487,6 +489,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut draft_revision = None;
     let mut offline = false;
     let mut tp = if is_image_sub { 2usize } else { 1usize };
+    let mut tp_auto = is_image_sub;
+    let mut tp_explicit = false;
     let mut prompt = if is_image_sub {
         "A cinematic macro photograph of a translucent mechanical watch movement on dark slate, studio lighting".to_string()
     } else {
@@ -598,6 +602,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--tp" | "-tp" | "--tp-size" | "--tensor-parallel-size" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing --tp value")?;
+                tp_explicit = true;
+                tp_auto = raw.trim().eq_ignore_ascii_case("auto");
                 tp = parse_tp_arg(raw)?;
             }
             "--prompt" | "-p" => {
@@ -944,6 +950,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         draft_revision,
         offline,
         tp,
+        tp_auto,
+        tp_explicit,
         prompt,
         prompt_explicit,
         prompt_file,
@@ -1013,6 +1021,9 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
     }
     if !matches!(options.tp, 1 | 2 | 4) {
         return Err("--tp must be 1, 2, or 4".into());
+    }
+    if matches!(sub, "image" | "bench-image") && !options.tp_auto && !matches!(options.tp, 1 | 2) {
+        return Err("--tp for image/bench-image must be 1, 2, or auto".into());
     }
     if sub == "greedy-diff" && options.golden_path.is_none() {
         return Err("--golden <dir-or-json> is required".into());

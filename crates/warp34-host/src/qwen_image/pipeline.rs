@@ -567,8 +567,9 @@ pub struct QwenImage21PipelineEngine {
 impl QwenImage21PipelineEngine {
     /// Loads `QwenImage21PipelineEngine` from a resolved checkpoint directory.
     ///
-    /// - When `tp_size == 2` (or `0` auto on `>= 2` GPUs): keeps `text_encoder` on GPU 0,
-    ///   `TP=2` `transformer` across GPU 0 + GPU 1, and `vae` on GPU 1 (100% resident in VRAM).
+    /// - When `tp_size == 2` (or `0` auto on `>= 2` GPUs): keeps `TP=2` `transformer` across
+    ///   GPU 0 + GPU 1, `vae` on GPU 0, and `text_encoder` on GPU 1 (`Resident` on quantized or
+    ///   `>= 32 GiB` GPUs, `OnDemand` on 24 GiB unquantized `FP16`).
     /// - When `tp_size == 1` on `>= 2` GPUs: keeps `transformer` + `vae` on GPU 0 and
     ///   `text_encoder` on GPU 1 (100% resident in VRAM).
     /// - When only 1 GPU is available: keeps all 3 resident if VRAM permits (`>= 34 GiB`),
@@ -578,7 +579,7 @@ impl QwenImage21PipelineEngine {
         let cfg = QwenImage21PipelineConfig::from_dir(model_dir).map_err(|e| {
             CudaError::with_detail(-10, "load QwenImage21PipelineConfig", e.to_string())
         })?;
-        let tok_path = cfg.processor_dir.join("tokenizer.json");
+        let tok_path = cfg.tokenizer_path();
         let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| {
             CudaError::with_detail(
                 -10,
@@ -623,7 +624,8 @@ impl QwenImage21PipelineEngine {
             .map_err(|e| CudaError::with_detail(-10, "open vae safetensors", e.to_string()))?;
 
         // Enable spatial tiling above 1536x1536 so <=1536px runs untiled single-pass while >=2048px avoids OOM.
-        let vae_dev = if num_gpus >= 2 && tp_size == 2 { 1 } else { 0 };
+        // Keep the 64-ch RGBA VAE on GPU 0 so GPU 1 is reserved for `rank1` + `text_encoder` on `TP=2`.
+        let vae_dev = 0;
         let vae_weights =
             QwenImage21VaeWeightsGpu::from_archive(&vae_archive, &cfg.vae, "", vae_dev)?;
         let mut vae = QwenImage21VaeEngine::new(vae_weights)?;
@@ -815,7 +817,16 @@ impl QwenImage21PipelineEngine {
         prompt: &str,
         images: &[PreprocessedImage],
     ) -> Result<Vec<i32>> {
-        let non_empty = if prompt.is_empty() { " " } else { prompt };
+        let sanitized: std::borrow::Cow<'_, str> = if prompt.contains("<|image_pad|>") {
+            std::borrow::Cow::Owned(prompt.replace("<|image_pad|>", ""))
+        } else {
+            std::borrow::Cow::Borrowed(prompt)
+        };
+        let non_empty = if sanitized.is_empty() {
+            " "
+        } else {
+            sanitized.as_ref()
+        };
         let formatted = if images.is_empty() {
             format_t2i_prompt(non_empty)
         } else {
@@ -825,16 +836,20 @@ impl QwenImage21PipelineEngine {
             CudaError::with_detail(-10, "tokenize QwenImage21 prompt", e.to_string())
         })?;
         let raw_ids = enc.get_ids();
-        if images.is_empty() {
-            return Ok(raw_ids.iter().map(|&id| id as i32).collect());
-        }
-        let spatial_merge_size = self
+        let (spatial_merge_size, image_token_id) = self
             .cfg
             .text_encoder
             .vision_config
             .as_ref()
-            .map(|v| v.spatial_merge_size)
-            .unwrap_or(2);
+            .map(|v| (v.spatial_merge_size, v.image_token_id))
+            .unwrap_or((2, IMAGE_PAD_TOKEN_ID));
+        if images.is_empty() {
+            return Ok(raw_ids
+                .iter()
+                .map(|&id| id as i32)
+                .filter(|&id| id != image_token_id)
+                .collect());
+        }
         let mut expanded = Vec::with_capacity(
             raw_ids.len()
                 + images
@@ -844,18 +859,25 @@ impl QwenImage21PipelineEngine {
         );
         let mut img_idx = 0usize;
         for &id in raw_ids {
-            if (id as i32) == IMAGE_PAD_TOKEN_ID {
+            if (id as i32) == image_token_id {
                 let count = images
                     .get(img_idx)
                     .map(|img| img.num_merged_tokens(spatial_merge_size))
                     .ok_or_else(|| {
                         CudaError::new(-10, "more <|image_pad|> tokens than condition images")
                     })?;
-                expanded.extend(std::iter::repeat_n(IMAGE_PAD_TOKEN_ID, count));
+                expanded.extend(std::iter::repeat_n(image_token_id, count));
                 img_idx += 1;
             } else {
                 expanded.push(id as i32);
             }
+        }
+        if img_idx != images.len() {
+            return Err(CudaError::with_detail(
+                -10,
+                "fewer <|image_pad|> tokens than condition images",
+                format!("got {img_idx}, expected {}", images.len()),
+            ));
         }
         Ok(expanded)
     }
@@ -882,6 +904,7 @@ impl QwenImage21PipelineEngine {
                 // alongside `rank1` and is dropped at the end of this block before `denoise_loop` allocates KV cache.
                 if self.tp_size == 1 {
                     self.transformer = None;
+                    self.vae.release_workspace()?;
                 } else if let Some(TransformerBackend::Tp2 {
                     engine,
                     cond_caches,
@@ -1126,7 +1149,10 @@ impl QwenImage21PipelineEngine {
                 )?,
             };
 
-        if is_ondemand && let Some(TransformerBackend::Tp2 { engine, .. }) = &self.transformer {
+        if is_ondemand
+            && target_tokens > 4096
+            && let Some(TransformerBackend::Tp2 { engine, .. }) = &self.transformer
+        {
             engine.release_workspaces();
         }
 

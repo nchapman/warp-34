@@ -734,5 +734,49 @@ describe("Playground UI integration", () => {
       "src",
       `data:image/png;base64,${fakeB64}`,
     );
+
+    // Inject explicit width/height + cfg_scale alias in JSON tab, then verify structured controls normalize them
+    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const jsonEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    const rawWithAliases = JSON.parse(jsonEditor.value) as Record<
+      string,
+      unknown
+    >;
+    delete rawWithAliases.size;
+    delete rawWithAliases.guidance_scale;
+    rawWithAliases.width = 768;
+    rawWithAliases.height = 768;
+    rawWithAliases.cfg_scale = 3.5;
+    fireEvent.change(jsonEditor, {
+      target: { value: JSON.stringify(rawWithAliases, null, 2) },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Prompt & Params" }));
+    expect(
+      (screen.getByLabelText("Image size") as HTMLSelectElement).value,
+    ).toBe("768x768");
+    expect(
+      Number(
+        (screen.getByLabelText("Guidance scale") as HTMLInputElement).value,
+      ),
+    ).toBe(3.5);
+
+    fireEvent.change(screen.getByLabelText("Image size"), {
+      target: { value: "auto" },
+    });
+    fireEvent.change(screen.getByLabelText("Guidance scale"), {
+      target: { value: "4" },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const normalized = JSON.parse(
+      (screen.getByLabelText("Request JSON body") as HTMLTextAreaElement).value,
+    ) as Record<string, unknown>;
+    expect(normalized.size).toBe("auto");
+    expect(normalized.width).toBeUndefined();
+    expect(normalized.height).toBeUndefined();
+    expect(normalized.guidance_scale).toBe(4);
+    expect(normalized.cfg_scale).toBeUndefined();
   });
 });

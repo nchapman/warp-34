@@ -38,6 +38,7 @@ pub(super) const PIPELINE_SUBDIRS: &[&str] = &[
     "processor",
     "scheduler",
     "text_encoder",
+    "tokenizer",
     "transformer",
     "vae",
 ];
@@ -313,7 +314,15 @@ pub(super) fn validate_checkpoint(
 ) -> io::Result<()> {
     validate_config(dir, role)?;
     if crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(dir) {
-        validate_files(dir, &["processor/tokenizer.json".into()])?;
+        let tok_rel = [
+            "processor/tokenizer.json",
+            "tokenizer/tokenizer.json",
+            "tokenizer.json",
+        ]
+        .into_iter()
+        .find(|&cand| names.contains(cand) || dir.join(cand).is_file())
+        .unwrap_or("processor/tokenizer.json");
+        validate_files(dir, &[tok_rel.into()])?;
         validate_files(dir, &weight_files(dir, names)?)?;
         let pcfg = crate::qwen_image::QwenImage21PipelineConfig::from_dir(dir)?;
         pcfg.open_text_encoder_archive()?;

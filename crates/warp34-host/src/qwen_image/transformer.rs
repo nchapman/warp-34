@@ -506,6 +506,15 @@ impl QwenImage21Workspace {
         }
         Ok(slot.as_ref().unwrap().addr())
     }
+
+    fn release_buffers(&mut self, device_id: i32) {
+        let _ = CudaDevice::set_current(device_id);
+        let next_epoch = self.alloc_epoch.wrapping_add(1);
+        *self = Self {
+            alloc_epoch: next_epoch,
+            ..Self::default()
+        };
+    }
 }
 
 /// GPU execution engine for `QwenImage21Transformer2DModel`.
@@ -1148,24 +1157,43 @@ impl QwenImage21TransformerEngine {
             }
             addr
         };
-        let had_scratch_bytes = self
-            .blocks
-            .first()
-            .map(|b| {
-                [
-                    &b.to_q,
-                    &b.to_k,
-                    &b.to_v,
-                    &b.to_out,
-                    &b.mlp_gate_up,
-                    &b.mlp_out,
-                ]
-                .into_iter()
-                .filter_map(|p| p.input_transform_workspace_bytes(total_seq_len))
-                .max()
-                .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let num_mod_rows = if self.cfg.causal_condition {
+            2usize
+        } else {
+            1usize
+        };
+        let had_scratch_bytes = [
+            self.time_linear_1
+                .input_transform_workspace_bytes(num_mod_rows),
+            self.time_linear_2
+                .input_transform_workspace_bytes(num_mod_rows),
+            self.modulation_linear
+                .input_transform_workspace_bytes(num_mod_rows),
+            self.norm_out_linear
+                .input_transform_workspace_bytes(num_mod_rows),
+            self.txt_in_layer
+                .input_transform_workspace_bytes(txt_seq_len),
+            self.txt_out_layer
+                .input_transform_workspace_bytes(txt_seq_len),
+            self.img_in.input_transform_workspace_bytes(img_tokens),
+            self.proj_out.input_transform_workspace_bytes(total_seq_len),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.blocks.iter().flat_map(|b| {
+            [
+                &b.to_q,
+                &b.to_k,
+                &b.to_v,
+                &b.to_out,
+                &b.mlp_gate_up,
+                &b.mlp_out,
+            ]
+            .into_iter()
+            .filter_map(|p| p.input_transform_workspace_bytes(total_seq_len))
+        }))
+        .max()
+        .unwrap_or(0);
         let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
@@ -1174,12 +1202,6 @@ impl QwenImage21TransformerEngine {
             exec_scratch_bytes,
         )?;
         let ex = stream.exec(exec_scratch_addr, exec_scratch_bytes);
-
-        let num_mod_rows = if self.cfg.causal_condition {
-            2usize
-        } else {
-            1usize
-        };
         let timesteps_host: &[f32] = if self.cfg.causal_condition {
             &[timestep, 0.0]
         } else {
@@ -2113,24 +2135,30 @@ impl QwenImage21TransformerEngine {
             }
             addr
         };
-        let had_scratch_bytes = self
-            .blocks
-            .first()
-            .map(|b| {
-                [
-                    &b.to_q,
-                    &b.to_k,
-                    &b.to_v,
-                    &b.to_out,
-                    &b.mlp_gate_up,
-                    &b.mlp_out,
-                ]
-                .into_iter()
-                .filter_map(|p| p.input_transform_workspace_bytes(target_tokens))
-                .max()
-                .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let had_scratch_bytes = [
+            self.time_linear_1.input_transform_workspace_bytes(1),
+            self.time_linear_2.input_transform_workspace_bytes(1),
+            self.modulation_linear.input_transform_workspace_bytes(1),
+            self.norm_out_linear.input_transform_workspace_bytes(1),
+            self.img_in.input_transform_workspace_bytes(target_tokens),
+            self.proj_out.input_transform_workspace_bytes(target_tokens),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.blocks.iter().flat_map(|b| {
+            [
+                &b.to_q,
+                &b.to_k,
+                &b.to_v,
+                &b.to_out,
+                &b.mlp_gate_up,
+                &b.mlp_out,
+            ]
+            .into_iter()
+            .filter_map(|p| p.input_transform_workspace_bytes(target_tokens))
+        }))
+        .max()
+        .unwrap_or(0);
         let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
@@ -3361,16 +3389,18 @@ impl QwenImage21TransformerTp2Engine {
     }
 
     pub fn release_workspaces(&self) {
-        *self
-            .rank0
+        let _ = self.stream0.synchronize();
+        let _ = self.stream1.synchronize();
+        self.rank0
             .workspace
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = QwenImage21Workspace::default();
-        *self
-            .rank1
+            .unwrap_or_else(|e| e.into_inner())
+            .release_buffers(self.rank0.device_id);
+        self.rank1
             .workspace
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = QwenImage21Workspace::default();
+            .unwrap_or_else(|e| e.into_inner())
+            .release_buffers(self.rank1.device_id);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3384,6 +3414,7 @@ impl QwenImage21TransformerTp2Engine {
         timestep: f32,
         kv_caches: Option<(&mut QwenImage21KvCacheGpu, &mut QwenImage21KvCacheGpu)>,
     ) -> Result<QwenImage21ExtractOutput> {
+        self.capture_gate.reset();
         let comm0 = &self.comm;
         let comm1 = &self.comm;
         let (c0, c1) = match kv_caches {

@@ -714,6 +714,8 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         model,
         resolved_model,
         tp,
+        tp_auto,
+        tp_explicit,
         prompt,
         negative_prompt,
         image_urls,
@@ -750,7 +752,13 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         None
     };
     let want_rgba = rgba_output || golden_loaded.as_ref().is_some_and(|(_, _, a, _)| *a);
-    let effective_tp = if compare_tp2 { 1 } else { tp };
+    let effective_tp = if compare_tp2 {
+        1
+    } else if !tp_explicit || tp_auto {
+        0
+    } else {
+        tp
+    };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
         effective_tp,
@@ -764,14 +772,15 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             .map(|s| s.len().max(1))
             .unwrap_or(40)
     });
-    let effective_prompt = if rgba_output && condition_images.is_empty() {
+    let effective_prompt = if want_rgba && condition_images.is_empty() {
         crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
     } else {
         prompt
     };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
     let req = crate::qwen_image::QwenImage21GenerationRequest {
         prompt: effective_prompt,
-        negative_prompt,
+        negative_prompt: effective_neg,
         condition_images,
         width,
         height,

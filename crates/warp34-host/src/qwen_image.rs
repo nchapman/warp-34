@@ -548,33 +548,81 @@ impl QwenImage21VaeConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(base_dim as u64) as usize;
         let z_dim = root.get("z_dim").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
-        let dim_mult = root
-            .get("dim_mult")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_u64().map(|u| u as usize))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![1, 2, 4, 8, 8]);
+        let dim_mult = match root.get("dim_mult") {
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "vae dim_mult must be an array")
+                })?
+                .iter()
+                .map(|x| {
+                    x.as_u64().map(|u| u as usize).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid integer in vae dim_mult",
+                        )
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            None => vec![1, 2, 4, 8, 8],
+        };
         let num_res_blocks = root
             .get("num_res_blocks")
             .and_then(|v| v.as_u64())
             .unwrap_or(2) as usize;
-        let attn_scales = root
-            .get("attn_scales")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_f64().map(|f| f as f32))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let temperal_downsample = root
-            .get("temperal_downsample")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_bool()).collect::<Vec<_>>())
-            .unwrap_or_else(|| vec![false, true, true, false]);
+        let attn_scales = match root.get("attn_scales") {
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vae attn_scales must be an array",
+                    )
+                })?
+                .iter()
+                .map(|x| {
+                    x.as_f64().map(|f| f as f32).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid float in vae attn_scales",
+                        )
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let temperal_downsample = match root.get("temperal_downsample") {
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vae temperal_downsample must be an array",
+                    )
+                })?
+                .iter()
+                .map(|x| {
+                    x.as_bool().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid bool in vae temperal_downsample",
+                        )
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?,
+            None => vec![false, true, true, false],
+        };
+        if base_dim == 0
+            || decoder_base_dim == 0
+            || z_dim == 0
+            || dim_mult.contains(&0)
+            || temperal_downsample.len() > 8
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vae dimensions must be > 0 and temperal_downsample length <= 8",
+            ));
+        }
         if dim_mult.len() != temperal_downsample.len() + 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -593,28 +641,54 @@ impl QwenImage21VaeConfig {
             .get("out_channels")
             .and_then(|v| v.as_u64())
             .unwrap_or(4) as usize;
+        if in_channels == 0 || out_channels == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vae in_channels and out_channels must be > 0",
+            ));
+        }
         let is_residual = root
             .get("is_residual")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let latents_mean = root
-            .get("latents_mean")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_f64().map(|f| f as f32))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![0.0; z_dim]);
-        let latents_std = root
-            .get("latents_std")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_f64().map(|f| f as f32))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![1.0; z_dim]);
+        let parse_latent_stats = |key: &str, default_val: f32| -> io::Result<Vec<f32>> {
+            match root.get(key) {
+                Some(v) => v
+                    .as_array()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("vae {key} must be an array"),
+                        )
+                    })?
+                    .iter()
+                    .map(|x| {
+                        let f = x.as_f64().ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid float in vae {key}"),
+                            )
+                        })? as f32;
+                        if !f.is_finite() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("non-finite float in vae {key}"),
+                            ));
+                        }
+                        Ok(f)
+                    })
+                    .collect(),
+                None => Ok(vec![default_val; z_dim]),
+            }
+        };
+        let latents_mean = parse_latent_stats("latents_mean", 0.0)?;
+        let latents_std = parse_latent_stats("latents_std", 1.0)?;
+        if latents_std.contains(&0.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vae latents_std entries must be non-zero",
+            ));
+        }
         if latents_mean.len() != z_dim || latents_std.len() != z_dim {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1077,10 +1151,13 @@ impl QwenImage21PipelineConfig {
     pub fn tokenizer_path(&self) -> PathBuf {
         let p = self.processor_dir.join("tokenizer.json");
         if p.is_file() {
-            p
-        } else {
-            self.root_dir.join("tokenizer.json")
+            return p;
         }
+        let t = self.root_dir.join("tokenizer").join("tokenizer.json");
+        if t.is_file() {
+            return t;
+        }
+        self.root_dir.join("tokenizer.json")
     }
 
     pub fn open_text_encoder_archive(&self) -> io::Result<SafetensorsArchive> {
@@ -1410,6 +1487,9 @@ mod tests {
         if CudaDevice::count().unwrap_or(0) <= 0 {
             return;
         }
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _dev = CudaDevice::set_current(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
         let cublas = CublasHandle::new(&stream).unwrap();
@@ -2033,6 +2113,21 @@ mod tests {
                 diff_hw_cached < 5e-3,
                 "2-GPU TP=2 cached max diff {diff_hw_cached} exceeded 5e-3"
             );
+            // Exercise TP=2 CudaGraph capture (call 2) + replay (call 3), then release_workspaces()
+            // and verify monotonic `alloc_epoch` invalidates the freed workspace graph without crash/stale pointers!
+            for _ in 0..2 {
+                let g_out = tp2_engine
+                    .forward_cached(&target_latents_1, t1, (&mut c0, &mut c1))
+                    .unwrap();
+                assert!(max_diff(&g_out, "dit.out_cached_target") < 5e-3);
+            }
+            tp2_engine.release_workspaces();
+            for _ in 0..3 {
+                let post_rel = tp2_engine
+                    .forward_cached(&target_latents_1, t1, (&mut c0, &mut c1))
+                    .unwrap();
+                assert!(max_diff(&post_rel, "dit.out_cached_target") < 5e-3);
+            }
 
             // Also verify full GPU-resident denoise_loop (CFG=2.0, 3 steps, pipelined AllReduce + CUDA Graph)
             // matches single-GPU denoise_loop!
@@ -2189,6 +2284,9 @@ mod tests {
         if CudaDevice::count().unwrap_or(0) < 1 {
             return;
         }
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         prepare_execution_plan(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
         let ex = stream.exec(0, 0);
@@ -2719,6 +2817,187 @@ mod tests {
                 psnr6 >= 45.0,
                 "Multi-image edit PSNR {psnr6:.2} dB < 45.0 dB"
             );
+        }
+    }
+
+    #[test]
+    fn test_vae_config_rejects_malformed_arrays_and_zero_std() {
+        let bad_mean = json!({
+            "_class_name": "AutoencoderKLQwenImage21",
+            "z_dim": 2,
+            "latents_mean": [0.0, "not_a_float"],
+            "latents_std": [1.0, 1.0],
+        });
+        assert!(QwenImage21VaeConfig::from_json(&bad_mean).is_err());
+
+        let zero_std = json!({
+            "_class_name": "AutoencoderKLQwenImage21",
+            "z_dim": 2,
+            "latents_mean": [0.0, 0.0],
+            "latents_std": [1.0, 0.0],
+        });
+        assert!(QwenImage21VaeConfig::from_json(&zero_std).is_err());
+
+        let zero_dim_mult = json!({
+            "_class_name": "AutoencoderKLQwenImage21",
+            "dim_mult": [1, 0, 4, 8, 8],
+        });
+        assert!(QwenImage21VaeConfig::from_json(&zero_dim_mult).is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_qwen_image_gated_residual_over_65535_rows_and_pipelined_tp2_allreduce() {
+        use crate::cuda::{
+            CudaDevice, CudaGraph, CudaStream, DeviceBuffer, Tp2Collectives, check_rc, f16_to_f32,
+            f32_to_f16, prepare_execution_plan,
+        };
+        use std::ffi::c_void;
+        use warp34_kernels::ffi;
+
+        if CudaDevice::count().unwrap_or(0) < 1 {
+            return;
+        }
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        prepare_execution_plan(0).unwrap();
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex = stream.exec(0, 0);
+
+        // 1. Test `warp34_qwen_image_gated_residual_f16` at `num_tokens = 65_600` (> 65,535 grid.y cap)
+        // across both scalar (`hidden_size = 12`) and `vec8` (`hidden_size = 16`) paths.
+        let num_tokens = 65_600usize;
+        for hidden_size in [12usize, 16usize] {
+            let elems = num_tokens * hidden_size;
+            let res_init = vec![f32_to_f16(1.25); elems];
+            let branch = vec![f32_to_f16(2.0); elems];
+            let mod_row = vec![f32_to_f16(0.5); hidden_size * 2];
+
+            let d_res = DeviceBuffer::alloc(0, elems * 2).unwrap();
+            let d_branch = DeviceBuffer::alloc(0, elems * 2).unwrap();
+            let d_mod = DeviceBuffer::alloc(0, mod_row.len() * 2).unwrap();
+            d_res.copy_from_host(&res_init, &stream).unwrap();
+            d_branch.copy_from_host(&branch, &stream).unwrap();
+            d_mod.copy_from_host(&mod_row, &stream).unwrap();
+
+            check_rc(
+                // SAFETY: `d_res`, `d_branch`, and `d_mod` are live device allocations on device 0
+                // sized for `num_tokens * hidden_size` FP16 elements and `hidden_size * 2` modulation cols.
+                unsafe {
+                    ffi::warp34_qwen_image_gated_residual_f16(
+                        &ex,
+                        d_res.addr() as *mut c_void,
+                        d_branch.addr() as *const c_void,
+                        d_mod.addr() as *const c_void,
+                        core::ptr::null(),
+                        num_tokens as i32,
+                        hidden_size as i32,
+                        (hidden_size * 2) as i32,
+                        hidden_size as i32,
+                    )
+                },
+                "gated_residual >65535 rows",
+            )
+            .unwrap();
+
+            let mut out = vec![0u16; elems];
+            d_res.copy_to_host(&mut out, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let expected = 1.25f32 + 0.5f32.tanh() * 2.0f32;
+            for idx in [
+                0usize,
+                65_534 * hidden_size,
+                (num_tokens - 1) * hidden_size + hidden_size - 1,
+            ] {
+                let got = f16_to_f32(out[idx]);
+                assert!(
+                    (got - expected).abs() < 5e-3,
+                    "hidden_size={hidden_size} idx={idx}: got {got}, expected {expected}"
+                );
+            }
+        }
+
+        // 2. Test >= 512 KiB `Tp2Collectives::all_reduce_pipelined_f16` (1 MiB = 524,288 FP16 elems)
+        // including CUDA Graph capture + replay across 2 GPUs when available.
+        if CudaDevice::count().unwrap_or(0) >= 2 {
+            prepare_execution_plan(1).unwrap();
+            let n_elems = 524_288usize; // 1 MiB -> exercises 8-chunk pipelined DMA + RX kernel
+            let comm = std::sync::Arc::new(Tp2Collectives::new_for_tp(2, n_elems * 2).unwrap());
+            let in0: Vec<u16> = (0..n_elems)
+                .map(|i| f32_to_f16(((i % 31) as f32) * 0.125))
+                .collect();
+            let in1: Vec<u16> = (0..n_elems)
+                .map(|i| f32_to_f16(((i % 17) as f32) * 0.25))
+                .collect();
+
+            let comm0 = std::sync::Arc::clone(&comm);
+            let comm1 = std::sync::Arc::clone(&comm);
+            let (out0, out1) = std::thread::scope(|s| {
+                let h1 = s.spawn(move || {
+                    let _d1 = CudaDevice::set_current(1).unwrap();
+                    let st1 = CudaStream::new(1).unwrap();
+                    let d_in1 = DeviceBuffer::alloc(1, n_elems * 2).unwrap();
+                    let d_out1 = DeviceBuffer::alloc(1, n_elems * 2).unwrap();
+                    d_in1.copy_from_host(&in1, &st1).unwrap();
+                    let ex1 = st1.exec(0, 0);
+                    comm1
+                        .all_reduce_pipelined_f16(
+                            &ex1,
+                            d_in1.addr(),
+                            d_out1.addr(),
+                            1,
+                            n_elems as i32,
+                        )
+                        .unwrap();
+                    let g1 = CudaGraph::capture(&st1, || {
+                        comm1.all_reduce_pipelined_f16(
+                            &ex1,
+                            d_in1.addr(),
+                            d_out1.addr(),
+                            1,
+                            n_elems as i32,
+                        )
+                    })
+                    .unwrap();
+                    g1.launch(&st1).unwrap();
+                    let mut host1 = vec![0u16; n_elems];
+                    d_out1.copy_to_host(&mut host1, &st1).unwrap();
+                    st1.synchronize().unwrap();
+                    host1
+                });
+                let _d0 = CudaDevice::set_current(0).unwrap();
+                let st0 = CudaStream::new(0).unwrap();
+                let d_in0 = DeviceBuffer::alloc(0, n_elems * 2).unwrap();
+                let d_out0 = DeviceBuffer::alloc(0, n_elems * 2).unwrap();
+                d_in0.copy_from_host(&in0, &st0).unwrap();
+                let ex0 = st0.exec(0, 0);
+                comm0
+                    .all_reduce_pipelined_f16(&ex0, d_in0.addr(), d_out0.addr(), 0, n_elems as i32)
+                    .unwrap();
+                let g0 = CudaGraph::capture(&st0, || {
+                    comm0.all_reduce_pipelined_f16(
+                        &ex0,
+                        d_in0.addr(),
+                        d_out0.addr(),
+                        0,
+                        n_elems as i32,
+                    )
+                })
+                .unwrap();
+                g0.launch(&st0).unwrap();
+                let mut host0 = vec![0u16; n_elems];
+                d_out0.copy_to_host(&mut host0, &st0).unwrap();
+                st0.synchronize().unwrap();
+                (host0, h1.join().unwrap())
+            });
+            assert_eq!(out0, out1);
+            for i in [0usize, 131_071, 262_144, n_elems - 1] {
+                let exp = ((i % 31) as f32) * 0.125 + ((i % 17) as f32) * 0.25;
+                assert!((f16_to_f32(out0[i]) - exp).abs() < 1e-3);
+            }
         }
     }
 }

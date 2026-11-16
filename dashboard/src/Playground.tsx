@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
 import {
   ENDPOINTS,
@@ -288,7 +288,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     setSseFrames([]);
   }
 
-  function parseCurrentBody(): Record<string, unknown> | null {
+  const bodyObj = useMemo<Record<string, unknown> | null>(() => {
     if (endpoint.method === "GET") return {};
     try {
       const val = JSON.parse(rawJson);
@@ -299,19 +299,16 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     } catch {
       return null;
     }
-  }
+  }, [endpoint.method, rawJson]);
 
   function updateBodyObject(
     updater: (body: Record<string, unknown>) => Record<string, unknown>,
   ) {
-    const current = parseCurrentBody();
-    if (!current) return;
-    const updated = updater(current);
+    if (!bodyObj) return;
+    const updated = updater({ ...bodyObj });
     setRawJson(JSON.stringify(updated, null, 2));
     setJsonError(null);
   }
-
-  const bodyObj = parseCurrentBody();
   const messages: TurnMessage[] =
     endpoint.conversational && bodyObj
       ? extractMessagesFromBody(endpoint.kind, bodyObj)
@@ -1676,7 +1673,14 @@ function ImageRequestEditor({
   const prompt = typeof body.prompt === "string" ? body.prompt : "";
   const negativePrompt =
     typeof body.negative_prompt === "string" ? body.negative_prompt : "";
-  const size = typeof body.size === "string" ? body.size : "1024x1024";
+  const size =
+    typeof body.width === "number" && typeof body.height === "number"
+      ? `${body.width}x${body.height}`
+      : typeof body.size === "string"
+        ? body.size
+        : isEditEndpoint
+          ? "auto"
+          : "1024x1024";
   const steps =
     typeof body.steps === "number"
       ? body.steps
@@ -1688,7 +1692,9 @@ function ImageRequestEditor({
       ? body.guidance_scale
       : typeof body.true_cfg_scale === "number"
         ? body.true_cfg_scale
-        : 1.0;
+        : typeof body.cfg_scale === "number"
+          ? body.cfg_scale
+          : 1.0;
   const seed = typeof body.seed === "number" ? body.seed : 42;
   const transparentBg = body.background === "transparent" || body.rgba === true;
   const conditionImages = extractConditionImages(body);
@@ -1709,7 +1715,15 @@ function ImageRequestEditor({
             }
             onChange={(e) => {
               const nextSize = e.target.value;
-              onUpdate((curr) => ({ ...curr, size: nextSize }));
+              onUpdate((curr) => {
+                const next: Record<string, unknown> = {
+                  ...curr,
+                  size: nextSize,
+                };
+                delete next.width;
+                delete next.height;
+                return next;
+              });
             }}
           >
             {IMAGE_SIZE_OPTIONS.map((opt) => (
@@ -1762,6 +1776,7 @@ function ImageRequestEditor({
                   guidance_scale: val,
                 };
                 delete next.true_cfg_scale;
+                delete next.cfg_scale;
                 return next;
               });
             }}

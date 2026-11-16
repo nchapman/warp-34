@@ -2590,6 +2590,9 @@ extern "C" int warp34_tp2_warmup(void) {
     cudaFuncAttributes attr;
     #define WARM(fn) do { cudaError_t err = cudaFuncGetAttributes(&attr, (fn)); if (err != cudaSuccess) return (int)err; } while (0)
     WARM(warp34_comm::tp2_all_reduce_f16_kernel);
+    WARM(warp34_comm::tp2_all_reduce_rx_chunk_f16_kernel);
+    WARM(warp34_comm::tp2_all_reduce_bf16_kernel);
+    WARM(warp34_comm::tp2_all_reduce_f32_kernel);
     WARM((warp34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>));
     WARM((warp34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>));
     WARM((warp34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>));

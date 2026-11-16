@@ -33,6 +33,7 @@ use tokio::sync::{Semaphore, oneshot};
 const IMAGE_BODY_LIMIT: usize = 64 * 1024 * 1024;
 const IMAGE_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BATCH_IMAGES: usize = 4;
+const MAX_IMAGE_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_CONDITION_IMAGE_DIM: u32 = 4096;
 const MAX_CONDITION_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_CONDITION_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
@@ -69,12 +70,6 @@ impl QwenImage21Worker {
         let stopping_bg = stopping.clone();
         let panicked_bg = panicked.clone();
         let panic_reason_bg = panic_reason.clone();
-        let telemetry = Telemetry::new(TelemetryConfig {
-            tp_size: 1,
-            kv_format: "fp16".to_string(),
-            speculation: "none".to_string(),
-        });
-        telemetry.set_model(model_name.to_string());
 
         let handle = std::thread::Builder::new()
             .name("warp34-qwen-image-worker".into())
@@ -102,6 +97,9 @@ impl QwenImage21Worker {
                         }
                         match cmd {
                             ImageWorkerCommand::Generate { req, tx } => {
+                                if tx.is_closed() {
+                                    continue;
+                                }
                                 let res = engine.generate(&req).map_err(WorkerError::Cuda);
                                 let _ = tx.send(res);
                             }
@@ -127,6 +125,12 @@ impl QwenImage21Worker {
         let (default_steps, tp_size) = init_rx
             .recv()
             .map_err(|_| "image worker thread exited during initialization".to_string())??;
+        let telemetry = Telemetry::new(TelemetryConfig {
+            tp_size,
+            kv_format: "fp16".to_string(),
+            speculation: "none".to_string(),
+        });
+        telemetry.set_model(model_name.to_string());
         Ok(Self {
             tx,
             handle: std::sync::Mutex::new(Some(handle)),
@@ -313,7 +317,91 @@ pub fn encode_png_bytes(
     Ok(buf)
 }
 
+fn decode_jpeg_rgba_bounded(raw: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    use turbojpeg_sys::*;
+    struct Decoder(tjhandle);
+    impl Drop for Decoder {
+        fn drop(&mut self) {
+            // SAFETY: owns the non-null turbojpeg handle and destroys it once.
+            unsafe { tj3Destroy(self.0) }
+        }
+    }
+    // SAFETY: `raw` remains live for the duration of header inspection and decompression,
+    // and `rgba` is sized to `w * h * 4` bytes after validating `1..=MAX_CONDITION_IMAGE_DIM`.
+    unsafe {
+        let handle = tj3Init(TJINIT_TJINIT_DECOMPRESS as i32);
+        if handle.is_null() {
+            return Err("JPEG decoder unavailable".into());
+        }
+        let decoder = Decoder(handle);
+        let error = || {
+            let err_ptr = tj3GetErrorStr(decoder.0);
+            if err_ptr.is_null() {
+                "failed to decode input JPEG: unknown JPEG error".to_string()
+            } else {
+                let message = std::ffi::CStr::from_ptr(err_ptr);
+                format!("failed to decode input JPEG: {}", message.to_string_lossy())
+            }
+        };
+        for (param, value) in [
+            (TJPARAM_TJPARAM_MAXMEMORY, 128),
+            (TJPARAM_TJPARAM_MAXPIXELS, MAX_CONDITION_IMAGE_PIXELS as i32),
+            (TJPARAM_TJPARAM_SCANLIMIT, 100),
+            (TJPARAM_TJPARAM_STOPONWARNING, 1),
+            (TJPARAM_TJPARAM_FASTDCT, 0),
+            (TJPARAM_TJPARAM_FASTUPSAMPLE, 0),
+        ] {
+            if tj3Set(decoder.0, param as i32, value) != 0 {
+                return Err(error());
+            }
+        }
+        if tj3DecompressHeader(decoder.0, raw.as_ptr(), raw.len() as _) != 0 {
+            return Err(error());
+        }
+        let w = tj3Get(decoder.0, TJPARAM_TJPARAM_JPEGWIDTH as i32);
+        let h = tj3Get(decoder.0, TJPARAM_TJPARAM_JPEGHEIGHT as i32);
+        if w <= 0
+            || h <= 0
+            || (w as u32) > MAX_CONDITION_IMAGE_DIM
+            || (h as u32) > MAX_CONDITION_IMAGE_DIM
+            || (w as u64) * (h as u64) > MAX_CONDITION_IMAGE_PIXELS
+        {
+            return Err(format!(
+                "condition image dimensions {w}x{h} exceed maximum allowed ({MAX_CONDITION_IMAGE_DIM}x{MAX_CONDITION_IMAGE_DIM}, 16 MP)"
+            ));
+        }
+        crate::vision::validate_image_aspect_ratio(h as usize, w as usize)?;
+        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+        if tj3Decompress8(
+            decoder.0,
+            raw.as_ptr(),
+            raw.len() as _,
+            rgba.as_mut_ptr(),
+            0,
+            TJPF_TJPF_RGBA,
+        ) != 0
+        {
+            return Err(error());
+        }
+        Ok((rgba, w as u32, h as u32))
+    }
+}
+
 pub fn decode_condition_image_bytes(bytes: &[u8]) -> Result<QwenImage21ConditionImage, String> {
+    if bytes.is_empty() {
+        return Err("empty condition image payload".into());
+    }
+    if bytes.len() as u64 > MAX_CONDITION_IMAGE_ALLOC {
+        return Err("condition image payload exceeds 64 MiB limit".into());
+    }
+    static CONDITION_DECODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CONDITION_DECODE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let (rgba, width, height) = decode_jpeg_rgba_bounded(bytes)?;
+        return QwenImage21ConditionImage::from_rgba_u8(rgba, width, height);
+    }
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("failed to inspect input image: {e}"))?;
@@ -345,28 +433,49 @@ pub fn load_condition_image_str(
     allow_remote_images: bool,
 ) -> Result<QwenImage21ConditionImage, String> {
     let trimmed = spec.trim();
+    if trimmed.starts_with("file://") {
+        return Err("file:// URLs are not permitted in condition image".into());
+    }
+    let max_b64_len = (crate::remote_images::MAX_REMOTE_IMAGE_BYTES.div_ceil(3) * 4) as usize;
     if let Some(rest) = trimmed.strip_prefix("data:") {
         let (_, b64) = rest
             .split_once(";base64,")
             .ok_or_else(|| "data: image URI must use ;base64, encoding".to_string())?;
-        let raw = crate::vision::decode_base64(b64)
+        if b64.len() > max_b64_len {
+            return Err("base64 condition image exceeds 16 MiB limit".into());
+        }
+        let raw_bytes = crate::vision::decode_base64(b64)
             .ok_or_else(|| "invalid base64 in data: image URI".to_string())?;
-        return decode_condition_image_bytes(&raw);
+        if raw_bytes.len() as u64 > crate::remote_images::MAX_REMOTE_IMAGE_BYTES {
+            return Err("decoded condition image exceeds 16 MiB limit".into());
+        }
+        return decode_condition_image_bytes(&raw_bytes);
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        let (rgb, height, width) =
-            crate::vision::parse_image_url_with_policy(trimmed, allow_remote_images)?;
-        let mut rgba = Vec::with_capacity(width * height * 4);
-        for px in rgb.as_chunks::<3>().0 {
-            rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        if !allow_remote_images {
+            return Err(
+                "remote images are disabled; enable --allow-remote-images to fetch public HTTP(S) URLs"
+                    .into(),
+            );
         }
-        return QwenImage21ConditionImage::from_rgba_u8(rgba, width as u32, height as u32);
+        let bytes = crate::remote_images::fetch_image_bytes(
+            trimmed,
+            crate::remote_images::REMOTE_IMAGE_TIMEOUT,
+        )?;
+        return decode_condition_image_bytes(&bytes);
     }
     // Raw base64 payload (standard in OpenAI JSON image edit requests)
-    if let Some(raw) = crate::vision::decode_base64(trimmed)
-        && raw.len() >= 8
+    if trimmed.len() <= max_b64_len
+        && let Some(raw_bytes) = crate::vision::decode_base64(trimmed)
+        && raw_bytes.len() >= 8
     {
-        return decode_condition_image_bytes(&raw);
+        if raw_bytes.len() as u64 > crate::remote_images::MAX_REMOTE_IMAGE_BYTES {
+            return Err("decoded condition image exceeds 16 MiB limit".into());
+        }
+        return decode_condition_image_bytes(&raw_bytes);
+    }
+    if trimmed.len() > max_b64_len {
+        return Err("base64 condition image exceeds 16 MiB limit".into());
     }
     Err(
         "condition image must be a base64 string, data:image/*;base64,... URI, or allowed URL"
@@ -414,6 +523,72 @@ pub fn parse_size_spec(
     Ok((None, None))
 }
 
+fn opt_json_str<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn opt_json_u64(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be a non-negative integer")),
+    }
+}
+
+fn opt_json_f64(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("'{key}' must be a number")),
+    }
+}
+
+fn opt_json_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("'{key}' must be a boolean")),
+    }
+}
+
+fn validate_prompt_bounds(prompt: &str, neg: Option<&str>) -> Result<(), String> {
+    if prompt.len() > MAX_IMAGE_PROMPT_BYTES {
+        return Err(format!(
+            "'prompt' exceeds maximum length of {MAX_IMAGE_PROMPT_BYTES} bytes"
+        ));
+    }
+    if let Some(np) = neg
+        && np.len() > MAX_IMAGE_PROMPT_BYTES
+    {
+        return Err(format!(
+            "'negative_prompt' exceeds maximum length of {MAX_IMAGE_PROMPT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_output_format(output_format: Option<&str>) -> Result<(), String> {
+    if let Some(fmt) = output_format.map(str::trim).filter(|s| !s.is_empty())
+        && !fmt.eq_ignore_ascii_case("png")
+    {
+        return Err(format!(
+            "unsupported output_format '{fmt}': only 'png' is supported"
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_json_image_request(
     body: &[u8],
     allow_remote_images: bool,
@@ -425,9 +600,14 @@ pub fn parse_json_image_request(
         .as_object()
         .ok_or_else(|| "request body must be a JSON object".to_string())?;
 
-    let prompt = obj
-        .get("prompt")
-        .and_then(Value::as_str)
+    if obj.get("mask").is_some_and(|v| !v.is_null()) {
+        return Err(
+            "'mask' is not supported by QwenImage21; describe the edit in 'prompt' with input 'image'"
+                .into(),
+        );
+    }
+
+    let prompt = opt_json_str(obj, "prompt")?
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "'prompt' is required and must be a non-empty string".to_string())?
@@ -435,10 +615,9 @@ pub fn parse_json_image_request(
 
     // Preserve explicit `""` or `" "` negative prompts so `guidance_scale > 1.0` enables CFG
     // identically to `QwenImage21Pipeline.__call__(negative_prompt="", true_cfg_scale=4.0)`.
-    let negative_prompt = obj
-        .get("negative_prompt")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let negative_prompt = opt_json_str(obj, "negative_prompt")?.map(str::to_string);
+    validate_prompt_bounds(&prompt, negative_prompt.as_deref())?;
+    validate_output_format(opt_json_str(obj, "output_format")?)?;
 
     let mut condition_images = Vec::new();
     for key in ["image", "images"] {
@@ -478,23 +657,19 @@ pub fn parse_json_image_request(
         return Err("'/v1/images/edits' requires at least one input 'image'".into());
     }
 
-    let width = obj
-        .get("width")
-        .and_then(Value::as_u64)
+    let width = opt_json_u64(obj, "width")?
         .map(|v| u32::try_from(v).map_err(|_| "invalid width".to_string()))
         .transpose()?;
-    let height = obj
-        .get("height")
-        .and_then(Value::as_u64)
+    let height = opt_json_u64(obj, "height")?
         .map(|v| u32::try_from(v).map_err(|_| "invalid height".to_string()))
         .transpose()?;
-    let size = obj.get("size").and_then(Value::as_str);
+    let size = opt_json_str(obj, "size")?;
     let (w, h) = parse_size_spec(size, width, height)?;
-    let output_resolution = match obj
-        .get("resolution")
-        .or_else(|| obj.get("output_resolution"))
-        .and_then(Value::as_u64)
-    {
+    let raw_res = match opt_json_u64(obj, "resolution")? {
+        Some(v) => Some(v),
+        None => opt_json_u64(obj, "output_resolution")?,
+    };
+    let output_resolution = match raw_res {
         Some(v) => {
             let res = u32::try_from(v).map_err(|_| "invalid 'resolution'".to_string())?;
             if !(64..=2048).contains(&res) {
@@ -505,40 +680,42 @@ pub fn parse_json_image_request(
         None => 1024,
     };
 
-    let num_inference_steps = obj
-        .get("steps")
-        .or_else(|| obj.get("num_inference_steps"))
-        .and_then(Value::as_u64)
-        .map(|v| v as usize);
+    let raw_steps = match opt_json_u64(obj, "steps")? {
+        Some(v) => Some(v),
+        None => opt_json_u64(obj, "num_inference_steps")?,
+    };
+    let num_inference_steps = raw_steps
+        .map(|v| usize::try_from(v).map_err(|_| "invalid 'steps'".to_string()))
+        .transpose()?;
     if num_inference_steps == Some(0) || num_inference_steps.is_some_and(|s| s > 100) {
         return Err("'steps' must be in 1..=100".into());
     }
 
-    let guidance_scale = obj
-        .get("guidance_scale")
-        .or_else(|| obj.get("true_cfg_scale"))
-        .or_else(|| obj.get("cfg_scale"))
-        .and_then(Value::as_f64)
-        .map(|v| v as f32)
-        .unwrap_or(1.0);
+    let raw_cfg = match opt_json_f64(obj, "guidance_scale")? {
+        Some(v) => Some(v),
+        None => match opt_json_f64(obj, "true_cfg_scale")? {
+            Some(v) => Some(v),
+            None => opt_json_f64(obj, "cfg_scale")?,
+        },
+    };
+    let guidance_scale = raw_cfg.map(|v| v as f32).unwrap_or(1.0);
     if !guidance_scale.is_finite() || !(0.0..=30.0).contains(&guidance_scale) {
         return Err("'guidance_scale' must be in 0.0..=30.0".into());
     }
 
-    let seed = obj.get("seed").and_then(Value::as_u64).unwrap_or(42);
+    let seed = opt_json_u64(obj, "seed")?.unwrap_or(42);
 
-    let background = obj.get("background").and_then(Value::as_str);
-    let rgba_flag = obj.get("rgba").and_then(Value::as_bool).unwrap_or(false);
+    let background = opt_json_str(obj, "background")?;
+    let rgba_flag = opt_json_bool(obj, "rgba")?.unwrap_or(false);
     let rgba_output = resolve_rgba_output(background, rgba_flag, &condition_images)?;
 
-    let n = obj.get("n").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let n = usize::try_from(opt_json_u64(obj, "n")?.unwrap_or(1))
+        .map_err(|_| "invalid 'n'".to_string())?;
     if !(1..=MAX_BATCH_IMAGES).contains(&n) {
         return Err(format!("'n' must be in 1..={MAX_BATCH_IMAGES}"));
     }
 
-    let response_format = obj
-        .get("response_format")
-        .and_then(Value::as_str)
+    let response_format = opt_json_str(obj, "response_format")?
         .unwrap_or("b64_json")
         .to_string();
     if response_format != "b64_json" {
@@ -596,27 +773,86 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn find_line_boundary(haystack: &[u8], delimiter: &[u8]) -> Option<usize> {
+    let mut search_from = 0usize;
+    while let Some(rel) = find_subslice(&haystack[search_from..], delimiter) {
+        let idx = search_from + rel;
+        let line_start = idx == 0 || haystack[idx - 1] == b'\n';
+        let after = idx + delimiter.len();
+        let valid_after = after == haystack.len()
+            || haystack[after..].starts_with(b"--")
+            || haystack[after..].starts_with(b"\r\n")
+            || haystack[after..].starts_with(b"\n");
+        if line_start && valid_after {
+            return Some(idx);
+        }
+        search_from = idx + 1;
+    }
+    None
+}
+
+fn parse_header_param(header_val: &str, target_key: &str) -> Option<String> {
+    let bytes = header_val.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] == b';' || bytes[i].is_ascii_whitespace()) {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b';' {
+            i += 1;
+        }
+        let key = header_val[key_start..i].trim();
+        if i >= bytes.len() || bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        i += 1; // skip '='
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let val = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let mut out = String::new();
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            out
+        } else {
+            let val_start = i;
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            header_val[val_start..i].trim().to_string()
+        };
+        if key.eq_ignore_ascii_case(target_key) {
+            return Some(val);
+        }
+    }
+    None
+}
+
 pub fn parse_multipart_image_request(
     content_type: &str,
     body: &[u8],
     require_images: bool,
 ) -> Result<ParsedImageRequest, String> {
-    let boundary = content_type
-        .split(';')
-        .skip(1)
-        .find_map(|param| {
-            let (k, v) = param.trim().split_once('=')?;
-            if k.trim().eq_ignore_ascii_case("boundary") {
-                Some(v.trim().trim_matches('"').to_string())
-            } else {
-                None
-            }
-        })
+    let (_, params) = content_type
+        .split_once(';')
+        .ok_or_else(|| "multipart/form-data Content-Type missing boundary".to_string())?;
+    let boundary = parse_header_param(params, "boundary")
         .filter(|b| !b.is_empty())
         .ok_or_else(|| "multipart/form-data Content-Type missing boundary".to_string())?;
 
     let delimiter = format!("--{boundary}").into_bytes();
-    let mut pos = find_subslice(body, &delimiter)
+    let mut pos = find_line_boundary(body, &delimiter)
         .ok_or_else(|| "multipart body missing initial boundary".to_string())?
         + delimiter.len();
 
@@ -633,6 +869,7 @@ pub fn parse_multipart_image_request(
     let mut rgba_flag = false;
     let mut n: usize = 1;
     let mut response_format = "b64_json".to_string();
+    let mut output_format: Option<String> = None;
     let mut condition_images = Vec::new();
 
     while pos < body.len() {
@@ -644,7 +881,7 @@ pub fn parse_multipart_image_request(
         } else if body[pos..].starts_with(b"\n") {
             pos += 1;
         }
-        let next_delim = find_subslice(&body[pos..], &delimiter)
+        let next_delim = find_line_boundary(&body[pos..], &delimiter)
             .ok_or_else(|| "unterminated multipart part".to_string())?;
         let part = &body[pos..pos + next_delim];
         pos += next_delim + delimiter.len();
@@ -668,14 +905,9 @@ pub fn parse_multipart_image_request(
         for line in headers.lines() {
             if let Some((hk, hv)) = line.split_once(':')
                 && hk.trim().eq_ignore_ascii_case("content-disposition")
+                && let Some((_, disp_params)) = hv.split_once(';')
             {
-                for param in hv.split(';') {
-                    if let Some((pk, pv)) = param.trim().split_once('=')
-                        && pk.trim().eq_ignore_ascii_case("name")
-                    {
-                        field_name = Some(pv.trim().trim_matches('"').to_string());
-                    }
-                }
+                field_name = parse_header_param(disp_params, "name");
             }
         }
         let Some(name) = field_name else {
@@ -687,6 +919,14 @@ pub fn parse_multipart_image_request(
                 .map_err(|_| format!("multipart field '{name}' is not valid UTF-8"))
         };
         match name.as_str() {
+            "mask" => {
+                if !content.is_empty() {
+                    return Err(
+                        "'mask' is not supported by QwenImage21; describe the edit in 'prompt' with input 'image'"
+                            .into(),
+                    );
+                }
+            }
             "image" | "image[]" | "images" | "images[]" => {
                 if condition_images.len() >= MAX_BATCH_IMAGES {
                     return Err(format!(
@@ -746,13 +986,24 @@ pub fn parse_multipart_image_request(
                     .map_err(|_| "invalid multipart 'seed'".to_string())?
             }
             "background" => background = Some(as_text()?),
-            "rgba" => rgba_flag = matches!(as_text()?.as_str(), "true" | "1"),
+            "rgba" => {
+                rgba_flag = match as_text()?.to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "invalid multipart 'rgba' value '{other}': expected 'true' or 'false'"
+                        ));
+                    }
+                };
+            }
             "n" => {
                 n = as_text()?
                     .parse()
                     .map_err(|_| "invalid multipart 'n'".to_string())?
             }
             "response_format" => response_format = as_text()?,
+            "output_format" => output_format = Some(as_text()?),
             _ => {}
         }
     }
@@ -760,6 +1011,8 @@ pub fn parse_multipart_image_request(
     let prompt = prompt
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "'prompt' field is required".to_string())?;
+    validate_prompt_bounds(&prompt, negative_prompt.as_deref())?;
+    validate_output_format(output_format.as_deref())?;
     if require_images && condition_images.is_empty() {
         return Err("'/v1/images/edits' requires at least one 'image' part".into());
     }
@@ -815,16 +1068,19 @@ async fn read_image_request(
     .map_err(|_| super::http::bad("request body read timed out"))?
     .map_err(|e| super::http::bad(format!("failed to read request body: {e}")))?;
 
-    if content_type
-        .to_ascii_lowercase()
-        .starts_with("multipart/form-data")
-    {
-        parse_multipart_image_request(&content_type, &body, require_images)
-            .map_err(super::http::bad)
-    } else {
-        parse_json_image_request(&body, allow_remote_images, require_images)
-            .map_err(super::http::bad)
-    }
+    tokio::task::spawn_blocking(move || {
+        if content_type
+            .to_ascii_lowercase()
+            .starts_with("multipart/form-data")
+        {
+            parse_multipart_image_request(&content_type, &body, require_images)
+        } else {
+            parse_json_image_request(&body, allow_remote_images, require_images)
+        }
+    })
+    .await
+    .map_err(|_| super::http::error(StatusCode::INTERNAL_SERVER_ERROR, "request parser panicked"))?
+    .map_err(super::http::bad)
 }
 
 async fn handle_image_request(
@@ -832,12 +1088,20 @@ async fn handle_image_request(
     req: Request,
     require_images: bool,
 ) -> Result<Json<Value>, super::http::ApiError> {
-    let parsed = read_image_request(req, state.allow_remote_images, require_images).await?;
+    if state.worker.is_panicked() {
+        return Err(super::http::worker_api_err(WorkerError::worker_panicked(
+            state
+                .worker
+                .panic_reason()
+                .unwrap_or_else(|| "image worker panicked".into()),
+        )));
+    }
     let _permit = state
         .admission
         .clone()
         .try_acquire_owned()
         .map_err(super::http::admission_error)?;
+    let parsed = read_image_request(req, state.allow_remote_images, require_images).await?;
     let steps = parsed
         .num_inference_steps
         .unwrap_or(state.worker.default_steps);
@@ -847,13 +1111,17 @@ async fn handle_image_request(
     } else {
         parsed.prompt.clone()
     };
+    let effective_negative_prompt = parsed
+        .negative_prompt
+        .clone()
+        .or_else(|| (parsed.guidance_scale > 1.0).then(String::new));
 
     let mut data = Vec::with_capacity(parsed.n);
     for idx in 0..parsed.n {
         let item_seed = parsed.seed.wrapping_add(idx as u64);
         let gen_req = QwenImage21GenerationRequest {
             prompt: effective_prompt.clone(),
-            negative_prompt: parsed.negative_prompt.clone(),
+            negative_prompt: effective_negative_prompt.clone(),
             condition_images: parsed.condition_images.clone(),
             width: parsed.width,
             height: parsed.height,
@@ -1030,8 +1298,9 @@ pub fn run_blocking_image_server(
             listener.local_addr()?
         );
         let app = image_router(state.clone());
+        let admission_shutdown = state.admission.clone();
         let res = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+            .with_graceful_shutdown(async move {
                 #[cfg(unix)]
                 {
                     let mut terminate =
@@ -1043,6 +1312,7 @@ pub fn run_blocking_image_server(
                 {
                     let _ = tokio::signal::ctrl_c().await;
                 }
+                admission_shutdown.close();
             })
             .await;
         state
@@ -1174,5 +1444,51 @@ mod tests {
         .unwrap();
         let edit_mixed = parse_json_image_request(&edit_mixed_body, false, true).unwrap();
         assert!(!edit_mixed.rgba_output);
+    }
+
+    #[test]
+    fn rejects_invalid_json_types_masks_formats_and_multipart_embedded_boundaries() {
+        for bad in [
+            json!({ "prompt": "ok", "steps": -1 }),
+            json!({ "prompt": "ok", "steps": "8" }),
+            json!({ "prompt": "ok", "n": 0 }),
+            json!({ "prompt": "ok", "n": "2" }),
+            json!({ "prompt": "ok", "guidance_scale": "4.0" }),
+            json!({ "prompt": "ok", "negative_prompt": 123 }),
+            json!({ "prompt": "ok", "mask": "AAAA" }),
+            json!({ "prompt": "ok", "output_format": "jpeg" }),
+            json!({ "prompt": "x".repeat(MAX_IMAGE_PROMPT_BYTES + 1) }),
+        ] {
+            let bytes = serde_json::to_vec(&bad).unwrap();
+            assert!(
+                parse_json_image_request(&bytes, false, false).is_err(),
+                "expected invalid request to fail: {bad}"
+            );
+        }
+
+        // Valid `output_format: "png"` succeeds
+        let ok_png = serde_json::to_vec(&json!({
+            "prompt": "ok",
+            "output_format": "png",
+        }))
+        .unwrap();
+        assert!(parse_json_image_request(&ok_png, false, false).is_ok());
+
+        // Quoted boundary with semicolon + prompt containing `--boundary` mid-line without CRLF
+        let boundary = "warp34;part";
+        let prompt_with_inline_delim = format!("Draw literal --{boundary} inside text");
+        let mp = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{prompt_with_inline_delim}\r\n--{boundary}--\r\n"
+        );
+        let parsed = parse_multipart_image_request(
+            &format!("multipart/form-data; boundary=\"{boundary}\""),
+            mp.as_bytes(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.prompt, prompt_with_inline_delim);
+
+        // Corrupt JPEG magic bytes fail cleanly under bounded libjpeg-turbo decoder
+        assert!(decode_condition_image_bytes(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x02]).is_err());
     }
 }

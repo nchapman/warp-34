@@ -264,6 +264,12 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         test_name="qwen_image::tests::gpu_qwen_image_transformer_extract_cached_graph_and_tp2_match_oracle",
         min_gpus=2,
     ),
+    SanitizerCase(
+        subsystem="qwen_image_tp2",
+        target="lib",
+        test_name="qwen_image::tests::gpu_qwen_image_gated_residual_over_65535_rows_and_pipelined_tp2_allreduce",
+        min_gpus=2,
+    ),
 )
 
 

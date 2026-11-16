@@ -282,20 +282,21 @@ __global__ void gated_residual_f16_kernel(
     int hidden_size,
     int mod_stride,
     int gate_col_offset) {
-    const int row = blockIdx.y;
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= num_tokens || col >= hidden_size) return;
+    if (col >= hidden_size) return;
 
-    const int mod_row = (target_token_mask != nullptr && target_token_mask[row] == 0) ? 1 : 0;
-    const __half gate_h = modulation[(size_t)mod_row * mod_stride + gate_col_offset + col];
-    const __half gate_tanh = __float2half_rn(__nv_tanhf(__half2float(gate_h)));
+    for (int row = blockIdx.y; row < num_tokens; row += gridDim.y) {
+        const int mod_row = (target_token_mask != nullptr && target_token_mask[row] == 0) ? 1 : 0;
+        const __half gate_h = modulation[(size_t)mod_row * mod_stride + gate_col_offset + col];
+        const __half gate_tanh = __float2half_rn(__nv_tanhf(__half2float(gate_h)));
 
-    const size_t idx = (size_t)row * hidden_size + col;
-    const __half prod = __hmul(gate_tanh, branch_out[idx]);
-    float sum = __half2float(__hadd(residual[idx], prod));
-    if (sum > 65504.0f) sum = 65504.0f;
-    if (sum < -65504.0f) sum = -65504.0f;
-    residual[idx] = __float2half_rn(sum);
+        const size_t idx = (size_t)row * hidden_size + col;
+        const __half prod = __hmul(gate_tanh, branch_out[idx]);
+        float sum = __half2float(__hadd(residual[idx], prod));
+        if (sum > 65504.0f) sum = 65504.0f;
+        if (sum < -65504.0f) sum = -65504.0f;
+        residual[idx] = __float2half_rn(sum);
+    }
 }
 
 __global__ void gated_residual_vec8_f16_kernel(
@@ -307,32 +308,33 @@ __global__ void gated_residual_vec8_f16_kernel(
     int vec_cols,
     int mod_stride,
     int gate_col_offset) {
-    const int row = blockIdx.y;
     const int vcol = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= num_tokens || vcol >= vec_cols) return;
+    if (vcol >= vec_cols) return;
 
-    const int mod_row = (target_token_mask != nullptr && target_token_mask[row] == 0) ? 1 : 0;
-    const uint4 gv = reinterpret_cast<const uint4*>(
-        modulation + (size_t)mod_row * mod_stride + gate_col_offset)[vcol];
-    const size_t idx = (size_t)row * vec_cols + vcol;
-    const uint4 rv = residual[idx];
-    const uint4 bv = branch_out[idx];
+    for (int row = blockIdx.y; row < num_tokens; row += gridDim.y) {
+        const int mod_row = (target_token_mask != nullptr && target_token_mask[row] == 0) ? 1 : 0;
+        const uint4 gv = reinterpret_cast<const uint4*>(
+            modulation + (size_t)mod_row * mod_stride + gate_col_offset)[vcol];
+        const size_t idx = (size_t)row * vec_cols + vcol;
+        const uint4 rv = residual[idx];
+        const uint4 bv = branch_out[idx];
 
-    const __half* gh = reinterpret_cast<const __half*>(&gv);
-    const __half* rh = reinterpret_cast<const __half*>(&rv);
-    const __half* bh = reinterpret_cast<const __half*>(&bv);
-    uint4 ov;
-    __half* oh = reinterpret_cast<__half*>(&ov);
-    #pragma unroll
-    for (int d = 0; d < 8; ++d) {
-        const __half gate_tanh = __float2half_rn(__nv_tanhf(__half2float(gh[d])));
-        const __half prod = __hmul(gate_tanh, bh[d]);
-        float sum = __half2float(__hadd(rh[d], prod));
-        if (sum > 65504.0f) sum = 65504.0f;
-        if (sum < -65504.0f) sum = -65504.0f;
-        oh[d] = __float2half_rn(sum);
+        const __half* gh = reinterpret_cast<const __half*>(&gv);
+        const __half* rh = reinterpret_cast<const __half*>(&rv);
+        const __half* bh = reinterpret_cast<const __half*>(&bv);
+        uint4 ov;
+        __half* oh = reinterpret_cast<__half*>(&ov);
+        #pragma unroll
+        for (int d = 0; d < 8; ++d) {
+            const __half gate_tanh = __float2half_rn(__nv_tanhf(__half2float(gh[d])));
+            const __half prod = __hmul(gate_tanh, bh[d]);
+            float sum = __half2float(__hadd(rh[d], prod));
+            if (sum > 65504.0f) sum = 65504.0f;
+            if (sum < -65504.0f) sum = -65504.0f;
+            oh[d] = __float2half_rn(sum);
+        }
+        residual[idx] = ov;
     }
-    residual[idx] = ov;
 }
 
 // Single-pass fused `gated_residual` + `adaln_modulate` + optional `hadamard64` for `hidden_size == 4096`.
@@ -740,14 +742,14 @@ extern "C" int warp34_qwen_image_gated_residual_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
+    const unsigned grid_y = (unsigned)(num_tokens > 65535 ? 65535 : num_tokens);
     if (((hidden_size & 7) == 0) &&
         ((mod_stride & 7) == 0) &&
         ((gate_col_offset & 7) == 0) &&
-        num_tokens <= 65535 &&
         ((((uintptr_t)residual | (uintptr_t)branch_out | (uintptr_t)modulation) & 15u) == 0)) {
         const int vec_cols = hidden_size >> 3;
         dim3 block(128);
-        dim3 grid((unsigned)((vec_cols + 127) / 128), (unsigned)num_tokens);
+        dim3 grid((unsigned)((vec_cols + 127) / 128), grid_y);
         warp34_qwen_image::gated_residual_vec8_f16_kernel<<<grid, block, 0, (cudaStream_t)ex->stream>>>(
             (uint4*)residual,
             (const uint4*)branch_out,
@@ -760,7 +762,7 @@ extern "C" int warp34_qwen_image_gated_residual_f16(
         return (int)cudaGetLastError();
     }
     dim3 block(256);
-    dim3 grid((unsigned)((hidden_size + 255) / 256), (unsigned)num_tokens);
+    dim3 grid((unsigned)((hidden_size + 255) / 256), grid_y);
     warp34_qwen_image::gated_residual_f16_kernel<<<grid, block, 0, (cudaStream_t)ex->stream>>>(
         (__half*)residual,
         (const __half*)branch_out,
