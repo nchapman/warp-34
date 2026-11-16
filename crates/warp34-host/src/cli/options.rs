@@ -974,6 +974,9 @@ pub(crate) fn validate_cuda_options(
     if *verify_lossless && speculative_kind.is_none() {
         return Err("--verify-lossless requires --speculative".into());
     }
+    if options.interactive && !options.image_urls.is_empty() {
+        return Err("--interactive cannot be combined with --image".into());
+    }
     if options.max_prompts == 0 {
         return Err("--max-prompts must be >= 1".into());
     }

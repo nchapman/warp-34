@@ -750,7 +750,8 @@ footer {
   gap: 12px;
   margin-bottom: 8px;
 }
-.connect-snippet-header label {
+.connect-snippet-header label,
+.connect-snippet-label {
   margin: 0;
   font-size: 12.5px;
   color: var(--muted);

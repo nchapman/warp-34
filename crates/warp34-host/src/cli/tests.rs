@@ -794,6 +794,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         &["serve", "--ctx-size", "16k", "--kv-pages", "1024"][..],
         &["serve", "-c", "4k", "--max-model-len", "8k"][..],
         &["serve", "--kv-pages", "256", "--max-model-len", "8192"][..],
+        &["chat", "-i", "--image", "test.png"][..],
     ] {
         let res = prepare_cuda_cli(&args(bad_args), |_, _, _| {
             panic!("invalid context sizing must fail before model resolution: {bad_args:?}")

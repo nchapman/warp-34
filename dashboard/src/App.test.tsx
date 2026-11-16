@@ -84,7 +84,17 @@ describe("dashboard states", () => {
     render(
       <Dashboard
         state={{
-          history: [snapshot({ model: "Qwen/Qwen3.5-4B" })],
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-4B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                max_model_len: 8192,
+              },
+            }),
+          ],
           connection: "live",
           error: null,
         }}
@@ -94,8 +104,12 @@ describe("dashboard states", () => {
     expect(
       screen.getByRole("heading", { name: "Bring your coding agent." }),
     ).toBeVisible();
+    expect(
+      screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=2048/),
+    ).toBeVisible();
     expect(screen.getByText(/claude --model "Qwen\/Qwen3.5-4B"/)).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "Codex CLI" }));
+    expect(screen.getByText(/model_context_window = 8192/)).toBeVisible();
     expect(screen.getByText(/\[model_providers\.warp34\]/)).toBeVisible();
     fireEvent.click(screen.getByRole("tab", { name: "OpenCode" }));
     expect(

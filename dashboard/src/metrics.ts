@@ -16,7 +16,12 @@ export interface Snapshot {
   uptime_seconds: number;
   model: string;
   status: "ready" | "unhealthy" | "stopping";
-  config: { tp_size: number; kv_format: string; speculation: string };
+  config: {
+    tp_size: number;
+    kv_format: string;
+    speculation: string;
+    max_model_len?: number;
+  };
   requests: {
     submitted: number;
     completed: number;
@@ -105,6 +110,7 @@ export function parseSnapshot(value: unknown): Snapshot {
     isNumber(config.tp_size) &&
     typeof config.kv_format === "string" &&
     typeof config.speculation === "string" &&
+    (config.max_model_len === undefined || isNumber(config.max_model_len)) &&
     hasNumbers(requests, [
       "submitted",
       "completed",

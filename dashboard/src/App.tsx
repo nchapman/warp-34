@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BrowserRouter,
   Link,
@@ -516,13 +516,27 @@ function sanitizeModelForSnippet(model: string | null): string {
 
 function CopyCodeBlock({ label, code }: { label: string; code: string }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+    };
+  }, []);
   const onCopy = () => {
     if (!navigator.clipboard?.writeText) return;
     navigator.clipboard
       .writeText(code)
       .then(() => {
         setCopied(true);
-        window.setTimeout(() => setCopied(false), 1600);
+        if (timerRef.current !== null) {
+          window.clearTimeout(timerRef.current);
+        }
+        timerRef.current = window.setTimeout(() => {
+          timerRef.current = null;
+          setCopied(false);
+        }, 1600);
       })
       .catch(() => {
         setCopied(false);
@@ -531,7 +545,7 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
   return (
     <div className="connect-snippet">
       <div className="connect-snippet-header">
-        <label>{label}</label>
+        <span className="connect-snippet-label">{label}</span>
         <button
           type="button"
           className="pg-btn pg-btn-ghost connect-copy-btn"
@@ -548,18 +562,22 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
 function ConnectionGuide({
   model,
   kvPages,
+  maxModelLen,
 }: {
   model: string | null;
   kvPages: number | null;
+  maxModelLen: number | null;
 }) {
   const [activeTab, setActiveTab] = useState<AgentTabId>("claude-code");
   const base = window.location.origin;
   const activeModel = sanitizeModelForSnippet(model);
-  const ctxTokens = kvPages && kvPages > 0 ? kvPages * 16 : 32768;
-  const maxOutTokens = Math.min(
-    16384,
-    Math.max(4096, Math.floor(ctxTokens / 4)),
-  );
+  const ctxTokens =
+    maxModelLen && maxModelLen > 0
+      ? maxModelLen
+      : kvPages && kvPages > 0
+        ? kvPages * 16
+        : 32768;
+  const maxOutTokens = Math.min(4096, Math.max(512, Math.floor(ctxTokens / 4)));
   const compactLimit = Math.floor(ctxTokens * 0.75);
 
   const guides: AgentGuideSpec[] = [
@@ -568,15 +586,15 @@ function ConnectionGuide({
       title: "Claude Code",
       protocol: "Anthropic Messages API · /v1/messages",
       summary:
-        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. warp34 natively serves /v1/messages/count_tokens and strips per-request cch= billing headers so MambaRadixCache prefix hits stay warm.",
+        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. Set CLAUDE_CODE_MAX_OUTPUT_TOKENS within warp34's 4,096-token per-turn output cap; warp34 natively serves /v1/messages/count_tokens and strips cch= billing headers so MambaRadixCache prefixes stay warm.",
       snippets: [
         {
           label: "Quick launch (terminal)",
-          code: `ANTHROPIC_BASE_URL=${base} \\\nANTHROPIC_AUTH_TOKEN=warp34 \\\nANTHROPIC_DEFAULT_SONNET_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_OPUS_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_HAIKU_MODEL="${activeModel}" \\\nclaude --model "${activeModel}"`,
+          code: `ANTHROPIC_BASE_URL=${base} \\\nANTHROPIC_AUTH_TOKEN=warp34 \\\nCLAUDE_CODE_MAX_OUTPUT_TOKENS=${maxOutTokens} \\\nANTHROPIC_DEFAULT_SONNET_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_OPUS_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_HAIKU_MODEL="${activeModel}" \\\nclaude --model "${activeModel}"`,
         },
         {
           label: "Persistent config (~/.claude/settings.json)",
-          code: `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${base}",\n    "ANTHROPIC_AUTH_TOKEN": "warp34",\n    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${activeModel}"\n  }\n}`,
+          code: `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${base}",\n    "ANTHROPIC_AUTH_TOKEN": "warp34",\n    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "${maxOutTokens}",\n    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${activeModel}"\n  }\n}`,
         },
       ],
     },
@@ -708,9 +726,11 @@ function ConnectionGuide({
           {guides.map((g) => (
             <button
               key={g.id}
+              id={`connect-tab-${g.id}`}
               type="button"
               role="tab"
               aria-selected={currentGuide.id === g.id}
+              aria-controls="connect-tabpanel"
               className={`connect-tab ${currentGuide.id === g.id ? "active" : ""}`}
               onClick={() => setActiveTab(g.id)}
             >
@@ -719,7 +739,12 @@ function ConnectionGuide({
           ))}
         </div>
 
-        <div className="connect-tab-body" role="tabpanel">
+        <div
+          id="connect-tabpanel"
+          className="connect-tab-body"
+          role="tabpanel"
+          aria-labelledby={`connect-tab-${currentGuide.id}`}
+        >
           <div className="connect-tab-meta">
             <span className="connect-protocol-badge">
               {currentGuide.protocol}
@@ -830,6 +855,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
               <ConnectionGuide
                 model={latest?.model ?? null}
                 kvPages={latest?.pools.kv.capacity ?? null}
+                maxModelLen={latest?.config.max_model_len ?? null}
               />
             }
           />

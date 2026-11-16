@@ -110,6 +110,8 @@ pub struct Config {
     pub tp_size: usize,
     pub kv_format: String,
     pub speculation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -157,6 +159,7 @@ impl Default for Telemetry {
             tp_size: 0,
             kv_format: "unknown".into(),
             speculation: "none".into(),
+            max_model_len: None,
         }))
         .ok()
         .unwrap()
@@ -196,6 +199,9 @@ impl Telemetry {
     }
     pub fn set_model(&self, model: String) {
         self.lock().model = model;
+    }
+    pub fn set_max_model_len(&self, max_model_len: Option<usize>) {
+        self.lock().config.max_model_len = max_model_len;
     }
     pub fn set_status(&self, status: &'static str) {
         let mut s = self.lock();
@@ -560,6 +566,7 @@ mod tests {
             tp_size: 1,
             kv_format: "tq4".into(),
             speculation: "none".into(),
+            max_model_len: None,
         })
     }
     #[test]

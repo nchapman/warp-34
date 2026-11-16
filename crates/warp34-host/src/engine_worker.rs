@@ -282,6 +282,7 @@ impl EngineWorker {
             .name("warp34-cuda".into())
             .spawn(move || match loader() {
                 Ok(engine) => {
+                    let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
                     worker_stats.telemetry.initialize(
                         TelemetryConfig {
                             tp_size: engine.tp_size,
@@ -291,6 +292,7 @@ impl EngineWorker {
                                 .as_ref()
                                 .map_or("none", |p| if p.is_mtp() { "mtp" } else { "dflash2" })
                                 .into(),
+                            max_model_len: Some(kv_token_capacity),
                         },
                         engine
                             .model_dir
@@ -330,7 +332,6 @@ impl EngineWorker {
                     }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
-                    let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
                     let unshareable_prefill = engine.cfg.noncausal_full_attention
                         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
                     let info = (
@@ -413,11 +414,14 @@ impl EngineWorker {
     pub fn set_max_model_len(&mut self, limit: Option<usize>) -> Result<(), String> {
         if limit.is_some_and(|n| n == 0 || n > self.kv_token_capacity) {
             return Err(format!(
-                "--max-model-len must be positive and no greater than the allocated KV capacity ({} tokens); increase --kv-pages if needed",
+                "--max-model-len must be positive and no greater than the allocated KV capacity ({} tokens); increase --ctx-size / --kv-pages if needed",
                 self.kv_token_capacity
             ));
         }
         self.max_model_len = limit;
+        self.stats
+            .telemetry
+            .set_max_model_len(Some(self.max_model_len()));
         Ok(())
     }
 
