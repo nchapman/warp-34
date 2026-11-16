@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import { Dashboard } from "./App";
 import { histogram, snapshot } from "./fixtures";
 
@@ -80,7 +81,8 @@ describe("dashboard states", () => {
     expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeVisible();
     expect(document.querySelector("img")).toBeNull();
   });
-  it("provides a read-only connection guide and security warning", () => {
+  it("provides a read-only connection guide and security warning", async () => {
+    const user = userEvent.setup();
     render(
       <Dashboard
         state={{
@@ -108,10 +110,10 @@ describe("dashboard states", () => {
       screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=2048/),
     ).toBeVisible();
     expect(screen.getByText(/claude --model "Qwen\/Qwen3.5-4B"/)).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "Codex CLI" }));
+    await user.click(screen.getByRole("tab", { name: "Codex CLI" }));
     expect(screen.getByText(/model_context_window = 8192/)).toBeVisible();
     expect(screen.getByText(/\[model_providers\.warp34\]/)).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "OpenCode" }));
+    await user.click(screen.getByRole("tab", { name: "OpenCode" }));
     expect(
       screen.getByText(/"model": "warp34\/Qwen\/Qwen3.5-4B"/),
     ).toBeVisible();
@@ -123,6 +125,43 @@ describe("dashboard states", () => {
       "/api/metrics",
     );
     window.history.replaceState(null, "", "/");
+  });
+  it("supports arrow-key integration tabs with associated panels", async () => {
+    const user = userEvent.setup();
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    const first = screen.getByRole("tab", { name: "Claude Code" });
+    first.focus();
+    await user.keyboard("{ArrowRight}");
+    const codex = screen.getByRole("tab", { name: "Codex CLI" });
+    expect(codex).toHaveFocus();
+    expect(codex).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "Codex CLI" })).toHaveAttribute(
+      "id",
+      codex.getAttribute("aria-controls"),
+    );
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: "Python & cURL" })).toHaveFocus();
+  });
+  it("announces a failed clipboard write instead of silently ignoring it", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(
+      new Error("Denied"),
+    );
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    await user.click(screen.getAllByRole("button", { name: /Copy/ })[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not copy",
+    );
   });
   it("populates throughput and latency panels for zero-generated-token decision workloads", () => {
     const s1 = snapshot({

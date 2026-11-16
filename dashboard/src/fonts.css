@@ -1,0 +1,34 @@
+/* WOFF2-only, Latin-only static faces. Do not import the package-wide CSS:
+   it includes unused subsets and WOFF fallbacks in the embedded bundle. */
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("@fontsource/geist/files/geist-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("@fontsource/geist/files/geist-latin-500-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("@fontsource/geist/files/geist-latin-600-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("@fontsource/geist-mono/files/geist-mono-latin-400-normal.woff2")
+    format("woff2");
+}

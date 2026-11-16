@@ -1,4 +1,4 @@
-//! Read-only React dashboard, embedded at compile time. Build assets with
+//! React dashboard and API playground, embedded at compile time. Build assets with
 //! `mise run dashboard-build` before invoking Cargo directly.
 use axum::{
     Router,
@@ -47,6 +47,7 @@ fn embedded_file(path: &str, immutable: bool) -> Response {
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("woff2") => "font/woff2",
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
@@ -72,6 +73,35 @@ fn embedded_file(path: &str, immutable: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_geist_fonts_use_woff2_and_stay_within_budget() {
+        let fonts: Vec<_> = ASSETS
+            .get_dir("assets")
+            .unwrap()
+            .files()
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "woff2"))
+            .collect();
+        assert_eq!(
+            fonts.len(),
+            4,
+            "three Geist weights and one Geist Mono face"
+        );
+        let bytes: usize = fonts.iter().map(|file| file.contents().len()).sum();
+        assert!(
+            bytes < 52_000,
+            "Latin WOFF2 font budget exceeded: {bytes} bytes"
+        );
+        for file in fonts {
+            let response = embedded_file(file.path().to_str().unwrap(), true);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "font/woff2");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=31536000, immutable"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn embedded_dashboard_and_assets_serve_without_filesystem() {

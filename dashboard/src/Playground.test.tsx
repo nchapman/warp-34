@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "./App";
@@ -399,6 +400,94 @@ describe("playground wire helpers", () => {
 });
 
 describe("Playground UI integration", () => {
+  it("offers manual cURL copying when clipboard access is unavailable", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator, "clipboard", "get").mockReturnValue(
+      undefined as unknown as Clipboard,
+    );
+    render(
+      <Dashboard
+        initialEntries={["/playground"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Copy cURL" }));
+    expect(
+      screen.queryByRole("button", { name: "Copied cURL" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not copy");
+    expect(screen.getByRole("tabpanel", { name: "cURL" })).toBeVisible();
+  });
+  it("locks request controls while keeping the focused Send/Abort button", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/playground");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () =>
+              reject(new DOMException("Aborted", "AbortError")),
+            );
+          }),
+      ),
+    );
+    render(
+      <Dashboard
+        state={{ history: [snapshot({})], connection: "live", error: null }}
+      />,
+    );
+    const send = screen.getByRole("button", { name: "Send Request" });
+    await user.click(send);
+    expect(screen.getByRole("button", { name: "Abort" })).toBe(send);
+    expect(send).toHaveFocus();
+    expect(screen.getByLabelText("Turn 2 content")).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Stream SSE" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Thinking" })).toBeDisabled();
+    expect(screen.getByLabelText(/PRESET/)).toBeDisabled();
+    expect(screen.getByLabelText("ENDPOINT")).toBeDisabled();
+    expect(screen.getByLabelText("API KEY")).toBeDisabled();
+    await user.click(send);
+    await waitFor(() => expect(send).toHaveTextContent("Send Request"));
+    expect(send).toHaveFocus();
+    expect(screen.getByLabelText("Turn 2 content")).toBeEnabled();
+  });
+  it("supports keyboard tab navigation and associated panels without losing edits", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/playground");
+    render(
+      <Dashboard
+        state={{ history: [snapshot({})], connection: "live", error: null }}
+      />,
+    );
+    const turn = screen.getByLabelText("Turn 2 content");
+    fireEvent.change(turn, { target: { value: "Keep this edit" } });
+    expect(screen.getByRole("switch", { name: "Stream SSE" })).toBeEnabled();
+    expect(screen.getByRole("switch", { name: "Thinking" })).toBeEnabled();
+    screen.getByRole("tab", { name: "Messages & Params" }).focus();
+    await user.keyboard("{ArrowRight}");
+    const jsonTab = screen.getByRole("tab", { name: "JSON Body" });
+    expect(jsonTab).toHaveFocus();
+    expect(jsonTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "JSON Body" })).toHaveAttribute(
+      "id",
+      jsonTab.getAttribute("aria-controls"),
+    );
+    const editor = screen.getByLabelText("Request JSON body");
+    expect(editor instanceof HTMLTextAreaElement && editor.value).toContain(
+      "Keep this edit",
+    );
+    await user.keyboard("{Home}");
+    expect(screen.getByLabelText("Turn 2 content")).toHaveValue(
+      "Keep this edit",
+    );
+    screen.getByRole("tab", { name: "Parsed" }).focus();
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: "cURL" })).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: "cURL" })).toBeVisible();
+    await user.keyboard("{Home}{ArrowRight}");
+    expect(screen.getByRole("tabpanel", { name: "Raw JSON" })).toBeVisible();
+  });
   it("switches to Playground, syncs structured turns with raw JSON, and executes requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -447,7 +536,7 @@ describe("Playground UI integration", () => {
     const turn2 = screen.getByLabelText("Turn 2 content");
     fireEvent.change(turn2, { target: { value: "Custom kernel question" } });
 
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const rawEditor = screen.getByLabelText(
       "Request JSON body",
     ) as HTMLTextAreaElement;
@@ -534,7 +623,7 @@ describe("Playground UI integration", () => {
     });
 
     const sseTab = screen.getByRole("tab", { name: "SSE (3)" });
-    fireEvent.click(sseTab);
+    await userEvent.click(sseTab);
     expect(screen.getByText("[DONE]")).toBeVisible();
   });
 
@@ -565,7 +654,7 @@ describe("Playground UI integration", () => {
     fireEvent.click(screen.getByRole("link", { name: "Playground" }));
 
     // Switch to JSON Body and enter invalid JSON
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const rawEditor = screen.getByLabelText("Request JSON body");
     fireEvent.change(rawEditor, { target: { value: "{bad json" } });
     expect(screen.getByRole("alert")).toHaveTextContent(/JSON syntax error/);

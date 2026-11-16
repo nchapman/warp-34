@@ -1,5 +1,12 @@
 # warp34 — Session Orientation & Current State
 
+## Dashboard: shadcn Neutral Dark Controls & Self-Hosted Geist
+
+- **Design system (`dashboard/`):** Adopted generated shadcn/ui Radix components and Tailwind v4 for buttons, inputs, textareas, native selects, switches, badges, and tabs. Replaced violet-tinted surfaces/glows with the standard neutral dark token palette, reserving bright violet/cyan for brand and telemetry signals. Kept custom chart/layout CSS in the base layer; added component/theme guidance in `dashboard/README.md`.
+- **Control behavior:** Added roving keyboard tabs and associated panels in Connect and Playground, Lucide action/navigation icons, request-editor locking while requests run, stable Send/Abort focus, accessible upload controls, JSON error associations, and explicit clipboard-failure feedback. Native selectors retain browser/mobile keyboard behavior; developer API proxying now covers all Playground endpoints.
+- **Typography (`dashboard/src/fonts.css`, `crates/warp34-host/src/dashboard.rs`):** Self-hosted Geist Sans 400/500/600 and Geist Mono 400, Latin-only WOFF2, `font-display: swap`, no unused weights/italics or external requests. Four font assets total **49,488 bytes (48.3 KiB)**; embedded serving adds `font/woff2` with immutable caching and a regression test enforcing a 52,000-byte budget.
+- **Verification:** Dashboard typecheck/format/build and **37/37** Vitest tests pass; **2/2** CUDA-feature embedded-dashboard tests pass (font test first reproduced a 404 before adding WOFF2 serving). Chrome checks cover all three routes at 390/768/1440px, keyboard tab navigation, four loaded font faces, and a mocked SSE request with no page overflow or browser errors. Two scoped reviews report no actionable findings. Full `mise run check` passed, including release tests and **117/117** CUDA sanitizer runs; final `mise run check-quick`, frontend checks, and focused embedded-asset tests also passed after the font changes.
+
 ## Model Startup, Safetensors Archive, Pipelined GPU Upload, & Tiered-MoE Initialization (`1.5–1.9×` Faster Startup)
 
 - **Warm-Cache HuggingFace Hub Fast Path (`crates/warp34-host/src/hub.rs`, `crates/warp34-host/src/hub/tests.rs`):**

@@ -1,5 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Check,
+  Copy,
+  LayoutDashboard,
+  Plug,
+  SquareTerminal,
+} from "lucide-react";
+import { Button } from "./components/ui/button";
+import { Badge } from "./components/ui/badge";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
+import {
   BrowserRouter,
   Link,
   MemoryRouter,
@@ -126,10 +136,14 @@ function Status({ state }: { state: MetricsState }) {
     style = snapshot?.status === "ready" ? "healthy" : "danger";
   }
   return (
-    <span className={`status ${style}`} role="status">
+    <Badge
+      variant="outline"
+      className={`status ${style} ${style === "healthy" ? "text-cyan-300" : style === "danger" ? "text-red-400" : "text-muted-foreground"}`}
+      role="status"
+    >
       <span className="status-dot" />
       {label}
-    </span>
+    </Badge>
   );
 }
 
@@ -516,6 +530,7 @@ function sanitizeModelForSnippet(model: string | null): string {
 
 function CopyCodeBlock({ label, code }: { label: string; code: string }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const timerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
@@ -525,7 +540,11 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
     };
   }, []);
   const onCopy = () => {
-    if (!navigator.clipboard?.writeText) return;
+    setCopyError(false);
+    if (!navigator.clipboard?.writeText) {
+      setCopyError(true);
+      return;
+    }
     navigator.clipboard
       .writeText(code)
       .then(() => {
@@ -540,21 +559,32 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
       })
       .catch(() => {
         setCopied(false);
+        setCopyError(true);
       });
   };
   return (
     <div className="connect-snippet">
       <div className="connect-snippet-header">
         <span className="connect-snippet-label">{label}</span>
-        <button
+        <Button
           type="button"
-          className="pg-btn pg-btn-ghost connect-copy-btn"
+          variant="ghost"
+          size="sm"
+          aria-label={`${copied ? "Copied" : "Copy"} ${label}`}
           onClick={onCopy}
         >
-          {copied ? "Copied" : "Copy"}
-        </button>
+          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+          <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
+        </Button>
       </div>
-      <pre>{code}</pre>
+      {copyError && (
+        <p role="alert" className="px-4 py-2 text-sm text-destructive">
+          Could not copy. Select and copy the snippet manually.
+        </p>
+      )}
+      <pre tabIndex={0} aria-label={label}>
+        {code}
+      </pre>
     </div>
   );
 }
@@ -568,7 +598,6 @@ function ConnectionGuide({
   kvPages: number | null;
   maxModelLen: number | null;
 }) {
-  const [activeTab, setActiveTab] = useState<AgentTabId>("claude-code");
   const base = window.location.origin;
   const activeModel = sanitizeModelForSnippet(model);
   const ctxTokens =
@@ -677,8 +706,6 @@ function ConnectionGuide({
     },
   ];
 
-  const currentGuide = guides.find((g) => g.id === activeTab) ?? guides[0];
-
   return (
     <>
       <div className="section-heading">
@@ -718,45 +745,37 @@ function ConnectionGuide({
           </div>
         </div>
 
-        <div
-          className="connect-tabs"
-          role="tablist"
-          aria-label="Coding agent integrations"
-        >
-          {guides.map((g) => (
-            <button
-              key={g.id}
-              id={`connect-tab-${g.id}`}
-              type="button"
-              role="tab"
-              aria-selected={currentGuide.id === g.id}
-              aria-controls="connect-tabpanel"
-              className={`connect-tab ${currentGuide.id === g.id ? "active" : ""}`}
-              onClick={() => setActiveTab(g.id)}
-            >
-              {g.title}
-            </button>
-          ))}
-        </div>
-
-        <div
-          id="connect-tabpanel"
-          className="connect-tab-body"
-          role="tabpanel"
-          aria-labelledby={`connect-tab-${currentGuide.id}`}
-        >
-          <div className="connect-tab-meta">
-            <span className="connect-protocol-badge">
-              {currentGuide.protocol}
-            </span>
-            <p>{currentGuide.summary}</p>
-          </div>
-          <div className="connect-snippets-grid">
-            {currentGuide.snippets.map((s) => (
-              <CopyCodeBlock key={s.label} label={s.label} code={s.code} />
+        <Tabs defaultValue="claude-code" className="mt-6 gap-5">
+          <TabsList
+            aria-label="Coding agent integrations"
+            className="h-auto! max-w-full flex-wrap justify-start gap-1"
+          >
+            {guides.map((guide) => (
+              <TabsTrigger
+                key={guide.id}
+                value={guide.id}
+                className="min-h-9 flex-none px-3"
+              >
+                {guide.title}
+              </TabsTrigger>
             ))}
-          </div>
-        </div>
+          </TabsList>
+          {guides.map((guide) => (
+            <TabsContent key={guide.id} value={guide.id} className="min-w-0">
+              <div className="connect-tab-meta">
+                <Badge variant="secondary" className="whitespace-normal">
+                  {guide.protocol}
+                </Badge>
+                <p>{guide.summary}</p>
+              </div>
+              <div className="connect-snippets-grid">
+                {guide.snippets.map((s) => (
+                  <CopyCodeBlock key={s.label} label={s.label} code={s.code} />
+                ))}
+              </div>
+            </TabsContent>
+          ))}
+        </Tabs>
       </section>
 
       <div className="connect-grid">
@@ -781,8 +800,9 @@ function ConnectionGuide({
             client with the deployment’s key (Bearer authorization or
             x-api-key). The dashboard, metrics, and health endpoints remain
             public. Bind locally or use an authenticated TLS reverse proxy to
-            protect the whole service. The dashboard is read-only and contains
-            no prompt or response content.
+            protect the whole service. Overview and Connect are read-only.
+            Playground sends requests and displays prompts and responses in this
+            browser tab; do not expose it to untrusted users.
           </p>
           <label>Start server with API key authentication</label>
           <pre>{`export WARP34_API_KEY="your-secret-key"\nwarp34 serve "${activeModel}" -c 64k --api-key-env WARP34_API_KEY`}</pre>
@@ -830,15 +850,21 @@ function DashboardShell({ state }: { state: MetricsState }) {
           <Status state={state} />
         </div>
       </header>
-      <nav aria-label="Main navigation">
+      <nav className="app-nav" aria-label="Main navigation">
         <NavLink to="/" end>
+          <LayoutDashboard className="mr-2 size-4" aria-hidden="true" />{" "}
           Overview
         </NavLink>
-        <NavLink to="/playground">Playground</NavLink>
-        <NavLink to="/connect">Connect</NavLink>
+        <NavLink to="/playground">
+          <SquareTerminal className="mr-2 size-4" aria-hidden="true" />{" "}
+          Playground
+        </NavLink>
+        <NavLink to="/connect">
+          <Plug className="mr-2 size-4" aria-hidden="true" /> Connect
+        </NavLink>
         <span className="nav-label">INFERENCE CONSOLE</span>
       </nav>
-      <main id="main">
+      <main id="main" tabIndex={-1}>
         <Routes>
           <Route path="/" element={<Overview state={state} />} />
           <Route

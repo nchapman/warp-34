@@ -119,7 +119,7 @@ export function Chart({
             <stop
               offset="0%"
               className={`chart-area-stop ${color}`}
-              stopOpacity="0.22"
+              stopOpacity="0.14"
             />
             <stop
               offset="100%"
