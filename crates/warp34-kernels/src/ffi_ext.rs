@@ -952,4 +952,314 @@ unsafe extern "C" {
         local_vocab_size: i32,
         vocab_offset: i32,
     ) -> i32;
+
+    pub fn warp34_rms_norm_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_fused_add_rms_norm_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_fused_qk_rmsnorm_rope_f16(
+        ex: *const Warp34Exec,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        positions: *const i32,
+        valid_token_mask: *const u8,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        num_tokens: i32,
+        pos_plane_stride: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        mrope_s0: i32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+        weight_bias: f32,
+    ) -> i32;
+
+    pub fn warp34_embedding_add_f16(
+        ex: *const Warp34Exec,
+        dst_embeds: *mut c_void,
+        src_visual_embeds: *const c_void,
+        token_indices: *const i32,
+        num_visual_tokens: i32,
+        dst_rows: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn warp34_mha_fa2_d128_f16(
+        ex: *const Warp34Exec,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        b: i32,
+        seqlen_q: i32,
+        seqlen_k: i32,
+        h: i32,
+        h_k: i32,
+        is_causal: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_timestep_sinusoidal_f16(
+        ex: *const Warp34Exec,
+        timesteps: *const f32,
+        out: *mut c_void,
+        num_rows: i32,
+        timestep_dim: i32,
+        max_period: f32,
+        time_factor: f32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_silu_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        out: *mut c_void,
+        n: i64,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_build_joint_hidden_f16(
+        ex: *const Warp34Exec,
+        txt_hidden: *const c_void,
+        img_hidden: *const c_void,
+        row_map: *const i32,
+        out_joint: *mut c_void,
+        total_rows: i32,
+        txt_rows: i32,
+        img_rows: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_adaln_modulate_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        scale_col_offset: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_adaln_modulate_ex_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        scale_col_offset: i32,
+        eps: f32,
+        apply_had64: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_gated_residual_f16(
+        ex: *const Warp34Exec,
+        residual: *mut c_void,
+        branch_out: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        gate_col_offset: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_fused_gated_residual_adaln_f16(
+        ex: *const Warp34Exec,
+        residual: *mut c_void,
+        branch_out: *const c_void,
+        gate_modulation: *const c_void,
+        gate_target_mask: *const u8,
+        gate_mod_stride: i32,
+        gate_col_offset: i32,
+        scale_modulation: *const c_void,
+        scale_target_mask: *const u8,
+        scale_mod_stride: i32,
+        scale_col_offset: i32,
+        norm_out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        apply_had64: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_euler_cfg_step_f16(
+        ex: *const Warp34Exec,
+        sample_f16: *mut c_void,
+        cond_pred_f16: *const c_void,
+        uncond_pred_f16: *const c_void,
+        true_cfg_scale: f32,
+        dt: f32,
+        n_elems: i64,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
+        ex: *const Warp34Exec,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        norm_q_w: *const c_void,
+        norm_k_w: *const c_void,
+        cos_table: *const f32,
+        sin_table: *const f32,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        cache_k_out: *mut c_void,
+        num_tokens: i32,
+        num_heads: i32,
+        cache_write_len: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_cublas_conv_gemm_f16(
+        handle: usize,
+        col: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        spatial: i32,
+        out_c: i32,
+        k_dim: i32,
+        ld_out: i32,
+    ) -> i32;
+
+    pub fn warp34_cublas_vae_qk_f16_f32(
+        handle: usize,
+        q_cs: *const c_void,
+        k_cs: *const c_void,
+        scores_f32: *mut f32,
+        spatial: i32,
+        channels: i32,
+        scale: f32,
+    ) -> i32;
+
+    pub fn warp34_cublas_vae_sv_f16(
+        handle: usize,
+        probs_f16: *const c_void,
+        v_cs: *const c_void,
+        out_cs: *mut c_void,
+        spatial: i32,
+        channels: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_rms_norm_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gamma: *const c_void,
+        out: *mut c_void,
+        channels: i32,
+        spatial: i32,
+        apply_silu: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_im2col_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        col: *mut c_void,
+        in_c: i32,
+        h_in: i32,
+        w_in: i32,
+        k_h: i32,
+        k_w: i32,
+        pad_top: i32,
+        pad_left: i32,
+        stride_h: i32,
+        stride_w: i32,
+        oh_start: i32,
+        chunk_h: i32,
+        w_out: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_bias_residual_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        channels: i32,
+        spatial: i32,
+        clamp_pm1: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_upsample2d_nearest2x_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        out: *mut c_void,
+        channels: i32,
+        h_in: i32,
+        w_in: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_avg_down_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        in_c: i32,
+        out_c: i32,
+        h_in: i32,
+        w_in: i32,
+        factor_t: i32,
+        factor_s: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_dup_up_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        in_c: i32,
+        out_c: i32,
+        h_in: i32,
+        w_in: i32,
+        factor_t: i32,
+        factor_s: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_dup_up_scaled_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        in_c: i32,
+        out_c: i32,
+        h_in: i32,
+        w_in: i32,
+        factor_t: i32,
+        factor_s: i32,
+        x_scale: f32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_vae_softmax_f32_to_f16(
+        ex: *const Warp34Exec,
+        scores: *const f32,
+        probs: *mut c_void,
+        seq_len: i32,
+    ) -> i32;
 }

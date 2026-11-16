@@ -5,8 +5,10 @@ use crate::loader::{ModelConfig, QuantScheme};
 
 const METADATA: &[&str] = &[
     "config.json",
+    "model_index.json",
     "generation_config.json",
     "model.safetensors.index.json",
+    "diffusion_pytorch_model.safetensors.index.json",
     "quantize_config.json",
     "quant_config.json",
     "quantization_config.json",
@@ -32,17 +34,58 @@ const METADATA: &[&str] = &[
     "runtime/mtp-int4-g32/model.safetensors.index.json",
 ];
 
+pub(super) const PIPELINE_SUBDIRS: &[&str] = &[
+    "processor",
+    "scheduler",
+    "text_encoder",
+    "tokenizer",
+    "transformer",
+    "vae",
+];
+
+const PIPELINE_SUBDIR_METADATA: &[&str] = &[
+    "config.json",
+    "scheduler_config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+    "diffusion_pytorch_model.safetensors.index.json",
+    "quantize_config.json",
+    "quant_config.json",
+    "quantization_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "chat_template.jinja",
+    "chat_template.json",
+    "processor_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+];
+
+pub(super) fn is_pipeline_files(files: &BTreeSet<String>) -> bool {
+    files.contains("model_index.json") && !files.contains("config.json")
+}
+
 pub(super) fn metadata_files(files: &BTreeSet<String>) -> io::Result<Vec<String>> {
-    if !files.contains("config.json") {
+    if !files.contains("config.json") && !files.contains("model_index.json") {
         return Err(invalid(
             "repository has no root config.json; specify a supported checkpoint repository",
         ));
     }
+    let is_pipeline = is_pipeline_files(files);
     let selected: Vec<_> = files
         .iter()
         .filter(|name| {
             METADATA.contains(&name.as_str())
                 || (name.starts_with("chat_templates/") && name.ends_with(".jinja"))
+                || (is_pipeline
+                    && name.split_once('/').is_some_and(|(sub, leaf)| {
+                        PIPELINE_SUBDIRS.contains(&sub) && PIPELINE_SUBDIR_METADATA.contains(&leaf)
+                    }))
         })
         .cloned()
         .collect();
@@ -52,7 +95,61 @@ pub(super) fn metadata_files(files: &BTreeSet<String>) -> io::Result<Vec<String>
     Ok(selected)
 }
 
+fn collect_component_weights(
+    dir: &Path,
+    subdir: &str,
+    files: &BTreeSet<String>,
+    selected: &mut BTreeSet<String>,
+) -> io::Result<()> {
+    for idx_leaf in [
+        "model.safetensors.index.json",
+        "diffusion_pytorch_model.safetensors.index.json",
+    ] {
+        let rel_idx = format!("{subdir}/{idx_leaf}");
+        if files.contains(&rel_idx) {
+            let index = read_json(&dir.join(&rel_idx))?;
+            let map = index["weight_map"]
+                .as_object()
+                .filter(|m| !m.is_empty())
+                .ok_or_else(|| invalid(format!("{rel_idx} has no nonempty weight_map")))?;
+            for value in map.values() {
+                let shard = value
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid safetensors shard filename"))?;
+                let rel_shard = format!("{subdir}/{shard}");
+                safe_path(&rel_shard)?;
+                if !rel_shard.ends_with(".safetensors") || !files.contains(&rel_shard) {
+                    return Err(invalid(format!(
+                        "checkpoint is missing indexed safetensors shard {rel_shard}"
+                    )));
+                }
+                selected.insert(rel_shard);
+            }
+            return Ok(());
+        }
+    }
+    for single_leaf in ["model.safetensors", "diffusion_pytorch_model.safetensors"] {
+        let rel_single = format!("{subdir}/{single_leaf}");
+        if files.contains(&rel_single) {
+            selected.insert(rel_single);
+            return Ok(());
+        }
+    }
+    Err(invalid(format!(
+        "pipeline component '{subdir}' has no safetensors weights or index"
+    )))
+}
+
 pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<Vec<String>> {
+    if is_pipeline_files(files)
+        || crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(dir)
+    {
+        let mut selected = BTreeSet::new();
+        for comp in ["text_encoder", "transformer", "vae"] {
+            collect_component_weights(dir, comp, files, &mut selected)?;
+        }
+        return Ok(selected.into_iter().collect());
+    }
     let mut selected = BTreeSet::new();
     if files.contains("model.safetensors.index.json") {
         let index = read_json(&dir.join("model.safetensors.index.json"))?;
@@ -108,6 +205,15 @@ pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<V
 }
 
 pub(super) fn validate_config(dir: &Path, role: ModelRole) -> io::Result<()> {
+    if crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(dir) {
+        if role != ModelRole::Target {
+            return Err(invalid(
+                "QwenImage21Pipeline checkpoints can only be loaded as a target model",
+            ));
+        }
+        crate::qwen_image::QwenImage21PipelineConfig::from_dir(dir)?;
+        return Ok(());
+    }
     let root = read_json(&dir.join("config.json"))?;
     match role {
         ModelRole::Target => {
@@ -203,6 +309,23 @@ pub(super) fn validate_checkpoint(
     names: &BTreeSet<String>,
 ) -> io::Result<()> {
     validate_config(dir, role)?;
+    if crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(dir) {
+        let tok_rel = [
+            "processor/tokenizer.json",
+            "tokenizer/tokenizer.json",
+            "tokenizer.json",
+        ]
+        .into_iter()
+        .find(|&cand| names.contains(cand) || dir.join(cand).is_file())
+        .unwrap_or("processor/tokenizer.json");
+        validate_files(dir, &[tok_rel.into()])?;
+        validate_files(dir, &weight_files(dir, names)?)?;
+        let pcfg = crate::qwen_image::QwenImage21PipelineConfig::from_dir(dir)?;
+        pcfg.open_text_encoder_archive()?;
+        pcfg.open_transformer_archive()?;
+        pcfg.open_vae_archive()?;
+        return Ok(());
+    }
     if role == ModelRole::Target {
         validate_files(dir, &["tokenizer.json".into()])?;
     }

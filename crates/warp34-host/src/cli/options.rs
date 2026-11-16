@@ -71,17 +71,20 @@ pub fn print_usage() {
         r#"Usage: warp34 <subcommand> [model] [options]
 
 Subcommands:
-  serve        [model] Start OpenAI/Anthropic HTTP server & embedded dashboard (default :8000)
+  serve        [model] Start OpenAI/Anthropic/Images HTTP server & embedded dashboard (default :8000)
   chat         [model] Interactive multi-turn chat REPL or single-turn chat (--prompt)
   generate     [model] Single-prompt text/multimodal generation
+  image        [model] Qwen-Image-2.1 text-to-image, single/multi-image editing, & RGBA generation
   bench        [model] Throughput & latency benchmark (--stage decode|radix|scheduler|vision|all)
+  bench-image  [model] Qwen-Image-2.1 end-to-end diffusion latency & throughput benchmark
   greedy-diff  [model] Token-level parity check against oracle golden JSON (--golden <dir|json>)
-  dump-diff    [model] Layer-by-layer tensor parity check (--compare-tp2 | --golden <safetensors>)
+  dump-diff    [model] Layer-by-layer tensor or image parity check (--compare-tp2 | --golden <path>)
   profile-diff         Nsight Systems SQLite kernel category comparison vs vLLM/SGLang
 
 Model & Hub Options:
   <model>, -m, --model <id|path>      Hugging Face repo ID or local Safetensors directory
-                                      (default: nchapman/Qwen3.5-4B-W4A16-HGPTQ)
+                                      (default: nchapman/Qwen3.5-4B-W4A16-HGPTQ;
+                                       Qwen/Qwen-Image-2.1-Turbo for image / bench-image)
   --revision <rev>                    Hub branch, tag, or full 40-char commit SHA
   --draft-revision <rev>              Hub revision for --draft-model (requires --draft-model)
   --offline                           Use local Hugging Face cache only (also respects HF_HUB_OFFLINE=1)
@@ -124,11 +127,22 @@ Generation & Chat Options (warp34 chat / generate):
   --presence-penalty <float>          Presence penalty (-2.0..2.0; default: 0.0)
   --frequency-penalty <float>         Frequency penalty (-2.0..2.0; default: 0.0)
   --no-thinking / --thinking          Disable or enable <think> reasoning blocks (enabled by default in chat)
-  --image <path|url>...               Attach image(s) for multimodal VL models (--allow-remote-images for URLs)
+  --image <path|url>...               Attach image(s) for multimodal VL / Qwen-Image editing (--allow-remote-images for URLs)
+
+Image Generation & Editing Options (warp34 image / bench-image):
+  --size <WxH>                        Output resolution shorthand (e.g. 1024x1024, 512x512)
+  --width <px> / --height <px>        Explicit output width and height in pixels (64..2048, multiple of 32)
+  --resolution <px>                   Target side length when aspect ratio is derived (default: 1024)
+  --steps, --num-inference-steps <n>  Flow-matching Euler steps (default: 8 Turbo, 40 standard)
+  --cfg-scale, --guidance-scale <f>   Classifier-free guidance scale (default: 1.0 Turbo, 4.0 standard)
+  --negative-prompt <text>            Negative prompt when --cfg-scale > 1.0
+  --rgba, --transparent               Preserve 4-channel RGBA alpha in output PNG
+  -o, --out, --output <path>          Output PNG path (default: qwen_image_out.png) or JSON report path
 
 Examples:
   warp34 serve Qwen/Qwen3.5-4B -c 64k --speculative mtp
-  warp34 serve nchapman/Qwen3.5-27B-W4A16-AutoRound --tp 2 -c 32k --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash
+  warp34 serve Qwen/Qwen-Image-2.1-Turbo --tp 2
+  warp34 image Qwen/Qwen-Image-2.1-Turbo -p "A macro photo of a mechanical watch" --size 1024x1024 -o watch.png
   warp34 chat Qwen/Qwen3.5-4B --speculative mtp
   warp34 generate Qwen/Qwen3.5-4B -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#
     );
@@ -292,6 +306,8 @@ impl ServeCliConfig {
                     | "--stage"
                     | "--golden"
                     | "--out"
+                    | "--output"
+                    | "-o"
                     | "--max-prompts"
                     | "--compare-tp2"
                     | "--oracle"
@@ -301,6 +317,20 @@ impl ServeCliConfig {
                     | "--verify-lossless"
                     | "--verify-radix-warm"
                     | "--live"
+                    | "--negative-prompt"
+                    | "--neg-prompt"
+                    | "--width"
+                    | "--height"
+                    | "--size"
+                    | "--resolution"
+                    | "--output-resolution"
+                    | "--steps"
+                    | "--num-inference-steps"
+                    | "--cfg-scale"
+                    | "--guidance-scale"
+                    | "--true-cfg-scale"
+                    | "--rgba"
+                    | "--transparent"
             ) {
                 self.rejected.get_or_insert_with(|| flag.to_string());
             }
@@ -383,6 +413,8 @@ pub(crate) struct CudaCliOptions {
     pub(crate) draft_revision: Option<String>,
     pub(crate) offline: bool,
     pub(crate) tp: usize,
+    pub(crate) tp_auto: bool,
+    pub(crate) tp_explicit: bool,
     pub(crate) prompt: String,
     pub(crate) prompt_explicit: bool,
     pub(crate) prompt_file: Option<String>,
@@ -420,6 +452,14 @@ pub(crate) struct CudaCliOptions {
     pub(crate) allow_remote_images: bool,
     pub(crate) lora_modules: Vec<crate::lora::LoraModuleSpec>,
     pub(crate) active_lora: Option<String>,
+    pub(crate) negative_prompt: Option<String>,
+    pub(crate) image_width: Option<u32>,
+    pub(crate) image_height: Option<u32>,
+    pub(crate) output_resolution: u32,
+    pub(crate) image_steps: Option<usize>,
+    pub(crate) cfg_scale: Option<f32>,
+    pub(crate) seed: u64,
+    pub(crate) rgba_output: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -436,16 +476,26 @@ pub(crate) fn revision_value(args: &[String], index: &mut usize) -> Result<Strin
 #[cfg(feature = "cuda")]
 pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
+    let is_image_sub = matches!(sub, "image" | "bench-image");
     let mut serve = ServeCliConfig::default();
-    let mut model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ".to_string();
+    let mut model = if is_image_sub {
+        "Qwen/Qwen-Image-2.1-Turbo".to_string()
+    } else {
+        "nchapman/Qwen3.5-4B-W4A16-HGPTQ".to_string()
+    };
     let mut explicit_model_flag = false;
     let mut positional_model: Option<String> = None;
     let mut revision = None;
     let mut draft_revision = None;
     let mut offline = false;
-    let mut tp = 1usize;
-    let mut prompt =
-        "Explain the difference between a mutex and a semaphore in two sentences.".to_string();
+    let mut tp = if is_image_sub { 2usize } else { 1usize };
+    let mut tp_auto = is_image_sub;
+    let mut tp_explicit = false;
+    let mut prompt = if is_image_sub {
+        "A cinematic macro photograph of a translucent mechanical watch movement on dark slate, studio lighting".to_string()
+    } else {
+        "Explain the difference between a mutex and a semaphore in two sentences.".to_string()
+    };
     let mut prompt_explicit = false;
     let mut prompt_file: Option<String> = None;
     let mut system_prompt: Option<String> = None;
@@ -467,7 +517,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut oracle_path: Option<String> = None;
     let mut preset_key: Option<String> = None;
     let mut warp34_prof_path: Option<String> = None;
-    let mut prof_rounds = 128usize;
+    let mut prof_rounds = if sub == "bench-image" {
+        3usize
+    } else {
+        128usize
+    };
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut enable_thinking = true;
@@ -486,6 +540,14 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut allow_remote_images = false;
     let mut lora_modules: Vec<crate::lora::LoraModuleSpec> = Vec::new();
     let mut active_lora: Option<String> = None;
+    let mut negative_prompt: Option<String> = None;
+    let mut image_width: Option<u32> = None;
+    let mut image_height: Option<u32> = None;
+    let mut output_resolution: u32 = 1024;
+    let mut image_steps: Option<usize> = None;
+    let mut cfg_scale: Option<f32> = None;
+    let mut seed: u64 = 42;
+    let mut rgba_output = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -540,6 +602,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--tp" | "-tp" | "--tp-size" | "--tensor-parallel-size" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing --tp value")?;
+                tp_explicit = true;
+                tp_auto = raw.trim().eq_ignore_ascii_case("auto");
                 tp = parse_tp_arg(raw)?;
             }
             "--prompt" | "-p" => {
@@ -602,12 +666,13 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             }
             "--seed" => {
                 i += 1;
-                sampling.seed = Some(
-                    args.get(i)
-                        .ok_or("missing --seed")?
-                        .parse()
-                        .map_err(|_| "invalid --seed")?,
-                );
+                let parsed_seed: u64 = args
+                    .get(i)
+                    .ok_or("missing --seed")?
+                    .parse()
+                    .map_err(|_| "invalid --seed")?;
+                sampling.seed = Some(parsed_seed);
+                seed = parsed_seed;
             }
             "--repetition-penalty" | "--repeat-penalty" => {
                 i += 1;
@@ -654,7 +719,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 i += 1;
                 golden_path = Some(args.get(i).cloned().ok_or("missing --golden")?);
             }
-            "--out" => {
+            "--out" | "--output" | "-o" => {
                 i += 1;
                 out_json = Some(args.get(i).cloned().ok_or("missing --out")?);
             }
@@ -785,6 +850,73 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--live" => {
                 live_profile = true;
             }
+            "--negative-prompt" | "--neg-prompt" => {
+                i += 1;
+                negative_prompt = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or("missing --negative-prompt value")?,
+                );
+            }
+            "--size" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --size")?;
+                let (w_str, h_str) = raw
+                    .split_once('x')
+                    .or_else(|| raw.split_once('X'))
+                    .ok_or_else(|| "invalid --size (expected <width>x<height>)".to_string())?;
+                let w: u32 = w_str.parse().map_err(|_| "invalid --size width")?;
+                let h: u32 = h_str.parse().map_err(|_| "invalid --size height")?;
+                image_width = Some(w);
+                image_height = Some(h);
+            }
+            "--width" => {
+                i += 1;
+                image_width = Some(
+                    args.get(i)
+                        .ok_or("missing --width")?
+                        .parse()
+                        .map_err(|_| "invalid --width")?,
+                );
+            }
+            "--height" => {
+                i += 1;
+                image_height = Some(
+                    args.get(i)
+                        .ok_or("missing --height")?
+                        .parse()
+                        .map_err(|_| "invalid --height")?,
+                );
+            }
+            "--resolution" | "--output-resolution" => {
+                i += 1;
+                output_resolution = args
+                    .get(i)
+                    .ok_or("missing --resolution")?
+                    .parse()
+                    .map_err(|_| "invalid --resolution")?;
+            }
+            "--steps" | "--num-inference-steps" => {
+                i += 1;
+                image_steps = Some(
+                    args.get(i)
+                        .ok_or("missing --steps")?
+                        .parse()
+                        .map_err(|_| "invalid --steps")?,
+                );
+            }
+            "--cfg-scale" | "--guidance-scale" | "--true-cfg-scale" => {
+                i += 1;
+                cfg_scale = Some(
+                    args.get(i)
+                        .ok_or("missing --cfg-scale")?
+                        .parse()
+                        .map_err(|_| "invalid --cfg-scale")?,
+                );
+            }
+            "--rgba" | "--transparent" => {
+                rgba_output = true;
+            }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(None);
@@ -819,6 +951,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         draft_revision,
         offline,
         tp,
+        tp_auto,
+        tp_explicit,
         prompt,
         prompt_explicit,
         prompt_file,
@@ -856,6 +990,14 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         allow_remote_images,
         lora_modules,
         active_lora,
+        negative_prompt,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
     }))
 }
 
@@ -863,7 +1005,15 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
 pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Result<(), String> {
     if !matches!(
         sub,
-        "generate" | "bench" | "greedy-diff" | "dump-diff" | "profile-diff" | "serve" | "chat"
+        "generate"
+            | "bench"
+            | "greedy-diff"
+            | "dump-diff"
+            | "profile-diff"
+            | "serve"
+            | "chat"
+            | "image"
+            | "bench-image"
     ) {
         if options.speculative_kind.is_some() {
             return Err("speculation is supported by generate, bench, greedy-diff, dump-diff, profile-diff, serve and chat".into());
@@ -872,6 +1022,9 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
     }
     if !matches!(options.tp, 1 | 2 | 4) {
         return Err("--tp must be 1, 2, or 4".into());
+    }
+    if matches!(sub, "image" | "bench-image") && !options.tp_auto && !matches!(options.tp, 1 | 2) {
+        return Err("--tp for image/bench-image must be 1, 2, or auto".into());
     }
     if sub == "greedy-diff" && options.golden_path.is_none() {
         return Err("--golden <dir-or-json> is required".into());
@@ -979,6 +1132,29 @@ pub(crate) fn validate_cuda_options(
     }
     if options.max_prompts == 0 {
         return Err("--max-prompts must be >= 1".into());
+    }
+    if let Some(w) = options.image_width
+        && !(64..=2048).contains(&w)
+    {
+        return Err("--width must be in 64..=2048".into());
+    }
+    if let Some(h) = options.image_height
+        && !(64..=2048).contains(&h)
+    {
+        return Err("--height must be in 64..=2048".into());
+    }
+    if !(64..=2048).contains(&options.output_resolution) {
+        return Err("--resolution must be in 64..=2048".into());
+    }
+    if let Some(steps) = options.image_steps
+        && !(1..=100).contains(&steps)
+    {
+        return Err("--steps must be in 1..=100".into());
+    }
+    if let Some(cfg) = options.cfg_scale
+        && (!cfg.is_finite() || !(0.0..=30.0).contains(&cfg))
+    {
+        return Err("--cfg-scale must be in 0.0..=30.0".into());
     }
     if options.lora_modules.len() > crate::lora::MAX_LORA_ADAPTERS {
         return Err(format!(

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
 import {
   ENDPOINTS,
@@ -19,6 +19,7 @@ import {
 interface PlaygroundProps {
   model: string | null;
   decisionMode?: boolean;
+  imageMode?: boolean;
 }
 
 type RequestTab = "structured" | "json";
@@ -39,20 +40,54 @@ const MAX_IMAGES_PER_REQUEST = 4;
 const MAX_IMAGE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_CANVAS_DIM = 2048;
 
+function formatDisplayJson(val: unknown): string {
+  const formatted = JSON.stringify(
+    val,
+    (key, v) => {
+      if (key === "b64_json" && typeof v === "string" && v.length > 256) {
+        return `${v.slice(0, 64)}… [${v.length} base64 chars]`;
+      }
+      return v;
+    },
+    2,
+  );
+  return formatted.length > MAX_SSE_BUFFER_CHARS
+    ? `${formatted.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
+    : formatted;
+}
+
+function endpointsForModel(isImageModel: boolean): EndpointSpec[] {
+  if (isImageModel) {
+    return ENDPOINTS.filter(
+      (e) => e.kind === "openai-images" || e.group === "System",
+    );
+  }
+  return ENDPOINTS.filter((e) => e.kind !== "openai-images");
+}
+
 function resolveRoute(
   pathEndpointId: string | undefined,
   searchParams: URLSearchParams,
   decisionMode: boolean,
+  model?: string | null,
+  imageMode = false,
 ): {
   endpoint: EndpointSpec;
   presetId: string;
 } {
   const requestedEndpoint = searchParams.get("endpoint") ?? pathEndpointId;
-  const fallbackId = decisionMode ? "decisions" : "chat-completions";
+  const isImageModel =
+    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const available = endpointsForModel(isImageModel);
+  const fallbackId = decisionMode
+    ? "decisions"
+    : isImageModel
+      ? "images-generations"
+      : "chat-completions";
   const endpoint =
-    ENDPOINTS.find((e) => e.id === requestedEndpoint) ??
-    ENDPOINTS.find((e) => e.id === fallbackId) ??
-    ENDPOINTS[0];
+    available.find((e) => e.id === requestedEndpoint) ??
+    available.find((e) => e.id === fallbackId) ??
+    available[0];
   const requestedPreset = searchParams.get("preset");
   const preset =
     endpoint.presets.find((p) => p.id === requestedPreset) ??
@@ -104,14 +139,36 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
   });
 }
 
-export function Playground({ model, decisionMode = false }: PlaygroundProps) {
+export function Playground({
+  model,
+  decisionMode = false,
+  imageMode = false,
+}: PlaygroundProps) {
   const navigate = useNavigate();
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const defaultEndpointId = decisionMode ? "decisions" : "chat-completions";
-  const initial = resolveRoute(pathEndpointId, searchParams, decisionMode);
+  const isImageModel =
+    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const availableEndpoints = useMemo(
+    () => endpointsForModel(isImageModel),
+    [isImageModel],
+  );
+  const defaultEndpointId = decisionMode
+    ? "decisions"
+    : isImageModel
+      ? "images-generations"
+      : "chat-completions";
+  const initial = resolveRoute(
+    pathEndpointId,
+    searchParams,
+    decisionMode,
+    model,
+    imageMode,
+  );
   const [endpointId, setEndpointId] = useState<string>(initial.endpoint.id);
-  const endpoint = ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0];
+  const endpoint =
+    availableEndpoints.find((e) => e.id === endpointId) ??
+    availableEndpoints[0];
 
   const [presetId, setPresetId] = useState<string>(initial.presetId);
   const activeModel = model ?? DEFAULT_MODEL;
@@ -144,7 +201,9 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState<string>("");
   const [requestTab, setRequestTab] = useState<RequestTab>(() =>
-    initial.endpoint.conversational ? "structured" : "json",
+    initial.endpoint.conversational || initial.endpoint.kind === "openai-images"
+      ? "structured"
+      : "json",
   );
   const [responseTab, setResponseTab] = useState<ResponseTab>("parsed");
 
@@ -190,7 +249,13 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
 
   // Synchronize endpoint & preset state when URL path or search params change externally
   useEffect(() => {
-    const resolved = resolveRoute(pathEndpointId, searchParams, decisionMode);
+    const resolved = resolveRoute(
+      pathEndpointId,
+      searchParams,
+      decisionMode,
+      model,
+      imageMode,
+    );
     if (resolved.endpoint.id !== endpointId || resolved.presetId !== presetId) {
       setEndpointId(resolved.endpoint.id);
       setPresetId(resolved.presetId);
@@ -203,12 +268,18 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
           : JSON.stringify(nextPreset.buildBody(activeModel), null, 2),
       );
       setJsonError(null);
-      setRequestTab(resolved.endpoint.conversational ? "structured" : "json");
+      setRequestTab(
+        resolved.endpoint.conversational ||
+          resolved.endpoint.kind === "openai-images"
+          ? "structured"
+          : "json",
+      );
     }
-  }, [pathEndpointId, searchParams, decisionMode]);
+  }, [pathEndpointId, searchParams, decisionMode, model, imageMode]);
 
   function selectEndpoint(nextId: string) {
-    const nextSpec = ENDPOINTS.find((e) => e.id === nextId) ?? ENDPOINTS[0];
+    const nextSpec =
+      availableEndpoints.find((e) => e.id === nextId) ?? availableEndpoints[0];
     const firstPreset = nextSpec.presets[0];
     setEndpointId(nextSpec.id);
     setPresetId(firstPreset.id);
@@ -216,7 +287,11 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     const body = firstPreset.buildBody(activeModel);
     setRawJson(nextSpec.method === "GET" ? "" : JSON.stringify(body, null, 2));
     setJsonError(null);
-    setRequestTab(nextSpec.conversational ? "structured" : "json");
+    setRequestTab(
+      nextSpec.conversational || nextSpec.kind === "openai-images"
+        ? "structured"
+        : "json",
+    );
     clearResponseState();
   }
 
@@ -240,7 +315,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     setSseFrames([]);
   }
 
-  function parseCurrentBody(): Record<string, unknown> | null {
+  const bodyObj = useMemo<Record<string, unknown> | null>(() => {
     if (endpoint.method === "GET") return {};
     try {
       const val = JSON.parse(rawJson);
@@ -251,19 +326,16 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     } catch {
       return null;
     }
-  }
+  }, [endpoint.method, rawJson]);
 
   function updateBodyObject(
     updater: (body: Record<string, unknown>) => Record<string, unknown>,
   ) {
-    const current = parseCurrentBody();
-    if (!current) return;
-    const updated = updater(current);
+    if (!bodyObj) return;
+    const updated = updater({ ...bodyObj });
     setRawJson(JSON.stringify(updated, null, 2));
     setJsonError(null);
   }
-
-  const bodyObj = parseCurrentBody();
   const messages: TurnMessage[] =
     endpoint.conversational && bodyObj
       ? extractMessagesFromBody(endpoint.kind, bodyObj)
@@ -336,6 +408,67 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
         (_, i) => i !== index,
       );
       return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
+
+  function handleSendGeneratedToImageEdit(imageUrl: string) {
+    const editSpec = ENDPOINTS.find((e) => e.id === "images-edits");
+    if (!editSpec) return;
+    const preset = editSpec.presets[0];
+    setEndpointId(editSpec.id);
+    setPresetId(preset.id);
+    updateRouteParams(editSpec.id, preset.id);
+    const baseBody = preset.buildBody(activeModel);
+    const nextBody: Record<string, unknown> = {
+      ...baseBody,
+      image: [imageUrl],
+    };
+    setRawJson(JSON.stringify(nextBody, null, 2));
+    setJsonError(null);
+    setRequestTab("structured");
+  }
+
+  async function handleAttachConditionImages(files: FileList | File[]) {
+    const fileArr = Array.from(files).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (fileArr.length === 0) return;
+    const currentImgs = extractConditionImages(bodyObj);
+    const remainingBudget = Math.max(
+      0,
+      MAX_IMAGES_PER_REQUEST - currentImgs.length,
+    );
+    const toRead = fileArr.slice(0, remainingBudget);
+    if (toRead.length === 0) return;
+    try {
+      const dataUrls = await Promise.all(toRead.map(readFileAsEngineDataUrl));
+      setRequestError(null);
+      updateBodyObject((curr) => {
+        const nextImgs = [...extractConditionImages(curr), ...dataUrls];
+        const next: Record<string, unknown> = { ...curr, image: nextImgs };
+        delete next.images;
+        return next;
+      });
+    } catch (err) {
+      setRequestError(
+        err instanceof Error ? err.message : "Failed to attach image.",
+      );
+    }
+  }
+
+  function handleRemoveConditionImage(imgIdx: number) {
+    updateBodyObject((curr) => {
+      const nextImgs = extractConditionImages(curr).filter(
+        (_, i) => i !== imgIdx,
+      );
+      const next = { ...curr };
+      delete next.images;
+      if (nextImgs.length > 0) {
+        next.image = nextImgs;
+      } else {
+        delete next.image;
+      }
+      return next;
     });
   }
 
@@ -495,10 +628,6 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
         });
       } else {
         const rawText = await response.text();
-        const text =
-          rawText.length > MAX_SSE_BUFFER_CHARS
-            ? `${rawText.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
-            : rawText;
         const totalMs = Math.round(performance.now() - startTime);
         setCallMetrics({
           status: response.status,
@@ -507,17 +636,22 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
           e2eMs: totalMs,
         });
         try {
-          const jsonVal = JSON.parse(text);
-          setRawResponse(JSON.stringify(jsonVal, null, 2));
+          const jsonVal = JSON.parse(rawText);
+          const displayJson = formatDisplayJson(jsonVal);
+          setRawResponse(displayJson);
           if (response.ok) {
             setParsedResult(parseJsonResponse(endpoint.kind, jsonVal));
           } else {
             setParsedResult({
               ...emptyParsedResult(),
-              content: JSON.stringify(jsonVal, null, 2),
+              content: displayJson,
             });
           }
         } catch {
+          const text =
+            rawText.length > MAX_SSE_BUFFER_CHARS
+              ? `${rawText.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
+              : rawText;
           setRawResponse(text);
           setParsedResult({
             ...emptyParsedResult(),
@@ -675,15 +809,21 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                     "Tokenizer & Counts",
                     "System",
                   ] as const
-                ).map((group) => (
-                  <optgroup key={group} label={group}>
-                    {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
-                      <option key={ep.id} value={ep.id}>
-                        {ep.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
+                ).map((group) => {
+                  const groupEps = availableEndpoints.filter(
+                    (ep) => ep.group === group,
+                  );
+                  if (groupEps.length === 0) return null;
+                  return (
+                    <optgroup key={group} label={group}>
+                      {groupEps.map((ep) => (
+                        <option key={ep.id} value={ep.id}>
+                          {ep.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  );
+                })}
               </select>
             </div>
 
@@ -750,7 +890,8 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                     {endpoint.path}
                   </h2>
                 </div>
-                {endpoint.conversational && (
+                {(endpoint.conversational ||
+                  endpoint.kind === "openai-images") && (
                   <div
                     className="pg-tab-group"
                     role="tablist"
@@ -763,7 +904,9 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                       className={requestTab === "structured" ? "active" : ""}
                       onClick={() => setRequestTab("structured")}
                     >
-                      Messages & Params
+                      {endpoint.kind === "openai-images"
+                        ? "Prompt & Params"
+                        : "Messages & Params"}
                     </button>
                     <button
                       type="button"
@@ -778,9 +921,20 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                 )}
               </div>
 
-              {endpoint.conversational &&
+              {endpoint.kind === "openai-images" &&
               requestTab === "structured" &&
               bodyObj ? (
+                <ImageRequestEditor
+                  endpoint={endpoint}
+                  body={bodyObj}
+                  onUpdate={updateBodyObject}
+                  onAttachConditionImages={handleAttachConditionImages}
+                  onRemoveConditionImage={handleRemoveConditionImage}
+                  onSubmit={() => void executeRequest()}
+                />
+              ) : endpoint.conversational &&
+                requestTab === "structured" &&
+                bodyObj ? (
                 <div className="pg-structured">
                   <ParameterBar
                     endpoint={endpoint}
@@ -1145,7 +1299,9 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                       <span className="eyebrow">
                         {endpoint.conversational
                           ? "ASSISTANT OUTPUT"
-                          : "RESPONSE PAYLOAD"}
+                          : endpoint.kind === "openai-images"
+                            ? "GENERATED IMAGE"
+                            : "RESPONSE PAYLOAD"}
                       </span>
                       {parsedResult.finishReason && (
                         <span className="mono muted">
@@ -1153,10 +1309,88 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                         </span>
                       )}
                     </div>
+                    {parsedResult.images && parsedResult.images.length > 0 && (
+                      <div
+                        className="pg-image-output-grid"
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns:
+                            "repeat(auto-fit, minmax(260px, 1fr))",
+                          gap: "12px",
+                          marginBottom: "12px",
+                        }}
+                      >
+                        {parsedResult.images.map((src, idx) => (
+                          <figure
+                            key={idx}
+                            style={{
+                              margin: 0,
+                              padding: "8px",
+                              borderRadius: "6px",
+                              border: "1px solid var(--border, #2a2f3a)",
+                              background:
+                                "repeating-conic-gradient(#1b1f27 0% 25%, #242936 0% 50%) 50% / 16px 16px",
+                            }}
+                          >
+                            <img
+                              src={src}
+                              alt={`Generated output ${idx + 1}`}
+                              style={{
+                                width: "100%",
+                                height: "auto",
+                                display: "block",
+                                borderRadius: "4px",
+                                background:
+                                  "repeating-conic-gradient(#161a22 0% 25%, #262d3d 0% 50%) 50% / 20px 20px",
+                              }}
+                            />
+                            <figcaption
+                              className="mono muted"
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                gap: "8px",
+                                marginTop: "6px",
+                                fontSize: "12px",
+                              }}
+                            >
+                              <span>Output #{idx + 1}</span>
+                              <span
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "8px",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className="pg-mini-btn"
+                                  onClick={() =>
+                                    handleSendGeneratedToImageEdit(src)
+                                  }
+                                >
+                                  ↪ Edit Image
+                                </button>
+                                <a
+                                  href={src}
+                                  download={`qwen-image-${idx + 1}.png`}
+                                  style={{ color: "var(--accent, #7aa2f7)" }}
+                                >
+                                  Download PNG
+                                </a>
+                              </span>
+                            </figcaption>
+                          </figure>
+                        ))}
+                      </div>
+                    )}
                     <pre className="pg-output-pre mono">
                       {parsedResult.content ||
                         (inFlight
-                          ? "Waiting for tokens…"
+                          ? endpoint.kind === "openai-images"
+                            ? "Synthesizing image…"
+                            : "Waiting for tokens…"
                           : "Send a request to inspect the response.")}
                     </pre>
                   </div>
@@ -1389,6 +1623,376 @@ function ParameterBar({
           <span>Thinking</span>
         </label>
       )}
+    </div>
+  );
+}
+
+function extractConditionImages(
+  body: Record<string, unknown> | null,
+): string[] {
+  if (!body) return [];
+  const out: string[] = [];
+  for (const key of ["image", "images"] as const) {
+    const val = body[key];
+    if (typeof val === "string" && val.trim().length > 0) {
+      out.push(val.trim());
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === "string" && item.trim().length > 0) {
+          out.push(item.trim());
+        }
+      }
+    }
+  }
+  return out;
+}
+
+const RGBA_PROMPT_PREFIX = "This is an RGBA image with transparency. ";
+const RGBA_PROMPT_SUFFIX =
+  "The image has alpha channel and the background is transparent.";
+
+function wrapRgbaTransparencyPrompt(prompt: string): string {
+  const trimmed = prompt.trim();
+  if (!trimmed) return `${RGBA_PROMPT_PREFIX}${RGBA_PROMPT_SUFFIX}`;
+  const lower = trimmed.toLowerCase();
+  if (lower.includes("rgba image") || lower.includes("alpha channel")) {
+    return prompt;
+  }
+  const body = trimmed.replace(/\.+$/, "");
+  return `${RGBA_PROMPT_PREFIX}${body}. ${RGBA_PROMPT_SUFFIX}`;
+}
+
+function unwrapRgbaTransparencyPrompt(prompt: string): string {
+  let out = prompt.trim();
+  if (out.toLowerCase().startsWith(RGBA_PROMPT_PREFIX.toLowerCase())) {
+    out = out.slice(RGBA_PROMPT_PREFIX.length).trim();
+  }
+  if (out.toLowerCase().endsWith(RGBA_PROMPT_SUFFIX.toLowerCase())) {
+    out = out
+      .slice(0, out.length - RGBA_PROMPT_SUFFIX.length)
+      .trim()
+      .replace(/\.+$/, "");
+  }
+  return out;
+}
+
+const IMAGE_SIZE_OPTIONS = [
+  "1024x1024",
+  "512x512",
+  "768x768",
+  "1024x768",
+  "768x1024",
+  "auto",
+] as const;
+
+function ImageRequestEditor({
+  endpoint,
+  body,
+  onUpdate,
+  onAttachConditionImages,
+  onRemoveConditionImage,
+  onSubmit,
+}: {
+  endpoint: EndpointSpec;
+  body: Record<string, unknown>;
+  onUpdate: (
+    updater: (b: Record<string, unknown>) => Record<string, unknown>,
+  ) => void;
+  onAttachConditionImages: (files: FileList | File[]) => Promise<void>;
+  onRemoveConditionImage: (index: number) => void;
+  onSubmit: () => void;
+}) {
+  const isEditEndpoint = endpoint.id === "images-edits";
+  const prompt = typeof body.prompt === "string" ? body.prompt : "";
+  const negativePrompt =
+    typeof body.negative_prompt === "string" ? body.negative_prompt : "";
+  const size =
+    typeof body.width === "number" && typeof body.height === "number"
+      ? `${body.width}x${body.height}`
+      : typeof body.size === "string"
+        ? body.size
+        : isEditEndpoint
+          ? "auto"
+          : "1024x1024";
+  const steps =
+    typeof body.steps === "number"
+      ? body.steps
+      : typeof body.num_inference_steps === "number"
+        ? body.num_inference_steps
+        : 8;
+  const guidanceScale =
+    typeof body.guidance_scale === "number"
+      ? body.guidance_scale
+      : typeof body.true_cfg_scale === "number"
+        ? body.true_cfg_scale
+        : typeof body.cfg_scale === "number"
+          ? body.cfg_scale
+          : 1.0;
+  const seed = typeof body.seed === "number" ? body.seed : 42;
+  const transparentBg = body.background === "transparent" || body.rgba === true;
+  const conditionImages = extractConditionImages(body);
+
+  return (
+    <div className="pg-structured">
+      <div className="pg-params-bar">
+        <label className="pg-param">
+          <span className="eyebrow">SIZE</span>
+          <select
+            aria-label="Image size"
+            value={
+              IMAGE_SIZE_OPTIONS.includes(
+                size as (typeof IMAGE_SIZE_OPTIONS)[number],
+              )
+                ? size
+                : "1024x1024"
+            }
+            onChange={(e) => {
+              const nextSize = e.target.value;
+              onUpdate((curr) => {
+                const next: Record<string, unknown> = {
+                  ...curr,
+                  size: nextSize,
+                };
+                delete next.width;
+                delete next.height;
+                return next;
+              });
+            }}
+          >
+            {IMAGE_SIZE_OPTIONS.map((opt) => (
+              <option key={opt} value={opt}>
+                {opt}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="pg-param">
+          <span className="eyebrow">STEPS</span>
+          <input
+            aria-label="Inference steps"
+            type="number"
+            min={1}
+            max={100}
+            value={steps}
+            onChange={(e) => {
+              const val = Math.min(
+                100,
+                Math.max(1, Number(e.target.value) || 8),
+              );
+              onUpdate((curr) => {
+                const next: Record<string, unknown> = { ...curr, steps: val };
+                delete next.num_inference_steps;
+                return next;
+              });
+            }}
+          />
+        </label>
+
+        <label className="pg-param">
+          <span className="eyebrow">CFG SCALE</span>
+          <input
+            aria-label="Guidance scale"
+            type="number"
+            min={0}
+            max={30}
+            step={0.5}
+            value={guidanceScale}
+            onChange={(e) => {
+              const val = Math.min(
+                30,
+                Math.max(0, Number(e.target.value) || 0),
+              );
+              onUpdate((curr) => {
+                const next: Record<string, unknown> = {
+                  ...curr,
+                  guidance_scale: val,
+                };
+                delete next.true_cfg_scale;
+                delete next.cfg_scale;
+                return next;
+              });
+            }}
+          />
+        </label>
+
+        <label className="pg-param">
+          <span className="eyebrow">SEED</span>
+          <input
+            aria-label="Random seed"
+            type="number"
+            min={0}
+            value={seed}
+            onChange={(e) => {
+              const val = Math.max(0, Number(e.target.value) || 0);
+              onUpdate((curr) => ({ ...curr, seed: val }));
+            }}
+          />
+        </label>
+
+        <label className="pg-param pg-checkbox">
+          <input
+            aria-label="Transparent RGBA"
+            type="checkbox"
+            checked={transparentBg}
+            onChange={(e) => {
+              const checked = e.target.checked;
+              onUpdate((curr) => {
+                const currPrompt =
+                  typeof curr.prompt === "string" ? curr.prompt : "";
+                const nextPrompt =
+                  !isEditEndpoint && currPrompt.length > 0
+                    ? checked
+                      ? wrapRgbaTransparencyPrompt(currPrompt)
+                      : unwrapRgbaTransparencyPrompt(currPrompt)
+                    : currPrompt;
+                const next: Record<string, unknown> = {
+                  ...curr,
+                  prompt: nextPrompt,
+                  background: checked ? "transparent" : "opaque",
+                };
+                delete next.rgba;
+                return next;
+              });
+            }}
+          />
+          <span>Transparent RGBA</span>
+        </label>
+      </div>
+
+      {(isEditEndpoint || conditionImages.length > 0) && (
+        <div
+          className="pg-message-row"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => {
+            if (e.dataTransfer?.files?.length) {
+              e.preventDefault();
+              void onAttachConditionImages(e.dataTransfer.files);
+            }
+          }}
+        >
+          <div className="pg-message-meta">
+            <span className="eyebrow">
+              CONDITION IMAGES ({conditionImages.length}/
+              {MAX_IMAGES_PER_REQUEST})
+            </span>
+            <div className="pg-turn-actions">
+              {conditionImages.length < MAX_IMAGES_PER_REQUEST && (
+                <label className="pg-mini-btn pg-upload-label">
+                  + Condition Image
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    multiple
+                    aria-label="Attach condition image"
+                    className="pg-upload-input"
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        void onAttachConditionImages(e.target.files);
+                        e.target.value = "";
+                      }
+                    }}
+                  />
+                </label>
+              )}
+            </div>
+          </div>
+
+          {conditionImages.length > 0 && (
+            <div className="pg-turn-images">
+              {conditionImages.map((imgUrl, imgIdx) => (
+                <div key={imgIdx} className="pg-turn-thumb">
+                  <img
+                    src={imgUrl}
+                    alt={`Condition image ${imgIdx + 1}`}
+                    className="pg-turn-thumb-img"
+                  />
+                  <span className="pg-turn-thumb-meta mono">
+                    IMG #{imgIdx + 1}
+                  </span>
+                  <button
+                    type="button"
+                    className="pg-remove-btn pg-thumb-remove"
+                    aria-label={`Remove condition image ${imgIdx + 1}`}
+                    onClick={() => onRemoveConditionImage(imgIdx)}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="pg-messages-list">
+        <div
+          className="pg-message-row"
+          onPaste={(e) => {
+            if (isEditEndpoint && e.clipboardData?.files?.length) {
+              const imgFiles = Array.from(e.clipboardData.files).filter((f) =>
+                f.type.startsWith("image/"),
+              );
+              if (imgFiles.length > 0) {
+                e.preventDefault();
+                void onAttachConditionImages(imgFiles);
+              }
+            }
+          }}
+        >
+          <div className="pg-message-meta">
+            <span className="eyebrow">PROMPT</span>
+          </div>
+          <textarea
+            aria-label="Image prompt"
+            rows={4}
+            value={prompt}
+            placeholder="Describe the image to generate or edit…"
+            onChange={(e) => {
+              const val = e.target.value;
+              onUpdate((curr) => ({ ...curr, prompt: val }));
+            }}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                onSubmit();
+              }
+            }}
+          />
+        </div>
+
+        <div className="pg-message-row">
+          <div className="pg-message-meta">
+            <span className="eyebrow">
+              NEGATIVE PROMPT (OPTIONAL, CFG &gt; 1)
+            </span>
+          </div>
+          <textarea
+            aria-label="Negative prompt"
+            rows={2}
+            value={negativePrompt}
+            placeholder="Optional negative prompt when guidance_scale > 1.0…"
+            onChange={(e) => {
+              const val = e.target.value;
+              onUpdate((curr) => {
+                const next = { ...curr };
+                if (val.trim().length > 0) {
+                  next.negative_prompt = val;
+                } else {
+                  delete next.negative_prompt;
+                }
+                return next;
+              });
+            }}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                onSubmit();
+              }
+            }}
+          />
+        </div>
+      </div>
     </div>
   );
 }

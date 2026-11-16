@@ -407,6 +407,10 @@ size_t warp34_tp2_signal_bytes(void);
 int warp34_tp2_all_reduce_f16(const warp34_exec* ex, const void* local_in, void* out,
                            void* stage0, void* stage1,
                            void* sig0, void* sig1, int rank, int num_elems);
+int warp34_tp2_all_reduce_pipelined_f16(
+    const warp34_exec* ex, const void* local_in, void* out,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_elems,
+    uintptr_t dma_stream, uintptr_t ev_ready, const uintptr_t* ev_tx_done, int max_chunks);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* tap_dst_bf16,
@@ -920,6 +924,100 @@ int warp34_sampler_shard_fast_greedy_f16(
     const uint32_t* bitmask_u32, const warp34_sampler_sparse_entry* sparse_entries,
     float* out_local_vals, int32_t* out_local_ids, int num_rows,
     int local_vocab_size, int vocab_offset);
+int warp34_rms_norm_f16(const warp34_exec* ex, const void* x, const void* weight,
+                     void* out, const uint8_t* valid_token_mask,
+                     int num_tokens, int hidden_size, float eps);
+int warp34_fused_add_rms_norm_f16(const warp34_exec* ex, const void* x, void* residual,
+                               const void* weight, void* out,
+                               const uint8_t* valid_token_mask,
+                               int num_tokens, int hidden_size, float eps);
+int warp34_fused_qk_rmsnorm_rope_f16(
+    const warp34_exec* ex, const void* q_in, const void* k_in,
+    const void* q_norm_w, const void* k_norm_w, const int32_t* positions,
+    const uint8_t* valid_token_mask, void* q_out, void* k_out,
+    int num_tokens, int pos_plane_stride, int num_q_heads, int num_kv_heads,
+    int head_dim, int rotary_dim, int mrope_s0, int mrope_s1, int mrope_s2,
+    float rope_theta, float rms_eps, float weight_bias);
+int warp34_embedding_add_f16(
+    const warp34_exec* ex, void* dst_embeds, const void* src_visual_embeds,
+    const int32_t* token_indices, int num_visual_tokens, int dst_rows, int hidden_size);
+int warp34_mha_fa2_d128_f16(
+    const warp34_exec* ex, const void* q, const void* k, const void* v, void* out,
+    int b, int seqlen_q, int seqlen_k, int h, int h_k, int is_causal);
+
+int warp34_qwen_image_timestep_sinusoidal_f16(
+    const warp34_exec* ex, const float* timesteps, void* out,
+    int num_rows, int timestep_dim, float max_period, float time_factor);
+int warp34_qwen_image_silu_f16(
+    const warp34_exec* ex, const void* x, void* out, int64_t n);
+int warp34_qwen_image_build_joint_hidden_f16(
+    const warp34_exec* ex, const void* txt_hidden, const void* img_hidden,
+    const int32_t* row_map, void* out_joint,
+    int total_rows, int txt_rows, int img_rows, int hidden_size);
+int warp34_qwen_image_adaln_modulate_f16(
+    const warp34_exec* ex, const void* x, const void* modulation,
+    const uint8_t* target_token_mask, void* out,
+    int num_tokens, int hidden_size, int mod_stride, int scale_col_offset, float eps);
+int warp34_qwen_image_adaln_modulate_ex_f16(
+    const warp34_exec* ex, const void* x, const void* modulation,
+    const uint8_t* target_token_mask, void* out,
+    int num_tokens, int hidden_size, int mod_stride, int scale_col_offset, float eps, int apply_had64);
+int warp34_qwen_image_gated_residual_f16(
+    const warp34_exec* ex, void* residual, const void* branch_out,
+    const void* modulation, const uint8_t* target_token_mask,
+    int num_tokens, int hidden_size, int mod_stride, int gate_col_offset);
+int warp34_qwen_image_fused_gated_residual_adaln_f16(
+    const warp34_exec* ex, void* residual, const void* branch_out,
+    const void* gate_modulation, const uint8_t* gate_target_mask,
+    int gate_mod_stride, int gate_col_offset,
+    const void* scale_modulation, const uint8_t* scale_target_mask,
+    int scale_mod_stride, int scale_col_offset,
+    void* norm_out, int num_tokens, int hidden_size, float eps, int apply_had64);
+int warp34_qwen_image_euler_cfg_step_f16(
+    const warp34_exec* ex, void* sample_f16, const void* cond_pred_f16,
+    const void* uncond_pred_f16, float true_cfg_scale, float dt, int64_t n_elems);
+int warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
+    const warp34_exec* ex, const void* q_in, const void* k_in,
+    const void* norm_q_w, const void* norm_k_w,
+    const float* cos_table, const float* sin_table,
+    void* q_out, void* k_out, void* cache_k_out,
+    int num_tokens, int num_heads, int cache_write_len, float eps);
+
+int warp34_cublas_conv_gemm_f16(
+    uintptr_t handle, const void* col, const void* weight, void* out,
+    int spatial, int out_c, int k_dim, int ld_out);
+int warp34_cublas_vae_qk_f16_f32(
+    uintptr_t handle, const void* q_cs, const void* k_cs, float* scores_f32,
+    int spatial, int channels, float scale);
+int warp34_cublas_vae_sv_f16(
+    uintptr_t handle, const void* probs_f16, const void* v_cs, void* out_cs,
+    int spatial, int channels);
+
+int warp34_qwen_image_vae_rms_norm_f16(
+    const warp34_exec* ex, const void* x, const void* gamma, void* out,
+    int channels, int spatial, int apply_silu);
+int warp34_qwen_image_vae_im2col_f16(
+    const warp34_exec* ex, const void* x, void* col,
+    int in_c, int h_in, int w_in, int k_h, int k_w,
+    int pad_top, int pad_left, int stride_h, int stride_w,
+    int oh_start, int chunk_h, int w_out);
+int warp34_qwen_image_vae_bias_residual_f16(
+    const warp34_exec* ex, const void* x, const void* bias,
+    const void* residual, void* out, int channels, int spatial, int clamp_pm1);
+int warp34_qwen_image_vae_upsample2d_nearest2x_f16(
+    const warp34_exec* ex, const void* x, void* out,
+    int channels, int h_in, int w_in);
+int warp34_qwen_image_vae_avg_down_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s);
+int warp34_qwen_image_vae_dup_up_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s);
+int warp34_qwen_image_vae_dup_up_scaled_f16(
+    const warp34_exec* ex, const void* x, const void* residual, void* out,
+    int in_c, int out_c, int h_in, int w_in, int factor_t, int factor_s, float x_scale);
+int warp34_qwen_image_vae_softmax_f32_to_f16(
+    const warp34_exec* ex, const float* scores, void* probs, int seq_len);
 
 #ifdef __cplusplus
 }

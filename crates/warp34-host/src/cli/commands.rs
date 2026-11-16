@@ -67,8 +67,292 @@ pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         "profile-diff" => run_profile_diff(options),
         "serve" => run_serve(options, policy, spec_config),
         "chat" => run_chat(options, policy, spec_config),
+        "image" => run_image(options),
+        "bench-image" => run_bench_image(options),
         other => Err(format!("unknown subcommand: {other}")),
     }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn is_qwen_image_model(resolved_model: &str) -> bool {
+    matches!(
+        crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)),
+        Ok(crate::loader::ModelKind::Image)
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_image_model_dir(
+    model: &str,
+    resolved_model: &str,
+    subcommand: &str,
+) -> Result<(), String> {
+    match crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)) {
+        Ok(crate::loader::ModelKind::Image) => Ok(()),
+        Ok(other) => Err(format!(
+            "model '{model}' is a {} model; use 'warp34 generate', 'warp34 chat', or 'warp34 bench', or pass a QwenImage21Pipeline model to 'warp34 {subcommand}'",
+            other.as_str()
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_llm_model_dir(
+    model: &str,
+    resolved_model: &str,
+    subcommand: &str,
+) -> Result<(), String> {
+    match crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)) {
+        Ok(crate::loader::ModelKind::Llm | crate::loader::ModelKind::Decision) => Ok(()),
+        Ok(crate::loader::ModelKind::Image) => Err(format!(
+            "model '{model}' is an image generation pipeline (ModelKind::Image); use 'warp34 image', 'warp34 bench-image', or 'warp34 serve' instead of 'warp34 {subcommand}'"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn load_cli_condition_images(
+    image_urls: &[String],
+    allow_remote_images: bool,
+) -> Result<Vec<crate::qwen_image::QwenImage21ConditionImage>, String> {
+    if image_urls.len() > 4 {
+        return Err("at most 4 --image inputs are supported".into());
+    }
+    let mut out = Vec::with_capacity(image_urls.len());
+    for spec in image_urls {
+        let trimmed = spec.trim();
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("data:")
+        {
+            out.push(crate::server::load_condition_image_str(
+                trimmed,
+                allow_remote_images,
+            )?);
+        } else {
+            let path_str = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+            let meta = std::fs::metadata(path_str)
+                .map_err(|e| format!("failed to stat image '{path_str}': {e}"))?;
+            if meta.len() > 64 * 1024 * 1024 {
+                return Err(format!(
+                    "image '{path_str}' exceeds 64 MiB CLI limit ({} bytes)",
+                    meta.len()
+                ));
+            }
+            let bytes = std::fs::read(path_str)
+                .map_err(|e| format!("failed to read image '{path_str}': {e}"))?;
+            out.push(crate::server::decode_condition_image_bytes(&bytes)?);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        tp_auto,
+        tp_explicit,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        use_cuda_graph,
+        out_json,
+        ..
+    } = options;
+    ensure_image_model_dir(&model, &resolved_model, "image")?;
+    if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+        return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+    }
+    let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        requested_tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
+    let effective_prompt = if rgba_output && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt: effective_prompt,
+        negative_prompt: effective_neg,
+        condition_images,
+        width,
+        height,
+        output_resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output,
+        use_cuda_graph,
+    };
+    let res = engine.generate(&req).map_err(|e| e.to_string())?;
+    let out_path = out_json.unwrap_or_else(|| "out.png".to_string());
+    std::fs::write(&out_path, &res.png_bytes)
+        .map_err(|e| format!("failed to write output PNG '{out_path}': {e}"))?;
+    println!(
+        "[warp34 image] model={model} tp={} size={}x{}x{} steps={steps} cfg={cfg_scale:.1} seed={seed} cond_ms={:.2} vae_enc_ms={:.2} step0_ms={:.2} cached_ms={:.2} vae_dec_ms={:.2} total_ms={:.2} out={out_path}",
+        engine.tp_size(),
+        res.width,
+        res.height,
+        res.channels,
+        res.timings.condition_encode_ms,
+        res.timings.vae_encode_ms,
+        res.timings.denoise_step0_ms,
+        res.timings.denoise_cached_ms,
+        res.timings.vae_decode_ms,
+        res.timings.total_ms,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        tp_auto,
+        tp_explicit,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        use_cuda_graph,
+        prof_rounds,
+        out_json,
+        ..
+    } = options;
+    ensure_image_model_dir(&model, &resolved_model, "bench-image")?;
+    if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+        return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+    }
+    let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        requested_tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
+    let rounds = prof_rounds.max(1);
+    let effective_prompt = if rgba_output && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt: effective_prompt,
+        negative_prompt: effective_neg,
+        condition_images,
+        width,
+        height,
+        output_resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output,
+        use_cuda_graph,
+    };
+    // Warmup pass
+    let _ = engine.generate(&req).map_err(|e| e.to_string())?;
+
+    let mut cond_ms = 0.0;
+    let mut vae_enc_ms = 0.0;
+    let mut step0_ms = 0.0;
+    let mut cached_ms = 0.0;
+    let mut vae_dec_ms = 0.0;
+    let mut total_ms = 0.0;
+    let mut out_w = 0u32;
+    let mut out_h = 0u32;
+    let mut out_c = 0u8;
+    for _ in 0..rounds {
+        let r = engine.generate(&req).map_err(|e| e.to_string())?;
+        cond_ms += r.timings.condition_encode_ms;
+        vae_enc_ms += r.timings.vae_encode_ms;
+        step0_ms += r.timings.denoise_step0_ms;
+        cached_ms += r.timings.denoise_cached_ms;
+        vae_dec_ms += r.timings.vae_decode_ms;
+        total_ms += r.timings.total_ms;
+        out_w = r.width;
+        out_h = r.height;
+        out_c = r.channels;
+    }
+    let inv = 1.0 / (rounds as f64);
+    cond_ms *= inv;
+    vae_enc_ms *= inv;
+    step0_ms *= inv;
+    cached_ms *= inv;
+    vae_dec_ms *= inv;
+    total_ms *= inv;
+    let per_cached_step_ms = if steps > 1 {
+        cached_ms / ((steps - 1) as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "[warp34 bench-image] model={model} tp={} size={}x{}x{} steps={steps} rounds={rounds} cond_ms={cond_ms:.2} vae_enc_ms={vae_enc_ms:.2} step0_ms={step0_ms:.2} cached_step_ms={per_cached_step_ms:.2} cached_total_ms={cached_ms:.2} vae_dec_ms={vae_dec_ms:.2} total_ms={total_ms:.2} img_per_s={:.3}",
+        engine.tp_size(),
+        out_w,
+        out_h,
+        out_c,
+        1000.0 / total_ms,
+    );
+    if let Some(path) = out_json {
+        let report = serde_json::json!({
+            "model": model,
+            "tp": engine.tp_size(),
+            "width": out_w,
+            "height": out_h,
+            "channels": out_c,
+            "steps": steps,
+            "rounds": rounds,
+            "condition_encode_ms": cond_ms,
+            "vae_encode_ms": vae_enc_ms,
+            "denoise_step0_ms": step0_ms,
+            "denoise_cached_step_ms": per_cached_step_ms,
+            "denoise_cached_total_ms": cached_ms,
+            "vae_decode_ms": vae_dec_ms,
+            "total_ms": total_ms,
+            "images_per_sec": 1000.0 / total_ms,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())
+            .map_err(|e| format!("failed to write benchmark JSON '{path}': {e}"))?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(feature = "cuda")]
@@ -77,6 +361,9 @@ pub(crate) fn run_generate(
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if is_qwen_image_model(&options.resolved_model) {
+        return run_image(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,
@@ -197,6 +484,9 @@ pub(crate) fn run_bench(
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if is_qwen_image_model(&options.resolved_model) {
+        return run_bench_image(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,
@@ -661,6 +951,8 @@ pub(crate) fn run_serve(
         serve,
         resolved_model,
         tp,
+        tp_auto,
+        tp_explicit,
         host,
         port,
         allow_remote_images,
@@ -686,6 +978,43 @@ pub(crate) fn run_serve(
         None => "none".to_string(),
     };
     let bind_addr = format!("{host}:{port}");
+    if is_qwen_image_model(&resolved_model) {
+        if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+            return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+        }
+        let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
+        println!(
+            "[warp34 serve] loading QwenImage21 model={model} tp={} for http://{bind_addr}",
+            if requested_tp == 0 {
+                "auto".to_string()
+            } else {
+                requested_tp.to_string()
+            }
+        );
+        let worker_model = resolved_model;
+        let state = crate::server::QwenImage21ServerState::from_loader_with_options(
+            model,
+            allow_remote_images,
+            use_cuda_graph,
+            serve.options,
+            move || {
+                crate::qwen_image::QwenImage21PipelineEngine::load(
+                    std::path::Path::new(&worker_model),
+                    requested_tp,
+                )
+                .map_err(|e| e.to_string())
+            },
+        )?;
+        println!(
+            "[warp34 serve] QwenImage21 api_auth={} tp={} default_steps={} max_num_seqs={max_num_seqs} (dashboard/metrics/health are public)",
+            if auth_enabled { "enabled" } else { "disabled" },
+            state.worker.tp_size,
+            state.worker.default_steps,
+        );
+        crate::server::run_blocking_image_server(&bind_addr, state)
+            .map_err(|e| format!("server error: {e}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     println!(
         "[warp34 serve] loading model={model} tp={tp} kv={kv_format} speculative={spec_label} for http://{bind_addr}"
     );
@@ -750,6 +1079,7 @@ pub(crate) fn run_chat(
         active_lora,
         ..
     } = options;
+    ensure_llm_model_dir(&model, &resolved_model, "chat")?;
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,

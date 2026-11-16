@@ -620,3 +620,83 @@ fn gated_access_errors_are_actionable_without_echoing_server_body() {
     );
     assert!(!message.contains("test-secret") && !message.contains("private-body"));
 }
+
+#[test]
+fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
+    let mut files = fixture_files();
+    files.remove("config.json");
+    files.remove("model.safetensors");
+    files.remove("tokenizer.json");
+    files.insert(
+        "model_index.json".into(),
+        serde_json::to_vec(&json!({"_class_name": "QwenImage21Pipeline"})).unwrap(),
+    );
+    files.insert("tokenizer/tokenizer.json".into(), b"{}".to_vec());
+    files.insert("scheduler/scheduler_config.json".into(), b"{}".to_vec());
+    files.insert(
+        "text_encoder/config.json".into(),
+        serde_json::to_vec(&json!({
+            "model_type": "qwen3_vl",
+            "text_config": { "hidden_size": 256 }
+        }))
+        .unwrap(),
+    );
+    files.insert(
+        "text_encoder/model.safetensors.index.json".into(),
+        br#"{"weight_map":{"w":"shards/model-00001-of-00001.safetensors"}}"#.to_vec(),
+    );
+    files.insert(
+        "text_encoder/shards/model-00001-of-00001.safetensors".into(),
+        weights(),
+    );
+    files.insert(
+        "transformer/config.json".into(),
+        serde_json::to_vec(&json!({
+            "_class_name": "QwenImage21Transformer2DModel",
+            "in_channels": 4,
+            "out_channels": 4,
+            "context_in_dim": 256
+        }))
+        .unwrap(),
+    );
+    files.insert(
+        "transformer/diffusion_pytorch_model.safetensors".into(),
+        weights(),
+    );
+    files.insert(
+        "vae/config.json".into(),
+        serde_json::to_vec(&json!({
+            "_class_name": "AutoencoderKLQwenImage21",
+            "z_dim": 4
+        }))
+        .unwrap(),
+    );
+    files.insert("vae/diffusion_pytorch_model.safetensors".into(), weights());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = HubServer::new(files);
+    let s = settings(tmp.path(), &[("HF_ENDPOINT", &server.endpoint)]);
+    let dir = resolve_remote("test/model", &HubOptions::default(), ModelRole::Target, &s).unwrap();
+    assert!(dir.join("model_index.json").exists());
+    assert!(dir.join("tokenizer/tokenizer.json").exists());
+    assert!(
+        dir.join("text_encoder/shards/model-00001-of-00001.safetensors")
+            .exists()
+    );
+    assert!(
+        dir.join("transformer/diffusion_pytorch_model.safetensors")
+            .exists()
+    );
+    assert!(dir.join("vae/diffusion_pytorch_model.safetensors").exists());
+
+    // Verify offline discovery without a warp34 manifest also discovers nested component shards.
+    let commit = dir.file_name().unwrap().to_str().unwrap().to_string();
+    let repo_dir = dir.parent().unwrap().parent().unwrap();
+    fs::remove_file(manifest_path(repo_dir, &commit)).unwrap();
+    let offline_opts = HubOptions {
+        offline: true,
+        ..HubOptions::default()
+    };
+    let offline_dir = resolve_remote("test/model", &offline_opts, ModelRole::Target, &s).unwrap();
+    assert_eq!(offline_dir, dir);
+}

@@ -145,6 +145,118 @@ pub enum LayerKind {
     FullAttention,
 }
 
+/// High-level checkpoint family used to select the execution engine, CUDA kernel warmup plan,
+/// CLI subcommand compatibility, and enabled HTTP REST routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// Autoregressive / multimodal language model (`Qwen3.5` / `Qwen3.6` / `Qwen3.8` / `Qwen3-VL`).
+    Llm,
+    /// Decision / scoring model (`decision_config.json`, `readout.safetensors`, or noncausal decision config).
+    Decision,
+    /// Diffusion / flow-matching image generation & editing pipeline (`model_index.json` / `QwenImage21Pipeline`).
+    Image,
+}
+
+impl ModelKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Decision => "decision",
+            Self::Image => "image",
+        }
+    }
+
+    pub const fn is_image(self) -> bool {
+        matches!(self, Self::Image)
+    }
+
+    pub const fn is_llm_family(self) -> bool {
+        matches!(self, Self::Llm | Self::Decision)
+    }
+
+    pub const fn supports_chat_and_completions(self) -> bool {
+        matches!(self, Self::Llm | Self::Decision)
+    }
+
+    pub const fn supports_images_api(self) -> bool {
+        matches!(self, Self::Image)
+    }
+
+    /// Detects the checkpoint family from directory metadata (`model_index.json` vs `config.json`
+    /// and `decision_config.json` / `readout.safetensors`) without loading weights or initializing CUDA.
+    pub fn detect_dir(dir: &Path) -> io::Result<Self> {
+        let model_index = dir.join("model_index.json");
+        let config_json = dir.join("config.json");
+        if model_index.is_file() && !config_json.is_file() {
+            let text = fs::read_to_string(&model_index)?;
+            let root: Json = serde_json::from_str(&text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad model_index.json: {e}"),
+                )
+            })?;
+            let cls = root
+                .get("_class_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if cls == "QwenImage21Pipeline" {
+                return Ok(Self::Image);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported pipeline _class_name='{}' (expected 'QwenImage21Pipeline')",
+                    sanitize_diag(cls)
+                ),
+            ));
+        }
+        if config_json.is_file() {
+            if dir.join("decision_config.json").is_file()
+                || dir.join("readout.safetensors").is_file()
+            {
+                return Ok(Self::Decision);
+            }
+            let text = fs::read_to_string(&config_json)?;
+            let root: Json = serde_json::from_str(&text).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}"))
+            })?;
+            let has_noncausal_layer = root
+                .get("text_config")
+                .unwrap_or(&root)
+                .get("layer_types")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|x| x.as_str() == Some("noncausal_full_attention"))
+                });
+            let is_decision = has_noncausal_layer
+                || root
+                    .get("noncausal_full_attention")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || root
+                    .get("prefix_bidir")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || root.get("decision_type").is_some()
+                || root.get("decision_config").is_some();
+            return Ok(if is_decision {
+                Self::Decision
+            } else {
+                Self::Llm
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "model directory '{}' has neither config.json nor model_index.json",
+                dir.display()
+            ),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DecisionConfigMeta {
     pub decision_type: Option<String>,
@@ -469,6 +581,7 @@ impl ModelConfig {
         Self::from_json_with_policy(root, /* backbone_sliding_window_fatal = */ false)
     }
 
+    #[allow(clippy::cognitive_complexity)]
     fn from_json_with_policy(root: &Json, backbone_sliding_window_fatal: bool) -> io::Result<Self> {
         let tc = root.get("text_config").unwrap_or(root);
         let is_truthy = |v: &serde_json::Value| -> bool {
@@ -610,29 +723,44 @@ impl ModelConfig {
                 ),
             ));
         }
+        let is_qwen3_vl = matches!(model_type.as_str(), "qwen3_vl" | "qwen3_vl_text")
+            || architectures
+                .iter()
+                .any(|a| a == "Qwen3VLForConditionalGeneration");
         let rope_theta = rope_params
             .and_then(|rp| rp.get("rope_theta"))
             .or_else(|| tc.get("rope_theta"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(10_000_000.0) as f32;
-        let partial_rotary_factor = rope_params
-            .and_then(|rp| rp.get("partial_rotary_factor"))
-            .or_else(|| tc.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.25);
-        let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
-        let mut mrope_section = [11usize, 11, 10];
+            .unwrap_or(if is_qwen3_vl {
+                5_000_000.0
+            } else {
+                10_000_000.0
+            }) as f32;
+        let mut mrope_section = if is_qwen3_vl {
+            [24usize, 20, 20]
+        } else {
+            [11usize, 11, 10]
+        };
         if let Some(arr) = rope_params
             .and_then(|rp| rp.get("mrope_section"))
+            .or_else(|| rope_scaling.and_then(|rs| rs.get("mrope_section")))
+            .or_else(|| tc.get("mrope_section"))
             .and_then(|v| v.as_array())
             && arr.len() == 3
         {
             mrope_section = [
-                arr[0].as_u64().unwrap_or(11) as usize,
-                arr[1].as_u64().unwrap_or(11) as usize,
-                arr[2].as_u64().unwrap_or(10) as usize,
+                arr[0].as_u64().unwrap_or(mrope_section[0] as u64) as usize,
+                arr[1].as_u64().unwrap_or(mrope_section[1] as u64) as usize,
+                arr[2].as_u64().unwrap_or(mrope_section[2] as u64) as usize,
             ];
         }
+        let default_partial_rotary = if is_qwen3_vl { 1.0 } else { 0.25 };
+        let partial_rotary_factor = rope_params
+            .and_then(|rp| rp.get("partial_rotary_factor"))
+            .or_else(|| tc.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default_partial_rotary);
+        let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
 
         let tie_word_embeddings = tc
             .get("tie_word_embeddings")
@@ -653,7 +781,7 @@ impl ModelConfig {
         let attn_output_gate = tc
             .get("attn_output_gate")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(!is_qwen3_vl);
 
         let linear_num_key_heads = tc
             .get("linear_num_key_heads")
@@ -691,6 +819,8 @@ impl ModelConfig {
                     _ => LayerKind::FullAttention,
                 })
                 .collect()
+        } else if is_qwen3_vl {
+            vec![LayerKind::FullAttention; num_hidden_layers]
         } else {
             let interval = tc
                 .get("full_attention_interval")
@@ -698,7 +828,7 @@ impl ModelConfig {
                 .unwrap_or(4) as usize;
             (0..num_hidden_layers)
                 .map(|i| {
-                    if interval > 1 && (i + 1) % interval == 0 {
+                    if interval == 1 || (interval > 1 && (i + 1) % interval == 0) {
                         LayerKind::FullAttention
                     } else {
                         LayerKind::LinearAttention
@@ -1669,6 +1799,14 @@ impl ModelConfig {
             .iter()
             .filter(|&&k| k == LayerKind::LinearAttention)
             .count()
+    }
+
+    pub fn is_qwen3_vl(&self) -> bool {
+        matches!(self.model_type.as_str(), "qwen3_vl" | "qwen3_vl_text")
+            || self
+                .architectures
+                .iter()
+                .any(|a| a == "Qwen3VLForConditionalGeneration")
     }
 
     pub fn is_qwen4_exp(&self) -> bool {

@@ -383,6 +383,24 @@ __global__ void embedding_splice_f16_kernel(
     }
 }
 
+__global__ void embedding_add_f16_kernel(
+    __half* __restrict__ dst_embeds,
+    const __half* __restrict__ src_visual_embeds,
+    const int32_t* __restrict__ token_indices,
+    int num_visual_tokens,
+    int dst_rows,
+    int hidden_size) {
+    const int v_idx = blockIdx.x;
+    if (v_idx >= num_visual_tokens) return;
+    const int tok = token_indices[v_idx];
+    if (tok < 0 || tok >= dst_rows) return;
+    __half* dst = dst_embeds + (size_t)tok * hidden_size;
+    const __half* src = src_visual_embeds + (size_t)v_idx * hidden_size;
+    for (int c = threadIdx.x; c < hidden_size; c += blockDim.x) {
+        dst[c] = __hadd(dst[c], src[c]);
+    }
+}
+
 } // namespace warp34_vision
 
 extern "C" int warp34_vision_bias_add_f16(
@@ -498,5 +516,23 @@ extern "C" int warp34_embedding_splice_f16(
     if (num_visual_tokens == 0) return 0;
     warp34_vision::embedding_splice_f16_kernel<<<(unsigned)num_visual_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
         (__half*)dst_embeds, (const __half*)src_visual_embeds, token_indices, num_visual_tokens, hidden_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_embedding_add_f16(
+    const warp34_exec* ex,
+    void* dst_embeds,
+    const void* src_visual_embeds,
+    const int32_t* token_indices,
+    int num_visual_tokens,
+    int dst_rows,
+    int hidden_size) {
+    if (ex == nullptr || dst_embeds == nullptr || src_visual_embeds == nullptr ||
+        token_indices == nullptr || num_visual_tokens < 0 || dst_rows < num_visual_tokens || hidden_size <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_visual_tokens == 0) return 0;
+    warp34_vision::embedding_add_f16_kernel<<<(unsigned)num_visual_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+        (__half*)dst_embeds, (const __half*)src_visual_embeds, token_indices, num_visual_tokens, dst_rows, hidden_size);
     return (int)cudaGetLastError();
 }

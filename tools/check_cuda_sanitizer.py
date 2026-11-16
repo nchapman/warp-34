@@ -232,6 +232,11 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         target="vision_rounding",
         test_name="vision_tanh_gelu_matches_native_activation",
     ),
+    SanitizerCase(
+        subsystem="qwen_image",
+        target="lib",
+        test_name="qwen_image::tests::gpu_qwen_image_vae_encode_decode_and_tiling_match_oracle",
+    ),
     # Multi-GPU TP=2 / TP=4 cross-device pinned-sysmem / P2P collective kernels.
     # Note: `compute-sanitizer` serializes kernels sharing a physical GPU, so N-rank
     # cooperative spin-barriers require N distinct physical GPUs (`min_gpus=N`).
@@ -251,6 +256,18 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         subsystem="collectives_tp2",
         target="collectives_and_gdn_wy",
         test_name="test_tp2_real_devices_all_gather_topk_and_hc_combine_2560",
+        min_gpus=2,
+    ),
+    SanitizerCase(
+        subsystem="qwen_image_tp2",
+        target="lib",
+        test_name="qwen_image::tests::gpu_qwen_image_transformer_extract_cached_graph_and_tp2_match_oracle",
+        min_gpus=2,
+    ),
+    SanitizerCase(
+        subsystem="qwen_image_tp2",
+        target="lib",
+        test_name="qwen_image::tests::gpu_qwen_image_gated_residual_over_65535_rows_and_pipelined_tp2_allreduce",
         min_gpus=2,
     ),
 )

@@ -460,6 +460,7 @@ pub(crate) fn run_greedy_diff(
         ..
     } = options;
     let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
+    ensure_llm_model_dir(&model, &resolved_model, "greedy-diff")?;
     if !image_urls.is_empty() && (spec_config.is_some() || verify_lossless) {
         return Err(
             "greedy-diff with --image does not support --speculative or --verify-lossless".into(),
@@ -665,11 +666,201 @@ pub(crate) fn run_greedy_diff(
 }
 
 #[cfg(feature = "cuda")]
+fn compute_image_psnr(a: &[u8], b: &[u8], channels: u8) -> Result<(f64, u8), String> {
+    if a.len() != b.len() || a.is_empty() {
+        return Err(format!(
+            "image pixel length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        ));
+    }
+    let mut sum_sq = 0.0f64;
+    let mut max_diff = 0u8;
+    if channels == 4 && a.len().is_multiple_of(4) {
+        for (px_a, px_b) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
+            let aa = (px_a[3] as f64) / 255.0;
+            let ab = (px_b[3] as f64) / 255.0;
+            for c in 0..3 {
+                let va = (px_a[c] as f64) * aa;
+                let vb = (px_b[c] as f64) * ab;
+                let d = (va - vb).abs();
+                max_diff = max_diff.max(d.round() as u8);
+                sum_sq += d * d;
+            }
+            let da = px_a[3].abs_diff(px_b[3]);
+            max_diff = max_diff.max(da);
+            let daf = da as f64;
+            sum_sq += daf * daf;
+        }
+    } else {
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            let diff = x.abs_diff(y);
+            max_diff = max_diff.max(diff);
+            let d = diff as f64;
+            sum_sq += d * d;
+        }
+    }
+    let mse = sum_sq / (a.len() as f64);
+    let psnr = if mse <= 1e-12 {
+        99.99
+    } else {
+        10.0 * ((255.0 * 255.0) / mse).log10()
+    };
+    Ok((psnr, max_diff))
+}
+
+#[cfg(feature = "cuda")]
+fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String> {
+    let CudaCliOptions {
+        model,
+        resolved_model,
+        tp,
+        tp_auto,
+        tp_explicit,
+        prompt,
+        negative_prompt,
+        image_urls,
+        allow_remote_images,
+        image_width,
+        image_height,
+        output_resolution,
+        image_steps,
+        cfg_scale,
+        seed,
+        rgba_output,
+        use_cuda_graph,
+        compare_tp2,
+        golden_path,
+        ..
+    } = options;
+    let condition_images =
+        crate::cli::commands::load_cli_condition_images(&image_urls, allow_remote_images)?;
+    let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
+    let golden_loaded = if let Some(ref golden) = golden_path {
+        let bytes = std::fs::read(golden)
+            .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
+        let dyn_img = image::load_from_memory(&bytes)
+            .map_err(|e| format!("failed to decode golden image '{golden}': {e}"))?;
+        let rgba8 = dyn_img.to_rgba8().into_raw();
+        let has_transparent_alpha =
+            dyn_img.color().has_alpha() && rgba8.as_chunks::<4>().0.iter().any(|px| px[3] < 255);
+        let use_rgba = rgba_output || has_transparent_alpha;
+        let (gw, gh) = (dyn_img.width(), dyn_img.height());
+        let pixels = if use_rgba {
+            rgba8
+        } else {
+            dyn_img.to_rgb8().into_raw()
+        };
+        Some((gw, gh, use_rgba, pixels))
+    } else {
+        None
+    };
+    let want_rgba = rgba_output || golden_loaded.as_ref().is_some_and(|(_, _, a, _)| *a);
+    let effective_tp = if compare_tp2 {
+        1
+    } else if !tp_explicit || tp_auto {
+        0
+    } else {
+        tp
+    };
+    let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
+        std::path::Path::new(&resolved_model),
+        effective_tp,
+    )
+    .map_err(|e| e.to_string())?;
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
+    let effective_prompt = if want_rgba && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
+    let effective_neg = negative_prompt.or_else(|| (cfg_scale > 1.0).then(String::new));
+    let req = crate::qwen_image::QwenImage21GenerationRequest {
+        prompt: effective_prompt,
+        negative_prompt: effective_neg,
+        condition_images,
+        width,
+        height,
+        output_resolution,
+        num_inference_steps: Some(steps),
+        sigmas: None,
+        true_cfg_scale: cfg_scale,
+        seed,
+        initial_latents_chw_f16: None,
+        rgba_output: want_rgba,
+        use_cuda_graph,
+    };
+    let res = engine.generate(&req).map_err(|e| e.to_string())?;
+    if compare_tp2 {
+        drop(engine);
+        let mut engine_tp2 = crate::qwen_image::QwenImage21PipelineEngine::load(
+            std::path::Path::new(&resolved_model),
+            2,
+        )
+        .map_err(|e| e.to_string())?;
+        let res_tp2 = engine_tp2.generate(&req).map_err(|e| e.to_string())?;
+        let (psnr, max_diff) =
+            compute_image_psnr(&res.pixels_u8, &res_tp2.pixels_u8, res.channels)?;
+        println!(
+            "[warp34 dump-diff tp1-vs-tp2] model={model} size={}x{}x{} steps={steps} psnr={psnr:.2}dB max_px_diff={max_diff} tp1_ms={:.2} tp2_ms={:.2}",
+            res.width, res.height, res.channels, res.timings.total_ms, res_tp2.timings.total_ms,
+        );
+        if psnr < 35.0 {
+            return Err(format!(
+                "dump-diff tp1-vs-tp2 PSNR {psnr:.2} dB below 35.0 dB threshold"
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let (Some(golden), Some((gw, gh, _, ref_pixels))) = (&golden_path, &golden_loaded) {
+        if res.width != *gw || res.height != *gh {
+            return Err(format!(
+                "dump-diff output dimensions {}x{} do not match golden '{golden}' dimensions {gw}x{gh}",
+                res.width, res.height
+            ));
+        }
+        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, ref_pixels, res.channels)?;
+        println!(
+            "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} golden={golden} psnr={psnr:.2}dB max_px_diff={max_diff} total_ms={:.2}",
+            engine.tp_size(),
+            res.width,
+            res.height,
+            res.channels,
+            res.timings.total_ms,
+        );
+        let min_psnr = if engine.cfg.transformer.quant != crate::loader::QuantScheme::Unquantized {
+            20.0
+        } else {
+            28.0
+        };
+        if psnr < min_psnr {
+            return Err(format!(
+                "dump-diff PSNR {psnr:.2} dB below {min_psnr:.1} dB threshold against '{golden}'"
+            ));
+        }
+    } else {
+        println!(
+            "[warp34 dump-diff] model={model} tp={} size={}x{}x{} steps={steps} total_ms={:.2}",
+            engine.tp_size(),
+            res.width,
+            res.height,
+            res.channels,
+            res.timings.total_ms,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_dump_diff(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
+    if crate::cli::commands::is_qwen_image_model(&options.resolved_model) {
+        return run_qwen_image_dump_diff(options);
+    }
     let CudaCliOptions {
         model,
         resolved_model,

@@ -934,3 +934,357 @@ fn positional_model_industry_aliases_and_sampling_validation() {
         );
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn qwen_image_cli_options_and_validation() {
+    // Qwen-Image CLI subcommands (`image`, `bench-image`) support positional <model>,
+    // `--size <WxH>`, `-o` / `--output`, `--num-inference-steps`, `--guidance-scale`,
+    // `--transparent`, and unified `--seed`.
+    let img_opts = parse(&[
+        "image",
+        "Qwen/Qwen-Image-2.1",
+        "-p",
+        "A translucent glass chess piece",
+        "--neg-prompt",
+        "blurry",
+        "--size",
+        "768x512",
+        "--num-inference-steps",
+        "28",
+        "--guidance-scale",
+        "4.0",
+        "--seed",
+        "777",
+        "--transparent",
+        "-o",
+        "/tmp/chess.png",
+    ]);
+    assert_eq!(img_opts.model, "Qwen/Qwen-Image-2.1");
+    assert_eq!(img_opts.tp, 2);
+    assert_eq!(img_opts.image_width, Some(768));
+    assert_eq!(img_opts.image_height, Some(512));
+    assert_eq!(img_opts.image_steps, Some(28));
+    assert_eq!(img_opts.cfg_scale, Some(4.0));
+    assert_eq!(img_opts.seed, 777);
+    assert_eq!(img_opts.sampling.seed, Some(777));
+    assert!(img_opts.rgba_output);
+    assert_eq!(img_opts.out_json.as_deref(), Some("/tmp/chess.png"));
+    assert_eq!(img_opts.negative_prompt.as_deref(), Some("blurry"));
+    assert!(validate_cuda_options(&img_opts, "image").is_ok());
+
+    for bad_img in [
+        &["image", "--size", "512"][..],
+        &["image", "--width", "32"][..],
+        &["image", "--height", "4096"][..],
+        &["image", "--resolution", "16"][..],
+        &["image", "--steps", "0"][..],
+        &["image", "--steps", "200"][..],
+        &["image", "--cfg-scale", "-1.0"][..],
+        &["image", "--tp", "4"][..],
+        &["bench-image", "--tp", "4"][..],
+        &["serve", "--size", "512x512"][..],
+        &["serve", "--steps", "8"][..],
+        &["serve", "--rgba"][..],
+        &["serve", "-o", "out.png"][..],
+    ] {
+        assert!(
+            prepare_cuda_cli(&args(bad_img), |_, _, _| {
+                panic!("invalid image CLI flag must fail before download: {bad_img:?}")
+            })
+            .is_err(),
+            "{bad_img:?}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn model_kind_detection_and_cli_subcommand_guards() {
+    use crate::loader::ModelKind;
+
+    // 1. Image pipeline directory -> ModelKind::Image
+    let img_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        img_dir.path().join("model_index.json"),
+        r#"{"_class_name": "QwenImage21Pipeline"}"#,
+    )
+    .unwrap();
+    let img_path = img_dir.path().to_str().unwrap();
+    assert_eq!(
+        ModelKind::detect_dir(img_dir.path()).unwrap(),
+        ModelKind::Image
+    );
+    assert_eq!(ModelKind::Image.as_str(), "image");
+    assert!(
+        super::commands::ensure_image_model_dir("Qwen/Qwen-Image-2.1", img_path, "image").is_ok()
+    );
+    assert!(
+        super::commands::ensure_llm_model_dir("Qwen/Qwen-Image-2.1", img_path, "chat")
+            .unwrap_err()
+            .contains("ModelKind::Image")
+    );
+
+    // 2. LLM directory -> ModelKind::Llm
+    let llm_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        llm_dir.path().join("config.json"),
+        r#"{"model_type": "qwen3_5", "hidden_size": 256}"#,
+    )
+    .unwrap();
+    let llm_path = llm_dir.path().to_str().unwrap();
+    assert_eq!(
+        ModelKind::detect_dir(llm_dir.path()).unwrap(),
+        ModelKind::Llm
+    );
+    assert_eq!(ModelKind::Llm.as_str(), "llm");
+    assert!(super::commands::ensure_llm_model_dir("Qwen/Qwen3.5-4B", llm_path, "chat").is_ok());
+    assert!(
+        super::commands::ensure_image_model_dir("Qwen/Qwen3.5-4B", llm_path, "image")
+            .unwrap_err()
+            .contains("is a llm model")
+    );
+
+    // 3. Decision directory (via decision_config.json, readout.safetensors, and noncausal_full_attention)
+    let dec_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dec_dir.path().join("config.json"),
+        r#"{"model_type": "qwen3_5", "layer_types": ["noncausal_full_attention"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        ModelKind::detect_dir(dec_dir.path()).unwrap(),
+        ModelKind::Decision
+    );
+    assert_eq!(ModelKind::Decision.as_str(), "decision");
+
+    let dec_dir2 = tempfile::tempdir().unwrap();
+    fs::write(
+        dec_dir2.path().join("config.json"),
+        r#"{"model_type": "qwen3_5"}"#,
+    )
+    .unwrap();
+    fs::write(dec_dir2.path().join("decision_config.json"), b"{}").unwrap();
+    assert_eq!(
+        ModelKind::detect_dir(dec_dir2.path()).unwrap(),
+        ModelKind::Decision
+    );
+
+    // 4. Unsupported pipeline class and missing config fail cleanly
+    let bad_pipe = tempfile::tempdir().unwrap();
+    fs::write(
+        bad_pipe.path().join("model_index.json"),
+        r#"{"_class_name": "StableDiffusionXLPipeline"}"#,
+    )
+    .unwrap();
+    assert!(ModelKind::detect_dir(bad_pipe.path()).is_err());
+
+    let empty_dir = tempfile::tempdir().unwrap();
+    assert!(ModelKind::detect_dir(empty_dir.path()).is_err());
+    let empty_str = empty_dir.path().to_str().unwrap();
+    assert!(super::commands::ensure_image_model_dir("empty", empty_str, "image").is_err());
+    assert!(super::commands::ensure_llm_model_dir("empty", empty_str, "chat").is_err());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn load_cli_condition_images_handles_paths_file_urls_data_uris_and_limits() {
+    use crate::qwen_image::pipeline::encode_png_bytes;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let png = encode_png_bytes(&[100u8; 4 * 4 * 4], 4, 4, 4).unwrap();
+    let file_path = tmp.path().join("cond.png");
+    fs::write(&file_path, &png).unwrap();
+
+    let file_str = file_path.to_str().unwrap().to_string();
+    let file_url = format!("file://{file_str}");
+    let data_uri = format!(
+        "data:image/png;base64,{}",
+        crate::server::encode_base64(&png)
+    );
+
+    let loaded =
+        super::commands::load_cli_condition_images(&[file_str.clone(), file_url, data_uri], false)
+            .unwrap();
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[0].width, 4);
+    assert_eq!(loaded[1].width, 4);
+    assert_eq!(loaded[2].width, 4);
+
+    // Remote URL rejected when allow_remote_images = false
+    assert!(
+        super::commands::load_cli_condition_images(
+            &["https://example.com/a.png".to_string()],
+            false
+        )
+        .is_err()
+    );
+    // > 4 images rejected
+    assert!(super::commands::load_cli_condition_images(&vec![file_str; 5], false).is_err());
+    // Non-existent local file rejected
+    assert!(
+        super::commands::load_cli_condition_images(
+            &["/nonexistent/warp34_missing.png".to_string()],
+            false
+        )
+        .is_err()
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_qwen_image_cli_commands_and_dump_diff_end_to_end() {
+    use std::process::ExitCode;
+
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if crate::cuda::CudaDevice::count().unwrap_or(0) < 1 {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let model_dir = tmp.path().join("synth_qwen_image");
+    crate::qwen_image::tests::write_synthetic_qwen_image_pipeline_dir(&model_dir);
+    let model_str = model_dir.to_str().unwrap().to_string();
+
+    let out_png = tmp.path().join("cli_out.png");
+    let out_png_str = out_png.to_str().unwrap().to_string();
+
+    // 1. `run_image` writes valid 64x64 PNG
+    let mut img_opts = parse(&[
+        "image",
+        &model_str,
+        "--tp",
+        "1",
+        "-p",
+        "synth fox",
+        "--size",
+        "64x64",
+        "--resolution",
+        "64",
+        "--steps",
+        "2",
+        "-o",
+        &out_png_str,
+    ]);
+    img_opts.resolved_model = model_str.clone();
+    assert_eq!(
+        super::commands::run_image(img_opts).unwrap(),
+        ExitCode::SUCCESS
+    );
+    let decoded = crate::qwen_image::pipeline::QwenImage21ConditionImage::from_image_bytes(
+        &fs::read(&out_png).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.width, 64);
+    assert_eq!(decoded.height, 64);
+
+    // 2. `run_bench_image` writes JSON report to `--out`
+    let bench_json_path = tmp.path().join("bench_image.json");
+    let bench_json_str = bench_json_path.to_str().unwrap().to_string();
+    let mut bench_opts = parse(&[
+        "bench-image",
+        &model_str,
+        "--tp",
+        "1",
+        "-p",
+        "synth fox",
+        "--size",
+        "64x64",
+        "--resolution",
+        "64",
+        "--steps",
+        "2",
+        "--rounds",
+        "1",
+        "--out",
+        &bench_json_str,
+    ]);
+    bench_opts.resolved_model = model_str.clone();
+    assert_eq!(
+        super::commands::run_bench_image(bench_opts).unwrap(),
+        ExitCode::SUCCESS
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&bench_json_path).unwrap()).unwrap();
+    assert_eq!(report["tp"], 1);
+    assert_eq!(report["width"], 64);
+    assert_eq!(report["height"], 64);
+
+    // 3. `run_dump_diff` dispatches to `run_qwen_image_dump_diff` and verifies `--golden <png>`
+    let dump_json_path = tmp.path().join("dump_diff.json");
+    let dump_json_str = dump_json_path.to_str().unwrap().to_string();
+    let mut dump_opts = parse(&[
+        "dump-diff",
+        &model_str,
+        "--tp",
+        "1",
+        "-p",
+        "synth fox",
+        "--size",
+        "64x64",
+        "--resolution",
+        "64",
+        "--steps",
+        "2",
+        "--golden",
+        &out_png_str,
+        "--out",
+        &dump_json_str,
+    ]);
+    dump_opts.resolved_model = model_str.clone();
+    assert_eq!(
+        super::oracle::run_dump_diff(dump_opts, super::KvFormatPolicy::Fp16, None).unwrap(),
+        ExitCode::SUCCESS
+    );
+
+    // 3b. `run_dump_diff` without `--rgba` against a 4-channel RGBA golden PNG compares RGB
+    // without appending the RGBA transparency clause to `effective_prompt`.
+    let rgba_golden_path = tmp.path().join("cli_out_rgba_container.png");
+    let rgba_golden_str = rgba_golden_path.to_str().unwrap().to_string();
+    let rgba_png = crate::qwen_image::pipeline::encode_png_bytes(&decoded.rgba, 64, 64, 4).unwrap();
+    fs::write(&rgba_golden_path, rgba_png).unwrap();
+    let dump_rgba_json_path = tmp.path().join("dump_diff_rgba_container.json");
+    let dump_rgba_json_str = dump_rgba_json_path.to_str().unwrap().to_string();
+    let mut dump_rgba_opts = parse(&[
+        "dump-diff",
+        &model_str,
+        "--tp",
+        "1",
+        "-p",
+        "synth fox",
+        "--size",
+        "64x64",
+        "--resolution",
+        "64",
+        "--steps",
+        "2",
+        "--golden",
+        &rgba_golden_str,
+        "--out",
+        &dump_rgba_json_str,
+    ]);
+    dump_rgba_opts.resolved_model = model_str.clone();
+    assert_eq!(
+        super::oracle::run_dump_diff(dump_rgba_opts, super::KvFormatPolicy::Fp16, None).unwrap(),
+        ExitCode::SUCCESS
+    );
+
+    // 4. `run_chat` and `run_greedy_diff` reject `ModelKind::Image` before loading LLM weights
+    let mut chat_opts = parse(&["chat", &model_str]);
+    chat_opts.resolved_model = model_str.clone();
+    assert!(
+        super::commands::run_chat(chat_opts, super::KvFormatPolicy::Fp16, None)
+            .unwrap_err()
+            .contains("ModelKind::Image")
+    );
+
+    let mut greedy_opts = parse(&["greedy-diff", &model_str, "--golden", &out_png_str]);
+    greedy_opts.resolved_model = model_str;
+    assert!(
+        super::oracle::run_greedy_diff(greedy_opts, super::KvFormatPolicy::Fp16, None)
+            .unwrap_err()
+            .contains("ModelKind::Image")
+    );
+}

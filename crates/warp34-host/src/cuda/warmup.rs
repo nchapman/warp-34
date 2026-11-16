@@ -81,10 +81,32 @@ fn warmup_norms(
 }
 
 #[cfg(feature = "cuda")]
+static WARMED_LLM_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static WARMED_LLM_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(feature = "cuda")]
+static WARMED_QWEN_IMAGE_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static WARMED_QWEN_IMAGE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "cuda")]
 pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let dev = CudaDevice::set_current(device_id)?;
     let dev_props = dev.props()?;
     dev_props.validate_supported()?;
+    let bit = u32::try_from(device_id)
+        .ok()
+        .filter(|&d| d < 64)
+        .map(|d| 1u64 << d)
+        .unwrap_or(0);
+    if bit != 0 && (WARMED_LLM_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
+        return dev.synchronize();
+    }
+    let _guard = WARMED_LLM_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(device_id)?;
+    if bit != 0 && (WARMED_LLM_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
+        return dev.synchronize();
+    }
     let marlin_ws_ints = dev_props.marlin_workspace_ints() as i64;
     let stream = CudaStream::new(device_id)?;
     let cublas = CublasHandle::new(&stream)?;
@@ -1557,5 +1579,40 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         &gdn_batch,
     )?;
 
-    dev.synchronize()
+    dev.synchronize()?;
+    if bit != 0 {
+        WARMED_LLM_BITS.fetch_or(bit, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
+}
+
+/// Pre-warms every kernel specialization reachable by `QwenImage21PipelineEngine`
+/// (`QwenImage21Transformer`, `QwenImage21VaeEngine`, and `Qwen3VlConditioningEncoder`)
+/// on `device_id` without touching LLM-only modules (`GDN`, `PagedAttention`, `TQ4`, `MoE`,
+/// `DFlash`, `QSA`, `MTP`, `Sampler`, `LoRA`).
+#[cfg(feature = "cuda")]
+pub fn prepare_qwen_image_execution_plan(device_id: i32) -> Result<()> {
+    let dev = CudaDevice::set_current(device_id)?;
+    let dev_props = dev.props()?;
+    dev_props.validate_supported()?;
+    let bit = u32::try_from(device_id)
+        .ok()
+        .filter(|&d| d < 64)
+        .map(|d| 1u64 << d)
+        .unwrap_or(0);
+    if bit != 0 && (WARMED_QWEN_IMAGE_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
+        return dev.synchronize();
+    }
+    let _guard = WARMED_QWEN_IMAGE_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(device_id)?;
+    if bit != 0 && (WARMED_QWEN_IMAGE_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
+        return dev.synchronize();
+    }
+    warmup_vision_moe::warmup_qwen_image_plan(device_id, &dev, &dev_props)?;
+    if bit != 0 {
+        WARMED_QWEN_IMAGE_BITS.fetch_or(bit, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
 }

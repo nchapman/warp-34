@@ -817,6 +817,21 @@ unsafe extern "C" {
         rank: i32,
         num_elems: i32,
     ) -> i32;
+    pub fn warp34_tp2_all_reduce_pipelined_f16(
+        ex: *const Warp34Exec,
+        local_in: *const c_void,
+        out: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_elems: i32,
+        dma_stream: usize,
+        ev_ready: usize,
+        ev_tx_done: *const usize,
+        max_chunks: i32,
+    ) -> i32;
     pub fn warp34_tp2_all_reduce_residual_gemma_rms_norm_f16(
         ex: *const Warp34Exec,
         local_in: *const c_void,
