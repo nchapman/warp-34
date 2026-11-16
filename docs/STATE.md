@@ -50,6 +50,20 @@
   - **Image Quality Parity (`warp34 dump-diff` on `RTX 4090` `sm_89` vs `diffusers` goldens):**
     - **`Qwen/Qwen-Image-2.1-Turbo` (`FP16`):** `512×512` `TP=1` **`PSNR = 51.95 dB`** (`max_px_diff = 16`), `TP=2` **`PSNR = 54.30 dB`** (`max_px_diff = 12`); `768×512` **`PSNR = 57.17 dB`** (`max_px_diff = 7`); `1024×1024` RGBA Transparent **`PSNR = 37.24 dB`** (`0` `NaN`s); `TP=1 vs TP=2` parity **`PSNR = 50.86 dB`** at `512×512` and **`PSNR = 55.42 dB`** (`max_px_diff = 25`) at `1024×1024`.
     - **`nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ`:** `512×512` `TP=1` & `TP=2` **`PSNR = 26.21 dB`**; `768×512` **`PSNR = 29.38 dB`**; `1024×1024` RGBA Transparent **`PSNR = 21.43 dB`**; `TP=1 vs TP=2` parity **`PSNR = 52.43 dB`** (`max_px_diff = 11`) at `512×512` and **`PSNR = 52.19 dB`** (`max_px_diff = 59`) at `1024×1024`.
+- **Verified Live Parity (`PSNR`) & Benchmarks on `1–2× NVIDIA A100 80GB PCIe` (`sm_80`, `108` SMs, `40 MiB` L2, `1,935 GB/s` HBM2e, `312 TFLOPS` F16-mma FP32-acc, PCIe Gen4 x16):**
+  - **Verification & Sanitizer Gates on `sm_80`:** Passed all `27/27` Qwen-Image unit/oracle/HTTP/CLI tests, `gpu_qwen_image_real_model_matches_diffusers_oracle_suite` (`6/6` real-model scenarios in `23.81s`), and `9/9` `compute-sanitizer` (`memcheck`, `racecheck`, `synccheck`) gates across `TP=1` and `TP=2` with `0` errors/hazards.
+  - **End-to-End Warm Throughput (`warp34 bench-image` vs `diffusers` `BF16` on `1–2× A100 80GB`, 8 steps):**
+    - **`512×512` T2I:**
+      - `warp34` `FP16` (`TP=2`, 2× A100 80GB): **`662.22 ms`** (**`1.510 img/s`**, `step0 = 79.84 ms`, `cached_step = 74.62 ms`, `vae_dec = 58.50 ms`) — **`1.41×` faster than 2-GPU `diffusers` `BF16` (`934.81 ms`, `1.070 img/s`)**.
+      - `warp34` `FP16` (`TP=1`, 1× A100 80GB, 100% resident): **`724.63 ms`** (**`1.380 img/s`**, `step0 = 82.70 ms`, `cached_step = 82.21 ms`, `vae_dec = 64.95 ms`) — **`1.28×` faster than 1-GPU `diffusers` `BF16` (`926.82 ms`, `1.079 img/s`)**.
+      - `warp34` `W4A16-HGPTQ` (`TP=2`, 2× A100 80GB): **`711.99 ms`** (**`1.405 img/s`**, `step0 = 88.73 ms`, `cached_step = 80.50 ms`, `vae_dec = 58.23 ms`) — **`1.31×` faster than 2-GPU `diffusers` `BF16`**; `TP=1` (1× A100 80GB): **`787.93 ms`** (**`1.269 img/s`**, `step0 = 94.33 ms`, `cached_step = 90.04 ms`, `vae_dec = 61.85 ms`).
+    - **`1024×1024` T2I:**
+      - `warp34` `FP16` (`TP=2`, 2× A100 80GB): **`2,659.83 ms`** (**`0.376 img/s`**, `step0 = 315.14 ms`, `cached_step = 307.63 ms`, `vae_dec = 185.46 ms`) — **`1.30×` faster than 2-GPU `diffusers` `BF16` (`3,470.80 ms`, `0.288 img/s`)**.
+      - `warp34` `FP16` (`TP=1`, 1× A100 80GB, 100% resident): **`2,913.90 ms`** (**`0.343 img/s`**, `step0 = 343.60 ms`, `cached_step = 338.97 ms`, `vae_dec = 191.74 ms`) — **`1.19×` faster than 1-GPU `diffusers` `BF16` (`3,464.15 ms`, `0.289 img/s`)**.
+      - `warp34` `W4A16-HGPTQ` (`TP=2`, 2× A100 80GB): **`2,848.98 ms`** (**`0.351 img/s`**, `step0 = 341.18 ms`, `cached_step = 330.82 ms`, `vae_dec = 186.30 ms`) — **`1.22×` faster than 2-GPU `diffusers` `BF16`**; `TP=1` (1× A100 80GB): **`3,323.07 ms`** (**`0.301 img/s`**, `step0 = 394.38 ms`, `cached_step = 390.52 ms`, `vae_dec = 189.17 ms`).
+  - **Image Quality Parity (`warp34 dump-diff` on `A100 80GB` `sm_80` vs `diffusers` goldens):**
+    - **`Qwen/Qwen-Image-2.1-Turbo` (`FP16`):** `512×512` `TP=1` **`PSNR = 48.18 dB`**, `TP=2` **`PSNR = 48.55 dB`**; `768×512` **`PSNR = 57.01 dB`** (`max_px_diff = 11`); `1024×1024` RGBA Transparent **`PSNR = 37.27 dB`** (`0` `NaN`s); `TP=1 vs TP=2` parity **`PSNR = 57.81 dB`** (`max_px_diff = 8`) at `512×512` and **`PSNR = 56.60 dB`** (`max_px_diff = 27`) at `1024×1024`.
+    - **`nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ`:** `512×512` `TP=1` **`PSNR = 26.22 dB`**, `TP=2` **`PSNR = 26.25 dB`**; `TP=1 vs TP=2` parity **`PSNR = 56.64 dB`** (`max_px_diff = 10`) at `512×512` and **`PSNR = 58.26 dB`** (`max_px_diff = 14`) at `1024×1024`.
 
 ## Mixed W2/W4 HGPTQ-RCO Tiered-MoE Hot Cache Sizing & `warp34` Naming Standardization
 
