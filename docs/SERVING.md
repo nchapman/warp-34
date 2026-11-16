@@ -2,7 +2,9 @@
 
 `warp34 serve` targets one Qwen model on one or two GPUs, not a general-purpose model
 gateway. Defaults remain loopback (`127.0.0.1:8000`), **no authentication**, 16 active
-sequences, automatic KV capacity, and the existing scheduler tuning.
+sequences, automatic KV capacity, and the existing scheduler tuning. The Web UI
+is enabled by default; `--no-webui` disables its pages and assets without changing
+API or metrics access.
 
 ```sh
 # Export WARP34_API_KEY securely through your deployment's secret manager first.
@@ -32,14 +34,16 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   `x-api-key: <key>`, including Anthropic clients. If Authorization is present it
   takes precedence; invalid Authorization does **not** fall back to x-api-key.
   Duplicate credential headers are rejected. Query-string credentials are ignored.
-- All inference, model-list, tokenization, token-count, and stored-Responses
-  routes require authentication, including unversioned aliases (`/decisions`,
+- When a key is configured, all inference, model-list, tokenization, token-count,
+  and stored-Responses routes require authentication, including unversioned aliases (`/decisions`,
   `/systemone`, `/responses/input_tokens`, `/chat/completions/input_tokens`).
   Authentication runs before body processing, remote image fetching, or inference.
   Failures return HTTP 401 with an OpenAI error envelope, or an Anthropic envelope
   on `/v1/messages` and `/v1/messages/count_tokens`.
-- **The read-only dashboard/assets, `/health`, `/metrics`, and `/api/metrics`
+- **Enabled Web UI pages/assets, `/health`, `/metrics`, and `/api/metrics`
   remain unauthenticated**, so monitoring and the dashboard continue to work.
+  Overview and Connect are read-only; Playground API requests require the same
+  configured key as any other client.
   They expose operational metadata, including the served model name and load.
   Protect the **entire listener with a firewall or authenticated reverse proxy**
   if that information is private. The API key is not TLS, rate limiting, or
@@ -52,6 +56,40 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 For Docker, pass `-e WARP34_API_KEY` before the image name and
 `--api-key-env WARP34_API_KEY` after `serve` to forward an already-exported secret.
+
+## Listener and Web UI exposure
+
+Network reachability controls access to observability and the Web UI; the optional
+API key controls API operations. Binding is not per-user authentication.
+
+| Surface | Access policy |
+|---|---|
+| Web UI: `/`, `/connect`, `/playground`, nested Playground paths, favicon, and `/assets/*` | Unauthenticated when enabled; HTTP 404 with `--no-webui` |
+| Metrics: `/metrics` and `/api/metrics` | Always unauthenticated, including with API authentication or `--no-webui` |
+| Health: `/health` | Always unauthenticated, minimal availability status only |
+| Inference, models, tokenization/counts, decisions, stored Responses, and aliases | Require the configured API key; unauthenticated if none is configured |
+| Stored Responses retrieval, deletion, cancellation, and chaining | Also enforce existing credential-scope ownership; a response ID alone grants no access |
+
+Keep the default `--host 127.0.0.1` for local access. To expose the service, select
+an explicit interface with `--host`; a Tailscale address limits the listener to
+that interface but still requires appropriate tailnet access rules. `--host
+0.0.0.0` listens on all IPv4 interfaces, subject to firewall rules. Use a firewall,
+Tailscale ACLs/grants, or an authenticated HTTPS reverse proxy to restrict the
+whole service. Prevent direct backend access when a proxy supplies access control.
+
+Startup reports API authentication and Web UI status without printing secrets.
+A non-loopback listener emits an exposure warning **even when an API key is set**:
+health, metrics, and enabled Web UI pages are still unauthenticated.
+
+```sh
+# API-only presentation, still with public metrics/health on the selected interface:
+warp34 serve MODEL --host 127.0.0.1 --no-webui --api-key-env WARP34_API_KEY
+```
+
+`--no-webui` is a serve-only boolean flag; it takes no value. It removes UI routes,
+not the embedded bundle from the binary, and does not hide telemetry or change
+API authentication. It is not a substitute for access control. There is no built-in
+browser account/login system; use a proxy if the entire dashboard needs a login.
 
 ## Model identity
 
@@ -108,9 +146,9 @@ shrinking the output budget to remaining capacity.
 ## Readiness, shutdown, and bounded recovery
 
 `GET /health` returns 200 while the worker is available, 503 with `status: "stopping"`
-when HTTP admission closes or worker shutdown is requested, and 503 with the
-existing error details after a worker panic. Panic diagnostics take precedence over
-stopping. This is **not a proof of GPU forward progress**: a stalled kernel or
+when HTTP admission closes or worker shutdown is requested, and 503 with
+`status: "error"` after a worker panic. Error status takes precedence over stopping;
+internal panic diagnostics remain in server logs, never in the public health body. This is **not a proof of GPU forward progress**: a stalled kernel or
 collective may leave HTTP responsive. Monitor completion progress/latency and
 use a bounded real inference probe appropriate to the deployment workload.
 
@@ -144,7 +182,7 @@ is lost on restart; a partially delivered stream cannot be transparently retried
 
 ## CLI scope and intentional omissions
 
-The five deployment settings (`--api-key`, `--api-key-env`,
+The deployment settings (`--api-key`, `--api-key-env`, `--no-webui`,
 `--served-model-name`, `--max-num-seqs`, `--max-model-len`) are **serve-only**.
 `serve` rejects generation, benchmarking, and oracle-only options it formerly
 accepted without effect. In particular, `--batch-size` is a benchmark option;

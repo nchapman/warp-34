@@ -3,6 +3,19 @@
 React + Vite, embedded into the Rust server at build time. Overview and Connect
 are read-only; Playground sends real inference requests to the same origin.
 
+## Access policy
+
+The server defaults to `127.0.0.1`. Enabled UI pages/assets, `/health`, `/metrics`,
+and `/api/metrics` are unauthenticated; binding and network/proxy access rules
+control who can reach them. Configuring an API key protects API operations,
+including Playground requests, **not** dashboard visibility or telemetry.
+
+`warp34 serve MODEL --no-webui` returns 404 for dashboard pages and assets while
+leaving API and metrics behavior unchanged. The flag does not remove assets from
+the binary. Use an authenticated HTTPS reverse proxy if the entire UI needs a
+login, and prevent direct access to the backend. See `docs/SERVING.md` for the
+complete exposure policy.
+
 ## Develop and verify
 
 ```sh

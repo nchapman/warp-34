@@ -714,7 +714,7 @@ pub(crate) fn run_serve(
         },
     )?;
     println!(
-        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens (dashboard/metrics/health are public)",
+        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens",
         if auth_enabled { "enabled" } else { "disabled" },
         state.worker.kv_token_capacity,
         state.worker.max_model_len(),

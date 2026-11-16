@@ -122,6 +122,9 @@ describe("dashboard states", () => {
     expect(
       screen.getByText(/API-key authentication is optional/),
     ).toBeVisible();
+    expect(screen.getByText(/Use --no-webui to disable/)).toHaveTextContent(
+      /metrics and health remain available/,
+    );
     expect(screen.getByRole("link", { name: "/api/metrics" })).toHaveAttribute(
       "href",
       "/api/metrics",

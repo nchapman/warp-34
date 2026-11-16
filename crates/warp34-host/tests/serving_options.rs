@@ -49,6 +49,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
         api_key: Some(ApiKey::new("deployment-test-key".into()).unwrap()),
         max_num_seqs: 2,
         max_model_len: Some(256),
+        ..Default::default()
     };
     let state =
         OpenAiServerState::from_loader_with_options("coding-model".into(), false, options, || {
@@ -93,7 +94,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
                 .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap();
-            check_route_auth(&client, &base).await;
+            check_route_auth(&client, &base, true).await;
             let models: Value = client
                 .get(format!("{base}/v1/models"))
                 .bearer_auth("deployment-test-key")
@@ -139,7 +140,73 @@ fn authenticated_serving_alias_context_and_concurrency() {
         });
 }
 
-async fn check_route_auth(client: &reqwest::Client, base: &str) {
+#[test]
+fn disabled_webui_preserves_public_metrics_and_protected_apis() {
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "disabled_webui_preserves_public_metrics_and_protected_apis",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let state = OpenAiServerState::from_loader_with_options(
+        "private-engine".into(),
+        false,
+        ServeOptions {
+            api_key: Some(ApiKey::new("deployment-test-key".into()).unwrap()),
+            webui: false,
+            max_num_seqs: 1,
+            ..Default::default()
+        },
+        || {
+            Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(256),
+                true,
+                1,
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
+    .unwrap();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                serve(listener, state, async {
+                    let _ = stop_rx.await;
+                })
+                .await
+            });
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap();
+            check_route_auth(&client, &base, false).await;
+            let metrics: Value = client
+                .get(format!("{base}/api/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(metrics["model"], "private-engine");
+            stop_tx.send(()).unwrap();
+            server.await.unwrap().unwrap();
+        });
+}
+
+async fn check_route_auth(client: &reqwest::Client, base: &str, webui: bool) {
     // Bodies are deliberately malformed: auth must run before parsing or GPU submission.
     for path in [
         "/v1/chat/completions",
@@ -187,7 +254,7 @@ async fn check_route_auth(client: &reqwest::Client, base: &str) {
             .status(),
         401
     );
-    for path in ["/", "/health", "/metrics", "/api/metrics"] {
+    for path in ["/health", "/metrics", "/api/metrics"] {
         assert_eq!(
             client
                 .get(format!("{base}{path}"))
@@ -198,6 +265,40 @@ async fn check_route_auth(client: &reqwest::Client, base: &str) {
             200,
             "{path}"
         );
+    }
+    // Exercise real hashed assets, not a nonexistent filename that always returns 404.
+    let index = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../dashboard/dist/index.html"
+    ));
+    let assets: Vec<_> = index
+        .split('"')
+        .filter(|part| part.starts_with("/assets/"))
+        .collect();
+    assert!(!assets.is_empty());
+    for path in [
+        "/",
+        "/connect",
+        "/playground",
+        "/playground/request",
+        "/favicon.svg",
+    ]
+    .into_iter()
+    .chain(assets)
+    {
+        for key in [None, Some("deployment-test-key")] {
+            let request = client.get(format!("{base}{path}"));
+            let request = if let Some(key) = key {
+                request.bearer_auth(key)
+            } else {
+                request
+            };
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                if webui { 200 } else { 404 },
+                "{path}"
+            );
+        }
     }
     assert_eq!(
         client

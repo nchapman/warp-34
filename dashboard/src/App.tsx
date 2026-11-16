@@ -882,10 +882,13 @@ function ConnectionGuide({
               API-key authentication is optional. When enabled, configure your
               client with the deployment’s key (Bearer authorization or
               x-api-key). The dashboard, metrics, and health endpoints remain
-              public. Bind locally or use an authenticated TLS reverse proxy to
-              protect the whole service. Overview and Connect are read-only.
-              Playground sends requests and displays prompts and responses in
-              this browser tab; do not expose it to untrusted users.
+              public. The server binds to 127.0.0.1 by default. Restrict network
+              access or use an authenticated TLS reverse proxy to protect the
+              whole service. Overview and Connect are read-only; Playground
+              requests require the same configured API key as other clients.
+              Playground displays prompts and responses in this browser tab. Use
+              --no-webui to disable these pages and assets; metrics and health
+              remain available.
             </p>
             <p id="auth-caption" className="text-xs">
               Start server with API key authentication

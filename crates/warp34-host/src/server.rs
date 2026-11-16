@@ -15,6 +15,8 @@ pub use http::*;
 #[derive(Clone)]
 pub struct ServeOptions {
     pub api_key: Option<crate::api_auth::ApiKey>,
+    /// Serve the unauthenticated dashboard; disabling it does not disable metrics or APIs.
+    pub webui: bool,
     pub max_num_seqs: usize,
     /// Optional total prompt + output admission ceiling, not a KV allocation size.
     pub max_model_len: Option<usize>,
@@ -24,6 +26,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             api_key: None,
+            webui: true,
             max_num_seqs: crate::scheduler::SchedulerConfig::default().max_num_seqs,
             max_model_len: None,
         }

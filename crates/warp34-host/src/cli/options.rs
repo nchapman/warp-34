@@ -67,8 +67,10 @@ pub(crate) fn parse_tp_arg(raw: &str) -> Result<usize, String> {
 }
 
 pub fn print_usage() {
-    eprintln!(
-        r#"Usage: warp34 <subcommand> [model] [options]
+    eprintln!("{USAGE}");
+}
+
+pub(crate) const USAGE: &str = r#"Usage: warp34 <subcommand> [model] [options]
 
 Subcommands:
   serve        [model] Start OpenAI/Anthropic HTTP server & embedded dashboard (default :8000)
@@ -103,13 +105,15 @@ Parallelism & Speculative Decoding:
   --no-cuda-graph, --enforce-eager    Disable CUDA Graph capture and run eager launches
 
 Serving Options (warp34 serve):
-  --host <addr>                       Bind address (default: 127.0.0.1; use 0.0.0.0 for LAN/Tailscale)
+  --host <addr>                       Bind address (default: 127.0.0.1; select an interface for remote access)
   --port <n>                          Listen port (default: 8000)
   --max-num-seqs <1..16>              Max concurrent active sequences (default: 16; alias: --max-running-requests)
   --max-model-len <tokens>            Max total prompt + output tokens per request (supports 16k, 64k, etc.;
                                       auto-expands KV pool when --ctx-size/--kv-pages is omitted)
   --served-model-name, --alias <name> Public model ID advertised on /v1/models (default: model ID)
-  --api-key <val> | --api-key-env <v> Bearer token auth for /v1/* routes (dashboard/metrics/health stay public)
+  --api-key <val> | --api-key-env <v> Optional bearer token auth for all API operations, including aliases (not only /v1)
+                                      Metrics (/metrics and /api/metrics), minimal health, and enabled webui remain unauthenticated
+  --no-webui                         Disable the web UI only; metrics and API remain available
 
 Generation & Chat Options (warp34 chat / generate):
   -p, --prompt <text>                 Prompt text (omit in terminal with `warp34 chat` for interactive REPL)
@@ -130,9 +134,7 @@ Examples:
   warp34 serve Qwen/Qwen3.5-4B -c 64k --speculative mtp
   warp34 serve nchapman/Qwen3.5-27B-W4A16-AutoRound --tp 2 -c 32k --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash
   warp34 chat Qwen/Qwen3.5-4B --speculative mtp
-  warp34 generate Qwen/Qwen3.5-4B -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#
-    );
-}
+  warp34 generate Qwen/Qwen3.5-4B -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#;
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Default)]
@@ -244,6 +246,11 @@ impl ServeCliConfig {
 
     fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
         let flag = args[*i].as_str();
+        if flag == "--no-webui" {
+            self.used = true;
+            self.options.webui = false;
+            return Ok(true);
+        }
         if !matches!(
             flag,
             "--api-key"
@@ -325,7 +332,9 @@ impl ServeCliConfig {
 
     fn validate(&self, sub: &str) -> Result<(), String> {
         if sub != "serve" && self.used {
-            return Err("API key, served model name and admission options require serve".into());
+            return Err(
+                "API key, webui, served model name and admission options require serve".into(),
+            );
         }
         if sub == "serve"
             && let Some(flag) = &self.rejected

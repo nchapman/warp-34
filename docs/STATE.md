@@ -1,5 +1,12 @@
 # warp34 — Session Orientation & Current State
 
+## HTTP Exposure Policy & Optional Web UI
+
+- **Deployment contract:** Kept loopback (`127.0.0.1`) and no API key as defaults. `/metrics`, `/api/metrics`, minimal `/health`, and enabled Web UI pages/assets remain unauthenticated; binding plus firewall/Tailscale/proxy rules control their reachability. Configured API keys still protect all inference, model-list, tokenization/count, decision, stored-Responses routes, and aliases, with existing Responses ownership checks unchanged.
+- **`--no-webui`:** Added a serve-only boolean flag and `ServeOptions.webui` (default `true`). Disabled UI returns 404 for pages, favicon, and bundled assets without disabling either metrics endpoint or changing API authentication. Help, `docs/SERVING.md`, dashboard guidance, and post-bind startup notices explain the distinction; non-loopback listeners warn even with an API key configured.
+- **Public health:** Worker panic readiness now returns only `{"status":"error"}` with HTTP 503; detailed diagnostics stay in server logs. Regression tests first reproduced the leaked panic detail and the previously ignored disabled-UI configuration before implementation.
+- **Verification:** Dashboard checks/build and **44/44** frontend tests pass; focused CUDA-feature tests pass (**326** host library tests, **4** kernel library tests, and **3** serving-options integration tests). Full `mise run check` passed, including release tests and **117/117** CUDA sanitizer runs. Scoped review found no task-related issues.
+
 ## Dashboard: shadcn Composition Audit & Recharts Telemetry
 
 - **Shared presentation:** Migrated Overview/Connect/Playground surfaces to shadcn `Card`, notices to `Alert`, status chips to `Badge`, and form composition to `Field`/labels/descriptions/errors. Preserved real headings and named regions, separated the preset description from its accessible name, and replaced non-control code captions with associated text. Removed about 400 lines of superseded CSS and redundant token aliases; native selects, scrolling, and reasoning disclosures remain intentional.

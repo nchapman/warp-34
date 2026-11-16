@@ -9,6 +9,92 @@ fn parse(values: &[&str]) -> CudaCliOptions {
 }
 
 #[test]
+fn serve_no_webui_is_accepted() {
+    let result = parse_cuda_options(&args(&["serve", "--no-webui"]));
+    assert!(result.is_ok(), "--no-webui rejected: {:?}", result.err());
+}
+
+#[test]
+fn serve_webui_defaults_scope_and_arity() {
+    let defaults = parse(&["serve"]);
+    assert!(defaults.serve.options.webui);
+    assert_eq!(defaults.host, "127.0.0.1");
+    for argv in [
+        vec!["serve", "--no-webui"],
+        vec!["serve", "--no-webui", "--port", "9000"],
+        vec!["serve", "--no-webui", "model"],
+        vec!["serve", "--no-webui", "--no-webui"],
+    ] {
+        let options = parse(&argv);
+        assert!(!options.serve.options.webui);
+        assert!(validate_cuda_options(&options, "serve").is_ok());
+    }
+    assert_eq!(parse(&["serve", "--no-webui", "model"]).model, "model");
+    assert_eq!(parse(&["serve", "--no-webui", "--port", "9000"]).port, 9000);
+    for value in ["--no-webui=true", "--no-webui=false"] {
+        assert!(parse_cuda_options(&args(&["serve", value])).is_err());
+    }
+    // A boolean flag consumes no value; an extra positional after the model is invalid.
+    assert!(parse_cuda_options(&args(&["serve", "model", "--no-webui", "false"])).is_err());
+    for sub in [
+        "chat",
+        "generate",
+        "bench",
+        "greedy-diff",
+        "dump-diff",
+        "profile-diff",
+    ] {
+        let error = validate_cuda_options(&parse(&[sub, "--no-webui"]), sub).unwrap_err();
+        assert!(error.contains("require serve"), "{sub}: {error}");
+    }
+}
+
+#[test]
+fn serve_exposure_help_and_notices() {
+    for text in [
+        "--no-webui",
+        "all API operations",
+        "including aliases",
+        "not only /v1",
+        "/metrics and /api/metrics",
+        "minimal health",
+        "enabled webui remain unauthenticated",
+        "UI only; metrics and API remain available",
+    ] {
+        assert!(USAGE.contains(text), "missing help: {text}");
+    }
+    for address in [
+        "127.0.0.1:8000",
+        "[::1]:8000",
+        "0.0.0.0:8000",
+        "[::]:8000",
+        "192.0.2.1:8000",
+    ] {
+        let addr: std::net::SocketAddr = address.parse().unwrap();
+        for auth in [false, true] {
+            for webui in [false, true] {
+                let notice = crate::server::serve_exposure_notice(addr, auth, webui);
+                assert_eq!(notice.contains("WARNING"), !addr.ip().is_loopback());
+                assert!(notice.contains(&format!("http://{addr}")));
+                assert!(notice.contains(if auth {
+                    "API auth enabled"
+                } else {
+                    "API auth disabled"
+                }));
+                assert!(notice.contains(
+                    "metrics (/metrics and /api/metrics) and minimal health are unauthenticated"
+                ));
+                assert!(notice.contains(if webui {
+                    "webui enabled and unauthenticated"
+                } else {
+                    "webui disabled (API and metrics remain available)"
+                }));
+            }
+        }
+    }
+}
+
+#[test]
 fn serve_defaults_limits_and_alias() {
     let defaults = parse(&["serve"]);
     assert_eq!(defaults.serve.options.max_num_seqs, 16);

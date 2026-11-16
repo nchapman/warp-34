@@ -34,6 +34,7 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct OpenAiServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
+    webui: bool,
     pub worker: EngineWorker,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
@@ -86,9 +87,9 @@ impl OpenAiServerState {
         worker.set_max_model_len(options.max_model_len)?;
         let mut state = Self::with_worker(model_name, worker, allow_remote_images);
         // This newly created state has not been shared with any request handler.
-        Arc::get_mut(&mut state)
-            .expect("unshared server state")
-            .api_key = options.api_key;
+        let unshared = Arc::get_mut(&mut state).expect("unshared server state");
+        unshared.api_key = options.api_key;
+        unshared.webui = options.webui;
         Ok(state)
     }
     fn with_worker(
@@ -112,6 +113,7 @@ impl OpenAiServerState {
         Arc::new(Self {
             model_name,
             api_key: None,
+            webui: true,
             worker,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
@@ -188,19 +190,18 @@ pub(super) fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
 }
 
 async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
-    let panic = s.worker.is_panicked().then(|| {
-        s.worker
-            .panic_reason()
-            .unwrap_or_else(|| "engine worker panicked".into())
-    });
-    health_response(panic, s.admission.is_closed() || s.worker.is_stopping())
+    health_response(
+        s.worker.is_panicked(),
+        s.admission.is_closed() || s.worker.is_stopping(),
+    )
 }
 
-fn health_response(panic: Option<String>, stopping: bool) -> Response {
-    if let Some(detail) = panic {
+fn health_response(panicked: bool, stopping: bool) -> Response {
+    // Readiness is public. The worker logs diagnostics; never publish them here.
+    if panicked {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status":"error","error":format!("engine worker terminated after panic: {detail}")})),
+            Json(json!({"status":"error"})),
         )
             .into_response();
     }
@@ -215,7 +216,7 @@ fn health_response(panic: Option<String>, stopping: bool) -> Response {
 }
 
 pub fn router(state: Arc<OpenAiServerState>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/v1/models", get(models))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
@@ -245,14 +246,19 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         ))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/api/metrics", get(metrics_json))
-        .merge(crate::dashboard::router())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            count_inference_responses,
-        ))
-        .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
-        .with_state(state)
+        .route("/api/metrics", get(metrics_json));
+    // UI visibility is independent of API authentication and telemetry exposure.
+    let app = if state.webui {
+        app.merge(crate::dashboard::router())
+    } else {
+        app
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        count_inference_responses,
+    ))
+    .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
+    .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
@@ -1636,6 +1642,28 @@ pub async fn serve(
         .map_err(std::io::Error::other)?;
     result
 }
+/// Format only deployment state, never credentials or user-supplied hostnames.
+pub(crate) fn serve_exposure_notice(
+    addr: std::net::SocketAddr,
+    auth_enabled: bool,
+    webui: bool,
+) -> String {
+    let auth = if auth_enabled { "enabled" } else { "disabled" };
+    let ui = if webui {
+        "webui enabled and unauthenticated"
+    } else {
+        "webui disabled (API and metrics remain available)"
+    };
+    let warning = if addr.ip().is_loopback() {
+        ""
+    } else {
+        "WARNING: non-loopback listener exposes public endpoints; "
+    };
+    format!(
+        "[warp34 serve] {warning}ready on http://{addr}; API auth {auth} (all API operations including aliases); metrics (/metrics and /api/metrics) and minimal health are unauthenticated; {ui}"
+    )
+}
+
 pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1652,7 +1680,10 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
                 return Err(error);
             }
         };
-        eprintln!("[warp34 serve] ready on http://{}", listener.local_addr()?);
+        eprintln!(
+            "{}",
+            serve_exposure_notice(listener.local_addr()?, state.api_key.is_some(), state.webui)
+        );
         serve(listener, state, async {
             #[cfg(unix)]
             {
@@ -1791,19 +1822,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_is_unavailable_while_stopping_and_preserves_panic_diagnostics() {
+    async fn readiness_is_unavailable_without_exposing_panic_diagnostics() {
         use axum::body::to_bytes;
-        assert_eq!(super::health_response(None, false).status(), StatusCode::OK);
-        let stopping = super::health_response(None, true);
+        assert_eq!(
+            super::health_response(false, false).status(),
+            StatusCode::OK
+        );
+        let stopping = super::health_response(false, true);
         assert_eq!(stopping.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(stopping.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["status"], "stopping");
-        let failed = super::health_response(Some("test panic".into()), true);
+        let failed = super::health_response(true, true);
         assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(failed.into_body(), 4096).await.unwrap()).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("test panic"));
+        assert_eq!(body, serde_json::json!({"status": "error"}));
     }
 
     #[test]
