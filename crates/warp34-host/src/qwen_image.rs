@@ -1235,9 +1235,31 @@ pub(crate) mod tests {
 
         let (cos, sin) =
             compute_qwen_image_21_rope_cos_sin(&shapes, &mask, [16, 56, 56], 10_000.0).unwrap();
+        assert_eq!(cos.len(), 960);
+        assert_eq!(sin.len(), 960);
+        for &(idx, exp_c, exp_s) in &[
+            (0usize, 1.0f32, 0.0f32),
+            (64, 0.5403023, 0.841471),
+            (128, -0.4161468, 0.9092974),
+            (136, 0.5403023, -0.841471),
+            (448, 0.2836622, -0.9589243),
+            (484, -0.4161468, -0.9092974),
+            (959, 1.0, 0.0001389),
+        ] {
+            assert!(
+                (cos[idx] - exp_c).abs() < 1e-5,
+                "rope.cos[{idx}] mismatch: got {} expected {exp_c}",
+                cos[idx]
+            );
+            assert!(
+                (sin[idx] - exp_s).abs() < 1e-5,
+                "rope.sin[{idx}] mismatch: got {} expected {exp_s}",
+                sin[idx]
+            );
+        }
         let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/oracle/fixtures/qwen_image_ops.safetensors");
-        if fixture_path.is_file() {
+        if fixture_path.metadata().is_ok_and(|m| m.len() > 1024) {
             let arch = SafetensorsArchive::open(&fixture_path).unwrap();
             let ref_cos = arch.read_f32("rope.cos").unwrap();
             let ref_sin = arch.read_f32("rope.sin").unwrap();
