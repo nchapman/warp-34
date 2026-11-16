@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   BrowserRouter,
   Link,
@@ -491,8 +491,176 @@ function Overview({ state }: { state: MetricsState }) {
   );
 }
 
-function ConnectionGuide() {
+type AgentTabId = "claude-code" | "codex" | "opencode" | "pi" | "aider" | "sdk";
+
+interface AgentSnippet {
+  label: string;
+  code: string;
+}
+
+interface AgentGuideSpec {
+  id: AgentTabId;
+  title: string;
+  protocol: string;
+  summary: string;
+  snippets: AgentSnippet[];
+}
+
+function sanitizeModelForSnippet(model: string | null): string {
+  const trimmed = model?.trim() ?? "";
+  if (trimmed.length > 0 && /^[A-Za-z0-9._/:+-]+$/.test(trimmed)) {
+    return trimmed;
+  }
+  return "nchapman/Qwen3.5-4B-W4A16-HGPTQ";
+}
+
+function CopyCodeBlock({ label, code }: { label: string; code: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = () => {
+    if (!navigator.clipboard?.writeText) return;
+    navigator.clipboard
+      .writeText(code)
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1600);
+      })
+      .catch(() => {
+        setCopied(false);
+      });
+  };
+  return (
+    <div className="connect-snippet">
+      <div className="connect-snippet-header">
+        <label>{label}</label>
+        <button
+          type="button"
+          className="pg-btn pg-btn-ghost connect-copy-btn"
+          onClick={onCopy}
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre>{code}</pre>
+    </div>
+  );
+}
+
+function ConnectionGuide({
+  model,
+  kvPages,
+}: {
+  model: string | null;
+  kvPages: number | null;
+}) {
+  const [activeTab, setActiveTab] = useState<AgentTabId>("claude-code");
   const base = window.location.origin;
+  const activeModel = sanitizeModelForSnippet(model);
+  const ctxTokens = kvPages && kvPages > 0 ? kvPages * 16 : 32768;
+  const maxOutTokens = Math.min(
+    16384,
+    Math.max(4096, Math.floor(ctxTokens / 4)),
+  );
+  const compactLimit = Math.floor(ctxTokens * 0.75);
+
+  const guides: AgentGuideSpec[] = [
+    {
+      id: "claude-code",
+      title: "Claude Code",
+      protocol: "Anthropic Messages API · /v1/messages",
+      summary:
+        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. warp34 natively serves /v1/messages/count_tokens and strips per-request cch= billing headers so MambaRadixCache prefix hits stay warm.",
+      snippets: [
+        {
+          label: "Quick launch (terminal)",
+          code: `ANTHROPIC_BASE_URL=${base} \\\nANTHROPIC_AUTH_TOKEN=warp34 \\\nANTHROPIC_DEFAULT_SONNET_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_OPUS_MODEL="${activeModel}" \\\nANTHROPIC_DEFAULT_HAIKU_MODEL="${activeModel}" \\\nclaude --model "${activeModel}"`,
+        },
+        {
+          label: "Persistent config (~/.claude/settings.json)",
+          code: `{\n  "env": {\n    "ANTHROPIC_BASE_URL": "${base}",\n    "ANTHROPIC_AUTH_TOKEN": "warp34",\n    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${activeModel}",\n    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${activeModel}"\n  }\n}`,
+        },
+      ],
+    },
+    {
+      id: "codex",
+      title: "Codex CLI",
+      protocol: "OpenAI Responses API · /v1/responses",
+      summary:
+        'OpenAI Codex CLI requires wire_api = "responses" (POST /v1/responses), which warp34 implements natively with both stateful previous_response_id chaining and stateless histories.',
+      snippets: [
+        {
+          label: "Provider profile (~/.codex/config.toml)",
+          code: `model = "${activeModel}"\nmodel_provider = "warp34"\nmodel_context_window = ${ctxTokens}\nmodel_auto_compact_token_limit = ${compactLimit}\n\n[model_providers.warp34]\nname = "warp34"\nbase_url = "${base}/v1"\nenv_key = "WARP34_API_KEY"\nwire_api = "responses"`,
+        },
+        {
+          label: "Run Codex CLI",
+          code: `export WARP34_API_KEY=warp34\ncodex -m "${activeModel}"`,
+        },
+      ],
+    },
+    {
+      id: "opencode",
+      title: "OpenCode",
+      protocol: "OpenAI-Compatible · /v1/chat/completions",
+      summary:
+        "Configure warp34 in opencode.json using @ai-sdk/openai-compatible and declare limit.context so OpenCode tracks context usage and auto-compacts before hitting the KV pool ceiling.",
+      snippets: [
+        {
+          label: "~/.config/opencode/opencode.json (or project opencode.json)",
+          code: `{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {\n    "warp34": {\n      "npm": "@ai-sdk/openai-compatible",\n      "name": "warp34",\n      "options": {\n        "baseURL": "${base}/v1",\n        "apiKey": "warp34"\n      },\n      "models": {\n        "${activeModel}": {\n          "name": "${activeModel}",\n          "limit": {\n            "context": ${ctxTokens},\n            "output": ${maxOutTokens}\n          }\n        }\n      }\n    }\n  },\n  "model": "warp34/${activeModel}"\n}`,
+        },
+      ],
+    },
+    {
+      id: "pi",
+      title: "Pi Agent",
+      protocol: "OpenAI Completions / Responses · ~/.pi/agent/models.json",
+      summary:
+        "Add warp34 to ~/.pi/agent/models.json, then run /model inside Pi to select the model (reload happens automatically when opening /model).",
+      snippets: [
+        {
+          label: "~/.pi/agent/models.json",
+          code: `{\n  "$schema": "https://pi.dev/schemas/models.schema.json",\n  "providers": {\n    "warp34": {\n      "baseUrl": "${base}/v1",\n      "api": "openai-completions",\n      "apiKey": "warp34",\n      "models": [\n        {\n          "id": "${activeModel}",\n          "contextWindow": ${ctxTokens},\n          "maxTokens": ${maxOutTokens}\n        }\n      ]\n    }\n  }\n}`,
+        },
+      ],
+    },
+    {
+      id: "aider",
+      title: "Aider / Continue / Cline",
+      protocol: "OpenAI Chat Completions · /v1/chat/completions",
+      summary:
+        "Any tool that accepts an OpenAI-compatible base URL (/v1) can connect directly. For Cline or Roo Code, choose 'OpenAI Compatible', set Base URL to the /v1 address, and set the context window to match your server.",
+      snippets: [
+        {
+          label: "Aider CLI",
+          code: `OPENAI_API_BASE=${base}/v1 \\\nOPENAI_API_KEY=warp34 \\\naider --model "openai/${activeModel}"`,
+        },
+        {
+          label: "Continue (~/.continue/config.yaml)",
+          code: `models:\n  - name: "${activeModel}"\n    provider: openai\n    model: "${activeModel}"\n    apiBase: "${base}/v1"\n    apiKey: "warp34"`,
+        },
+      ],
+    },
+    {
+      id: "sdk",
+      title: "Python & cURL",
+      protocol: "OpenAI SDK (/v1) & Anthropic SDK (root URL)",
+      summary:
+        "The OpenAI SDK expects /v1 in base_url, whereas the Anthropic SDK appends /v1/messages itself and expects the root origin.",
+      snippets: [
+        {
+          label: "Python — OpenAI & Anthropic SDKs",
+          code: `from openai import OpenAI\nfrom anthropic import Anthropic\n\n# OpenAI Chat Completions or Responses API (/v1 suffix)\noai = OpenAI(base_url="${base}/v1", api_key="warp34")\nresp = oai.chat.completions.create(\n    model="${activeModel}",\n    messages=[{"role": "user", "content": "Hello from warp34!"}],\n)\n\n# Anthropic Messages API (no /v1 suffix)\nanth = Anthropic(base_url="${base}", api_key="warp34")\nmsg = anth.messages.create(\n    model="${activeModel}",\n    max_tokens=1024,\n    messages=[{"role": "user", "content": "Hello from warp34!"}],\n)`,
+        },
+        {
+          label: "cURL — OpenAI Chat Completions",
+          code: `curl ${base}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${activeModel}",\n    "messages": [{"role": "user", "content": "Hello!"}],\n    "max_tokens": 256\n  }'`,
+        },
+      ],
+    },
+  ];
+
+  const currentGuide = guides.find((g) => g.id === activeTab) ?? guides[0];
+
   return (
     <>
       <div className="section-heading">
@@ -501,22 +669,72 @@ function ConnectionGuide() {
           <p>One engine. Your tools.</p>
         </div>
       </div>
+
+      <section className="panel guide connect-hero">
+        <div className="connect-hero-top">
+          <div>
+            <span className="eyebrow">CODING AGENTS &amp; SDKS</span>
+            <h2>Bring your coding agent.</h2>
+            <p>
+              Point an OpenAI-compatible, Responses API, or Anthropic Messages
+              client at this server. Snippets below are pre-filled with your
+              loaded model and{" "}
+              <span className="numeric">{ctxTokens.toLocaleString()}</span>
+              -token KV capacity.
+            </p>
+          </div>
+        </div>
+
+        <div className="connect-endpoints-bar">
+          <div className="connect-endpoint-item">
+            <span>OpenAI Base URL (/v1/chat/completions, /v1/responses)</span>
+            <code>{base}/v1</code>
+          </div>
+          <div className="connect-endpoint-item">
+            <span>Anthropic Base URL (/v1/messages — no /v1 suffix)</span>
+            <code>{base}</code>
+          </div>
+          <div className="connect-endpoint-item">
+            <span>Loaded Model ID</span>
+            <code>{activeModel}</code>
+          </div>
+        </div>
+
+        <div
+          className="connect-tabs"
+          role="tablist"
+          aria-label="Coding agent integrations"
+        >
+          {guides.map((g) => (
+            <button
+              key={g.id}
+              type="button"
+              role="tab"
+              aria-selected={currentGuide.id === g.id}
+              className={`connect-tab ${currentGuide.id === g.id ? "active" : ""}`}
+              onClick={() => setActiveTab(g.id)}
+            >
+              {g.title}
+            </button>
+          ))}
+        </div>
+
+        <div className="connect-tab-body" role="tabpanel">
+          <div className="connect-tab-meta">
+            <span className="connect-protocol-badge">
+              {currentGuide.protocol}
+            </span>
+            <p>{currentGuide.summary}</p>
+          </div>
+          <div className="connect-snippets-grid">
+            {currentGuide.snippets.map((s) => (
+              <CopyCodeBlock key={s.label} label={s.label} code={s.code} />
+            ))}
+          </div>
+        </div>
+      </section>
+
       <div className="connect-grid">
-        <section className="panel guide">
-          <span className="eyebrow">OPENAI-COMPATIBLE API</span>
-          <h2>Bring your coding agent.</h2>
-          <p>
-            Point an OpenAI-compatible client at this server’s base URL and use
-            the loaded model identifier shown in Overview.
-          </p>
-          <label>Base URL</label>
-          <code>{base}/v1</code>
-          <p>
-            Native Responses and Anthropic Messages endpoints are also
-            available. Model capabilities and client configuration vary; this
-            page does not change engine settings.
-          </p>
-        </section>
         <section className="panel guide">
           <span className="eyebrow">OBSERVABILITY</span>
           <h2>Use your own monitoring.</h2>
@@ -530,19 +748,21 @@ function ConnectionGuide() {
           <label>Prometheus scrape config</label>
           <pre>{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
         </section>
+        <section className="panel guide-security">
+          <span className="eyebrow">EXPOSURE &amp; AUTHENTICATION</span>
+          <h2>Keep your endpoint private.</h2>
+          <p>
+            API-key authentication is optional. When enabled, configure your
+            client with the deployment’s key (Bearer authorization or
+            x-api-key). The dashboard, metrics, and health endpoints remain
+            public. Bind locally or use an authenticated TLS reverse proxy to
+            protect the whole service. The dashboard is read-only and contains
+            no prompt or response content.
+          </p>
+          <label>Start server with API key authentication</label>
+          <pre>{`export WARP34_API_KEY="your-secret-key"\nwarp34 serve "${activeModel}" -c 64k --api-key-env WARP34_API_KEY`}</pre>
+        </section>
       </div>
-      <section className="panel guide-security">
-        <span className="eyebrow">EXPOSURE &amp; AUTHENTICATION</span>
-        <h2>Keep your endpoint private.</h2>
-        <p>
-          API-key authentication is optional. When enabled, configure your
-          client with the deployment’s key (Bearer authorization or x-api-key).
-          The dashboard, metrics, and health endpoints remain public. Bind
-          locally or use an authenticated TLS reverse proxy to protect the whole
-          service. The dashboard is read-only and contains no prompt or response
-          content.
-        </p>
-      </section>
     </>
   );
 }
@@ -604,7 +824,15 @@ function DashboardShell({ state }: { state: MetricsState }) {
             path="/playground/:endpointId"
             element={<Playground model={latest?.model ?? null} />}
           />
-          <Route path="/connect" element={<ConnectionGuide />} />
+          <Route
+            path="/connect"
+            element={
+              <ConnectionGuide
+                model={latest?.model ?? null}
+                kvPages={latest?.pools.kv.capacity ?? null}
+              />
+            }
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

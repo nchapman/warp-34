@@ -656,6 +656,114 @@ footer {
 .notice strong {
   font-weight: 600;
 }
+.connect-hero {
+  margin-bottom: 18px;
+}
+.connect-endpoints-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 20px;
+}
+.connect-endpoint-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.connect-endpoint-item span {
+  font-size: 12px;
+  color: var(--subtle);
+}
+.connect-endpoint-item code {
+  margin: 0;
+  padding: 11px 14px;
+  white-space: nowrap;
+}
+.connect-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.connect-tab {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 14px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.connect-tab:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.connect-tab.active {
+  background: var(--accent-tint);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.connect-tab-body {
+  margin-top: 18px;
+}
+.connect-tab-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.connect-protocol-badge {
+  align-self: flex-start;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  color: var(--aqua);
+  background: var(--aqua-tint);
+  border: 1px solid var(--aqua-border);
+  border-radius: 4px;
+  padding: 3px 9px;
+}
+.connect-tab-meta p {
+  margin: 0;
+  max-width: 920px;
+}
+.connect-snippets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 16px;
+}
+.connect-snippet {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.connect-snippet-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.connect-snippet-header label {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.connect-copy-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.connect-snippet pre {
+  margin: 0;
+  flex: 1;
+  line-height: 1.55;
+}
 .connect-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -679,14 +787,16 @@ footer {
   font-size: 14px;
   line-height: 1.75;
 }
-.guide label {
+.guide label,
+.guide-security label {
   display: block;
   font-size: 12px;
   color: var(--subtle);
   margin-top: 22px;
 }
 .guide code,
-.guide pre {
+.guide pre,
+.guide-security pre {
   display: block;
   padding: 14px 16px;
   background: var(--background);
@@ -698,7 +808,8 @@ footer {
   color: var(--accent);
   margin: 10px 0 18px;
 }
-.guide pre {
+.guide pre,
+.guide-security pre {
   margin-bottom: 0;
 }
 .guide a {
@@ -1271,7 +1382,9 @@ footer {
   .latency-values {
     gap: 18px;
   }
-  .connect-grid {
+  .connect-grid,
+  .connect-endpoints-bar,
+  .connect-snippets-grid {
     grid-template-columns: minmax(0, 1fr);
   }
   .playground-workspace {

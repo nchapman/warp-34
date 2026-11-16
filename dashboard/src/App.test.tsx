@@ -83,12 +83,23 @@ describe("dashboard states", () => {
   it("provides a read-only connection guide and security warning", () => {
     render(
       <Dashboard
-        state={{ history: [], connection: "connecting", error: null }}
+        state={{
+          history: [snapshot({ model: "Qwen/Qwen3.5-4B" })],
+          connection: "live",
+          error: null,
+        }}
       />,
     );
     fireEvent.click(screen.getByRole("link", { name: "Connect" }));
     expect(
       screen.getByRole("heading", { name: "Bring your coding agent." }),
+    ).toBeVisible();
+    expect(screen.getByText(/claude --model "Qwen\/Qwen3.5-4B"/)).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "Codex CLI" }));
+    expect(screen.getByText(/\[model_providers\.warp34\]/)).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "OpenCode" }));
+    expect(
+      screen.getByText(/"model": "warp34\/Qwen\/Qwen3.5-4B"/),
     ).toBeVisible();
     expect(
       screen.getByText(/API-key authentication is optional/),
