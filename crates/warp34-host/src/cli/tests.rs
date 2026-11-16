@@ -965,7 +965,7 @@ fn qwen_image_cli_options_and_validation() {
     assert_eq!(img_opts.image_width, Some(768));
     assert_eq!(img_opts.image_height, Some(512));
     assert_eq!(img_opts.image_steps, Some(28));
-    assert_eq!(img_opts.cfg_scale, 4.0);
+    assert_eq!(img_opts.cfg_scale, Some(4.0));
     assert_eq!(img_opts.seed, 777);
     assert_eq!(img_opts.sampling.seed, Some(777));
     assert!(img_opts.rgba_output);

@@ -1160,6 +1160,20 @@ impl QwenImage21PipelineConfig {
         self.root_dir.join("tokenizer.json")
     }
 
+    /// Returns the default number of inference steps (`sample_sigmas.len()` for Turbo, `40` for standard).
+    pub fn default_steps(&self) -> usize {
+        self.sample_sigmas.as_ref().map_or(40, |s| s.len().max(1))
+    }
+
+    /// Returns the default classifier-free guidance scale (`1.0` for distilled `sample_sigmas` / Turbo, `4.0` for standard `Qwen-Image-2.1`).
+    pub fn default_cfg_scale(&self) -> f32 {
+        if self.sample_sigmas.is_some() {
+            1.0
+        } else {
+            4.0
+        }
+    }
+
     pub fn open_text_encoder_archive(&self) -> io::Result<SafetensorsArchive> {
         SafetensorsArchive::open(&self.text_encoder_dir)
     }
@@ -1748,6 +1762,8 @@ pub(crate) mod tests {
 
         let pcfg = QwenImage21PipelineConfig::from_dir(root).unwrap();
         assert_eq!(pcfg.sample_sigmas, Some(vec![1.0, 0.5]));
+        assert_eq!(pcfg.default_steps(), 2);
+        assert_eq!(pcfg.default_cfg_scale(), 1.0);
         assert_eq!(pcfg.text_encoder.rotary_dim, 128);
         assert_eq!(pcfg.text_encoder.mrope_section, [24, 20, 20]);
         assert!(!pcfg.text_encoder.attn_output_gate);
@@ -1756,6 +1772,11 @@ pub(crate) mod tests {
         assert!(pcfg.open_text_encoder_archive().is_ok());
         assert!(pcfg.open_transformer_archive().is_ok());
         assert!(pcfg.open_vae_archive().is_ok());
+
+        let mut std_pcfg = pcfg.clone();
+        std_pcfg.sample_sigmas = None;
+        assert_eq!(std_pcfg.default_steps(), 40);
+        assert_eq!(std_pcfg.default_cfg_scale(), 4.0);
 
         // If the real Qwen-Image-2.1-Turbo / Qwen-Image-2.1 snapshots are cached locally,
         // verify offline Hub resolution and archive opening on the real checkpoints too.

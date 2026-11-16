@@ -626,11 +626,12 @@ fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
     let mut files = fixture_files();
     files.remove("config.json");
     files.remove("model.safetensors");
+    files.remove("tokenizer.json");
     files.insert(
         "model_index.json".into(),
         serde_json::to_vec(&json!({"_class_name": "QwenImage21Pipeline"})).unwrap(),
     );
-    files.insert("processor/tokenizer.json".into(), b"{}".to_vec());
+    files.insert("tokenizer/tokenizer.json".into(), b"{}".to_vec());
     files.insert("scheduler/scheduler_config.json".into(), b"{}".to_vec());
     files.insert(
         "text_encoder/config.json".into(),
@@ -642,10 +643,10 @@ fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
     );
     files.insert(
         "text_encoder/model.safetensors.index.json".into(),
-        br#"{"weight_map":{"w":"model-00001-of-00001.safetensors"}}"#.to_vec(),
+        br#"{"weight_map":{"w":"shards/model-00001-of-00001.safetensors"}}"#.to_vec(),
     );
     files.insert(
-        "text_encoder/model-00001-of-00001.safetensors".into(),
+        "text_encoder/shards/model-00001-of-00001.safetensors".into(),
         weights(),
     );
     files.insert(
@@ -677,8 +678,9 @@ fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
     let s = settings(tmp.path(), &[("HF_ENDPOINT", &server.endpoint)]);
     let dir = resolve_remote("test/model", &HubOptions::default(), ModelRole::Target, &s).unwrap();
     assert!(dir.join("model_index.json").exists());
+    assert!(dir.join("tokenizer/tokenizer.json").exists());
     assert!(
-        dir.join("text_encoder/model-00001-of-00001.safetensors")
+        dir.join("text_encoder/shards/model-00001-of-00001.safetensors")
             .exists()
     );
     assert!(
@@ -686,4 +688,15 @@ fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
             .exists()
     );
     assert!(dir.join("vae/diffusion_pytorch_model.safetensors").exists());
+
+    // Verify offline discovery without a warp34 manifest also discovers nested component shards.
+    let commit = dir.file_name().unwrap().to_str().unwrap().to_string();
+    let repo_dir = dir.parent().unwrap().parent().unwrap();
+    fs::remove_file(manifest_path(repo_dir, &commit)).unwrap();
+    let offline_opts = HubOptions {
+        offline: true,
+        ..HubOptions::default()
+    };
+    let offline_dir = resolve_remote("test/model", &offline_opts, ModelRole::Target, &s).unwrap();
+    assert_eq!(offline_dir, dir);
 }

@@ -116,11 +116,7 @@ fn collect_component_weights(
                 let shard = value
                     .as_str()
                     .ok_or_else(|| invalid("invalid safetensors shard filename"))?;
-                let rel_shard = if shard.contains('/') {
-                    shard.to_owned()
-                } else {
-                    format!("{subdir}/{shard}")
-                };
+                let rel_shard = format!("{subdir}/{shard}");
                 safe_path(&rel_shard)?;
                 if !rel_shard.ends_with(".safetensors") || !files.contains(&rel_shard) {
                     return Err(invalid(format!(

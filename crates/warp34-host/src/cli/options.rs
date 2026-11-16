@@ -457,7 +457,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) image_height: Option<u32>,
     pub(crate) output_resolution: u32,
     pub(crate) image_steps: Option<usize>,
-    pub(crate) cfg_scale: f32,
+    pub(crate) cfg_scale: Option<f32>,
     pub(crate) seed: u64,
     pub(crate) rgba_output: bool,
 }
@@ -545,7 +545,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut image_height: Option<u32> = None;
     let mut output_resolution: u32 = 1024;
     let mut image_steps: Option<usize> = None;
-    let mut cfg_scale: f32 = 1.0;
+    let mut cfg_scale: Option<f32> = None;
     let mut seed: u64 = 42;
     let mut rgba_output = false;
 
@@ -907,11 +907,12 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             }
             "--cfg-scale" | "--guidance-scale" | "--true-cfg-scale" => {
                 i += 1;
-                cfg_scale = args
-                    .get(i)
-                    .ok_or("missing --cfg-scale")?
-                    .parse()
-                    .map_err(|_| "invalid --cfg-scale")?;
+                cfg_scale = Some(
+                    args.get(i)
+                        .ok_or("missing --cfg-scale")?
+                        .parse()
+                        .map_err(|_| "invalid --cfg-scale")?,
+                );
             }
             "--rgba" | "--transparent" => {
                 rgba_output = true;
@@ -1150,7 +1151,9 @@ pub(crate) fn validate_cuda_options(
     {
         return Err("--steps must be in 1..=100".into());
     }
-    if !options.cfg_scale.is_finite() || !(0.0..=30.0).contains(&options.cfg_scale) {
+    if let Some(cfg) = options.cfg_scale
+        && (!cfg.is_finite() || !(0.0..=30.0).contains(&cfg))
+    {
         return Err("--cfg-scale must be in 0.0..=30.0".into());
     }
     if options.lora_modules.len() > crate::lora::MAX_LORA_ADAPTERS {

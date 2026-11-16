@@ -765,14 +765,8 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         effective_tp,
     )
     .map_err(|e| e.to_string())?;
-    let steps = image_steps.unwrap_or_else(|| {
-        engine
-            .cfg
-            .sample_sigmas
-            .as_ref()
-            .map(|s| s.len().max(1))
-            .unwrap_or(40)
-    });
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
     let effective_prompt = if want_rgba && condition_images.is_empty() {
         crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
     } else {

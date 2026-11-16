@@ -184,14 +184,8 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         requested_tp,
     )
     .map_err(|e| e.to_string())?;
-    let steps = image_steps.unwrap_or_else(|| {
-        engine
-            .cfg
-            .sample_sigmas
-            .as_ref()
-            .map(|s| s.len().max(1))
-            .unwrap_or(40)
-    });
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
     let effective_prompt = if rgba_output && condition_images.is_empty() {
         crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
     } else {
@@ -269,14 +263,8 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
         requested_tp,
     )
     .map_err(|e| e.to_string())?;
-    let steps = image_steps.unwrap_or_else(|| {
-        engine
-            .cfg
-            .sample_sigmas
-            .as_ref()
-            .map(|s| s.len().max(1))
-            .unwrap_or(40)
-    });
+    let steps = image_steps.unwrap_or_else(|| engine.cfg.default_steps());
+    let cfg_scale = cfg_scale.unwrap_or_else(|| engine.cfg.default_cfg_scale());
     let rounds = prof_rounds.max(1);
     let effective_prompt = if rgba_output && condition_images.is_empty() {
         crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
