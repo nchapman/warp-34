@@ -822,11 +822,346 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         ),
         "warmup warp34_moe_gpu_lru_update_and_pull"
     )?;
+    Ok(())
+}
 
-    // Warm all Qwen-Image-2.1 DiT & VAE kernel specializations (both generic & vectorized fast paths).
+#[cfg(feature = "cuda")]
+pub(super) fn warmup_qwen_image_plan(
+    device_id: i32,
+    dev: &CudaDevice,
+    dev_props: &CudaDeviceProps,
+) -> Result<()> {
+    let marlin_ws_ints = dev_props.marlin_workspace_ints() as i64;
+    let stream = CudaStream::new(device_id)?;
+    let cublas = CublasHandle::new(&stream)?;
+    let mut arena = DeviceArena::new(device_id, 2 * 1024 * 1024)?;
+    let ex = stream.exec(arena.buf.addr(), arena.capacity());
+
+    macro_rules! warmup_ffi {
+        ($call:expr, $label:expr) => {{
+            // SAFETY: Warmup arena buffers are sized for this launch and remain live until `dev.synchronize()`.
+            check_rc(unsafe { $call }, $label)
+        }};
+    }
+
+    let buf_a = arena.alloc_aligned(64 * 1024)?;
+    let buf_b = arena.alloc_aligned(64 * 1024)?;
+    let buf_c = arena.alloc_aligned(64 * 1024)?;
+    let buf_d = arena.alloc_aligned(64 * 1024)?;
+    let buf_ws = arena.alloc_aligned((64 * 1024).max(dev_props.marlin_workspace_bytes()))?;
+    let zero_i32 = arena.upload_slice(&[0i32; 16], &stream)?;
+    let reject_ids = arena.upload_slice(&[0i32; 4], &stream)?;
+    let reject_probs = arena.upload_slice(&[1.0f32; 256], &stream)?;
+    let cu_seqlens = arena.upload_slice(&[0i32, 1i32], &stream)?;
+
+    // 1. Linear, Hadamard, Marlin & cuBLAS GEMMs used by Qwen3-VL, DiT & VAE
+    for block_size in [16, 64] {
+        warmup_ffi!(
+            ffi::warp34_block_hadamard_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                2,
+                128,
+                192,
+                block_size,
+            ),
+            "warmup warp34_block_hadamard_f16"
+        )?;
+        warmup_ffi!(
+            ffi::warp34_block_hadamard_inplace_f16(&ex, buf_b as *mut c_void, 2, 128, block_size),
+            "warmup warp34_block_hadamard_inplace_f16"
+        )?;
+    }
+    warmup_ffi!(
+        ffi::warp34_linear_epilogue_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_c as *const c_void,
+            buf_b as *mut c_void,
+            2,
+            64,
+            128,
+        ),
+        "warmup warp34_linear_epilogue_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_marlin_warmup_specializations(),
+        "warmup warp34_marlin_warmup_specializations"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_marlin_repack_int4(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64),
+        "warmup warp34_marlin_repack_int4"
+    )?;
+    for m_warm in [1i64, 16, 40, 64] {
+        for group_blocks in [8i32, 4, 2, -1] {
+            warmup_ffi!(
+                ffi::warp34_marlin_gemm_f16u4(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *const c_void,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    buf_ws as *mut i32,
+                    m_warm,
+                    64,
+                    128,
+                    marlin_ws_ints,
+                    group_blocks,
+                ),
+                "warmup warp34_marlin_gemm_f16u4"
+            )?;
+            warmup_ffi!(
+                ffi::warp34_marlin_gemm_f16u8(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *const c_void,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    buf_ws as *mut i32,
+                    m_warm,
+                    64,
+                    128,
+                    marlin_ws_ints,
+                    group_blocks,
+                ),
+                "warmup warp34_marlin_gemm_f16u8"
+            )?;
+            if group_blocks != -1 {
+                warmup_ffi!(
+                    ffi::warp34_marlin_gemm_f16u4_zp(
+                        &ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        marlin_ws_ints,
+                        group_blocks,
+                    ),
+                    "warmup warp34_marlin_gemm_f16u4_zp"
+                )?;
+            }
+        }
+    }
+    cublas.gemm_f16(buf_a, buf_b, buf_c, 1, 64, 128)?;
+    cublas.gemm_f16_bias(buf_a, buf_b, buf_d, buf_c, 1, 64, 128)?;
+    for m_warm in [1i32, 4, 20] {
+        warmup_ffi!(
+            ffi::warp34_small_n_gemm_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                m_warm,
+                64,
+                128,
+            ),
+            "warmup warp34_small_n_gemm_f16"
+        )?;
+    }
+
+    // 2. Qwen3-VL conditioning encoder & Vision kernels
+    warmup_ffi!(
+        ffi::warp34_gemma_rms_norm_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+            1e-6,
+        ),
+        "warmup warp34_gemma_rms_norm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_vision_bias_add_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_a as *const c_void,
+            buf_c as *mut c_void,
+            1,
+            64,
+        ),
+        "warmup warp34_vision_bias_add_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_vision_layernorm_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            1,
+            64,
+            1e-6,
+        ),
+        "warmup warp34_vision_layernorm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_vision_bias_gelu_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            1,
+            64,
+            1,
+        ),
+        "warmup warp34_vision_bias_gelu_f16"
+    )?;
+    let ex_vision = stream.exec(buf_ws, 64 * 1024);
+    for head_dim in [64, 72] {
+        warmup_ffi!(
+            ffi::warp34_vision_qkv_rope_attn_f16(
+                &ex_vision,
+                buf_a as *mut c_void,
+                buf_b as *const c_void,
+                reject_ids as *const i32,
+                cu_seqlens as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                head_dim,
+                10000.0,
+            ),
+            "warmup warp34_vision_qkv_rope_attn_f16"
+        )?;
+    }
+    warmup_ffi!(
+        ffi::warp34_embedding_splice_f16(
+            &ex,
+            buf_c as *mut c_void,
+            buf_a as *const c_void,
+            reject_ids as *const i32,
+            1,
+            64,
+        ),
+        "warmup warp34_embedding_splice_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_embedding_add_f16(
+            &ex,
+            buf_c as *mut c_void,
+            buf_a as *const c_void,
+            reject_ids as *const i32,
+            1,
+            1,
+            64,
+        ),
+        "warmup warp34_embedding_add_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_rms_norm_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+            1e-6,
+        ),
+        "warmup warp34_rms_norm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_fused_add_rms_norm_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *mut c_void,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+            1e-6,
+        ),
+        "warmup warp34_fused_add_rms_norm_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_fused_qk_rmsnorm_rope_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+            zero_i32 as *const i32,
+            core::ptr::null(),
+            buf_d as *mut c_void,
+            buf_c as *mut c_void,
+            1,
+            1,
+            2,
+            1,
+            128,
+            128,
+            24,
+            20,
+            20,
+            5_000_000.0,
+            1e-6,
+            0.0,
+        ),
+        "warmup warp34_fused_qk_rmsnorm_rope_f16"
+    )?;
+    for is_causal in [0i32, 1i32] {
+        warmup_ffi!(
+            ffi::warp34_mha_fa2_d128_f16(
+                &ex_vision,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                1,
+                1,
+                2,
+                1,
+                is_causal,
+            ),
+            "warmup warp34_mha_fa2_d128_f16"
+        )?;
+    }
+    for d_warm in [128i32, 132] {
+        warmup_ffi!(
+            ffi::warp34_silu_and_mul_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_c as *mut c_void,
+                core::ptr::null(),
+                1,
+                d_warm,
+            ),
+            "warmup warp34_silu_and_mul_f16"
+        )?;
+    }
+    warmup_ffi!(
+        ffi::warp34_silu_and_mul_hadamard_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            128,
+        ),
+        "warmup warp34_silu_and_mul_hadamard_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_add_inplace_f16(&ex, buf_c as *mut c_void, buf_a as *const c_void, 128),
+        "warmup warp34_add_inplace_f16"
+    )?;
+
+    // 3. Qwen-Image-2.1 DiT & 3D Causal VAE kernel specializations (generic & vectorized fast paths).
     warmup_ffi!(
         ffi::warp34_qwen_image_timestep_sinusoidal_f16(
-            ex,
+            &ex,
             reject_probs as *const f32,
             buf_c as *mut c_void,
             1,
@@ -838,12 +1173,12 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     )?;
     for n in [7i64, 64i64] {
         warmup_ffi!(
-            ffi::warp34_qwen_image_silu_f16(ex, buf_a as *const c_void, buf_c as *mut c_void, n),
+            ffi::warp34_qwen_image_silu_f16(&ex, buf_a as *const c_void, buf_c as *mut c_void, n),
             "warmup warp34_qwen_image_silu_f16"
         )?;
         warmup_ffi!(
             ffi::warp34_qwen_image_euler_cfg_step_f16(
-                ex,
+                &ex,
                 buf_c as *mut c_void,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
@@ -854,25 +1189,27 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             "warmup warp34_qwen_image_euler_cfg_step_f16"
         )?;
     }
-    warmup_ffi!(
-        ffi::warp34_qwen_image_build_joint_hidden_f16(
-            ex,
-            buf_a as *const c_void,
-            buf_b as *const c_void,
-            zero_i32 as *const i32,
-            buf_c as *mut c_void,
-            1,
-            1,
-            1,
-            64,
-        ),
-        "warmup warp34_qwen_image_build_joint_hidden_f16"
-    )?;
+    for hs in [66i32, 64i32] {
+        warmup_ffi!(
+            ffi::warp34_qwen_image_build_joint_hidden_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                zero_i32 as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                1,
+                hs,
+            ),
+            "warmup warp34_qwen_image_build_joint_hidden_f16"
+        )?;
+    }
     for hs in [66i32, 64i32, 4096i32] {
         let had64 = i32::from((hs & 63) == 0);
         warmup_ffi!(
             ffi::warp34_qwen_image_adaln_modulate_ex_f16(
-                ex,
+                &ex,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
                 core::ptr::null(),
@@ -888,7 +1225,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         )?;
         warmup_ffi!(
             ffi::warp34_qwen_image_gated_residual_f16(
-                ex,
+                &ex,
                 buf_c as *mut c_void,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
@@ -902,7 +1239,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         )?;
         warmup_ffi!(
             ffi::warp34_qwen_image_fused_gated_residual_adaln_f16(
-                ex,
+                &ex,
                 buf_c as *mut c_void,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
@@ -924,7 +1261,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     }
     warmup_ffi!(
         ffi::warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
-            ex,
+            &ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
             buf_c as *const c_void,
@@ -944,7 +1281,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     for sp in [4i32, 16i32] {
         warmup_ffi!(
             ffi::warp34_qwen_image_vae_rms_norm_f16(
-                ex,
+                &ex,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
                 buf_c as *mut c_void,
@@ -956,7 +1293,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         )?;
         warmup_ffi!(
             ffi::warp34_qwen_image_vae_bias_residual_f16(
-                ex,
+                &ex,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
                 buf_c as *const c_void,
@@ -971,7 +1308,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     for (w_out, stride_w) in [(8i32, 1i32), (4i32, 2i32)] {
         warmup_ffi!(
             ffi::warp34_qwen_image_vae_im2col_f16(
-                ex,
+                &ex,
                 buf_a as *const c_void,
                 buf_c as *mut c_void,
                 4,
@@ -993,7 +1330,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     for w_in in [2i32, 4i32] {
         warmup_ffi!(
             ffi::warp34_qwen_image_vae_upsample2d_nearest2x_f16(
-                ex,
+                &ex,
                 buf_a as *const c_void,
                 buf_c as *mut c_void,
                 4,
@@ -1005,7 +1342,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     }
     warmup_ffi!(
         ffi::warp34_qwen_image_vae_avg_down_f16(
-            ex,
+            &ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
             buf_c as *mut c_void,
@@ -1020,7 +1357,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
     )?;
     warmup_ffi!(
         ffi::warp34_qwen_image_vae_dup_up_f16(
-            ex,
+            &ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
             buf_c as *mut c_void,
@@ -1034,13 +1371,30 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         "warmup warp34_qwen_image_vae_dup_up_f16"
     )?;
     warmup_ffi!(
+        ffi::warp34_qwen_image_vae_dup_up_scaled_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            4,
+            4,
+            2,
+            2,
+            1,
+            2,
+            0.25,
+        ),
+        "warmup warp34_qwen_image_vae_dup_up_scaled_f16"
+    )?;
+    warmup_ffi!(
         ffi::warp34_qwen_image_vae_softmax_f32_to_f16(
-            ex,
+            &ex,
             reject_probs as *const f32,
             buf_c as *mut c_void,
             4,
         ),
         "warmup warp34_qwen_image_vae_softmax_f32_to_f16"
     )?;
-    Ok(())
+
+    dev.synchronize()
 }

@@ -145,6 +145,118 @@ pub enum LayerKind {
     FullAttention,
 }
 
+/// High-level checkpoint family used to select the execution engine, CUDA kernel warmup plan,
+/// CLI subcommand compatibility, and enabled HTTP REST routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// Autoregressive / multimodal language model (`Qwen3.5` / `Qwen3.6` / `Qwen3.8` / `Qwen3-VL`).
+    Llm,
+    /// Decision / scoring model (`decision_config.json`, `readout.safetensors`, or noncausal decision config).
+    Decision,
+    /// Diffusion / flow-matching image generation & editing pipeline (`model_index.json` / `QwenImage21Pipeline`).
+    Image,
+}
+
+impl ModelKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Decision => "decision",
+            Self::Image => "image",
+        }
+    }
+
+    pub const fn is_image(self) -> bool {
+        matches!(self, Self::Image)
+    }
+
+    pub const fn is_llm_family(self) -> bool {
+        matches!(self, Self::Llm | Self::Decision)
+    }
+
+    pub const fn supports_chat_and_completions(self) -> bool {
+        matches!(self, Self::Llm | Self::Decision)
+    }
+
+    pub const fn supports_images_api(self) -> bool {
+        matches!(self, Self::Image)
+    }
+
+    /// Detects the checkpoint family from directory metadata (`model_index.json` vs `config.json`
+    /// and `decision_config.json` / `readout.safetensors`) without loading weights or initializing CUDA.
+    pub fn detect_dir(dir: &Path) -> io::Result<Self> {
+        let model_index = dir.join("model_index.json");
+        let config_json = dir.join("config.json");
+        if model_index.is_file() && !config_json.is_file() {
+            let text = fs::read_to_string(&model_index)?;
+            let root: Json = serde_json::from_str(&text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad model_index.json: {e}"),
+                )
+            })?;
+            let cls = root
+                .get("_class_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if cls == "QwenImage21Pipeline" {
+                return Ok(Self::Image);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported pipeline _class_name='{}' (expected 'QwenImage21Pipeline')",
+                    sanitize_diag(cls)
+                ),
+            ));
+        }
+        if config_json.is_file() {
+            if dir.join("decision_config.json").is_file()
+                || dir.join("readout.safetensors").is_file()
+            {
+                return Ok(Self::Decision);
+            }
+            let text = fs::read_to_string(&config_json)?;
+            let root: Json = serde_json::from_str(&text).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}"))
+            })?;
+            let has_noncausal_layer = root
+                .get("text_config")
+                .unwrap_or(&root)
+                .get("layer_types")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|x| x.as_str() == Some("noncausal_full_attention"))
+                });
+            let is_decision = has_noncausal_layer
+                || root
+                    .get("noncausal_full_attention")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || root
+                    .get("prefix_bidir")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || root.get("decision_type").is_some()
+                || root.get("decision_config").is_some();
+            return Ok(if is_decision {
+                Self::Decision
+            } else {
+                Self::Llm
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "model directory '{}' has neither config.json nor model_index.json",
+                dir.display()
+            ),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DecisionConfigMeta {
     pub decision_type: Option<String>,

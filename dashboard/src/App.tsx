@@ -802,6 +802,9 @@ function DashboardShell({ state }: { state: MetricsState }) {
   const location = useLocation();
   const latest = state.history.at(-1);
   const isPlayground = location.pathname.startsWith("/playground");
+  const isImageModel =
+    latest?.config.kv_format === "fp16_dit_vae" ||
+    Boolean(latest?.model.toLowerCase().includes("qwen-image"));
 
   useEffect(() => {
     document.title = titleFromPathname(location.pathname);
@@ -843,11 +846,21 @@ function DashboardShell({ state }: { state: MetricsState }) {
           <Route path="/" element={<Overview state={state} />} />
           <Route
             path="/playground"
-            element={<Playground model={latest?.model ?? null} />}
+            element={
+              <Playground
+                model={latest?.model ?? null}
+                imageMode={isImageModel}
+              />
+            }
           />
           <Route
             path="/playground/:endpointId"
-            element={<Playground model={latest?.model ?? null} />}
+            element={
+              <Playground
+                model={latest?.model ?? null}
+                imageMode={isImageModel}
+              />
+            }
           />
           <Route
             path="/connect"

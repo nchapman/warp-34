@@ -1258,7 +1258,7 @@ pub use collectives::*;
 #[cfg(feature = "cuda")]
 mod warmup;
 #[cfg(feature = "cuda")]
-pub use warmup::prepare_execution_plan;
+pub use warmup::{prepare_execution_plan, prepare_qwen_image_execution_plan};
 
 #[cfg(test)]
 mod tests;

@@ -478,6 +478,19 @@ pub fn encode_png_bytes(
         4 => ExtendedColorType::Rgba8,
         _ => return Err(format!("unsupported PNG channel count: {channels}")),
     };
+    if width == 0 || height == 0 {
+        return Err(format!("invalid PNG dimensions {width}x{height}"));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(channels as usize))
+        .ok_or_else(|| "PNG pixel buffer size overflow".to_string())?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "PNG pixel buffer length mismatch: expected {expected} bytes for {width}x{height}x{channels}, got {}",
+            pixels.len()
+        ));
+    }
     let mut buf = Vec::with_capacity(pixels.len() / 2);
     let encoder = PngEncoder::new_with_quality(
         Cursor::new(&mut buf),
@@ -795,6 +808,17 @@ impl QwenImage21PipelineEngine {
     /// Returns the active tensor-parallel degree (`1` or `2`).
     pub const fn tp_size(&self) -> usize {
         self.tp_size
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn force_ondemand_conditioning_for_test(&mut self) {
+        let device_id = if self.tp_size == 2 { 1 } else { 0 };
+        let archive = Arc::new(
+            SafetensorsArchive::open(&self.cfg.text_encoder_dir)
+                .expect("open text_encoder archive"),
+        );
+        self.conditioning = ConditioningBackend::OnDemand { device_id, archive };
+        self.conditioning_cache.clear();
     }
 
     fn hash_conditioning_key(prompt: &str, images: &[PreprocessedImage]) -> u64 {
@@ -1255,6 +1279,149 @@ mod tests {
                     "transparent RGB bled into semi-transparent pixel: {px:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn condition_image_validation_and_png_encoding_edges() {
+        // Invalid dimensions or byte lengths
+        assert!(QwenImage21ConditionImage::from_rgba_u8(vec![0u8; 16], 0, 4).is_err());
+        assert!(QwenImage21ConditionImage::from_rgba_u8(vec![0u8; 16], 4, 0).is_err());
+        assert!(QwenImage21ConditionImage::from_rgba_u8(vec![0u8; 15], 2, 2).is_err());
+        assert!(QwenImage21ConditionImage::from_image_bytes(b"not-an-image").is_err());
+
+        // Same-size resize returns clone fast-path
+        let cond = QwenImage21ConditionImage::from_rgba_u8(vec![200u8; 4 * 4 * 4], 4, 4).unwrap();
+        let same = cond.resize_lanczos(4, 4);
+        assert_eq!(same.width, 4);
+        assert_eq!(same.height, 4);
+        assert_eq!(same.rgba, cond.rgba);
+
+        // Fully transparent pixels preserve RGB=0 when resizing
+        let trans = QwenImage21ConditionImage::from_rgba_u8(vec![0u8; 4 * 4 * 4], 4, 4).unwrap();
+        let trans_resized = trans.resize_lanczos(2, 2);
+        assert!(trans_resized.rgba.iter().all(|&b| b == 0));
+
+        // RGB (channels = 3) and invalid channel count PNG encoding
+        let rgb_png = encode_png_bytes(&[128u8; 4 * 4 * 3], 4, 4, 3).unwrap();
+        let decoded_rgb = QwenImage21ConditionImage::from_image_bytes(&rgb_png).unwrap();
+        assert_eq!(decoded_rgb.width, 4);
+        assert_eq!(decoded_rgb.height, 4);
+        assert!(encode_png_bytes(&[0u8; 16], 2, 2, 2).is_err());
+        assert!(encode_png_bytes(&[0u8; 10], 2, 2, 4).is_err());
+        assert!(encode_png_bytes(&[], 0, 2, 4).is_err());
+
+        // PSNR edge cases: empty / length mismatch vs noisy buffer
+        assert_eq!(compute_psnr_u8(&[], &[]), f64::INFINITY);
+        assert!(compute_psnr_u8(&[1, 2], &[1]).is_nan());
+        let psnr_diff = compute_psnr_u8(&[100, 100, 100, 255], &[110, 90, 100, 255]);
+        assert!(psnr_diff > 20.0 && psnr_diff < 50.0);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_synthetic_pipeline_t2i_ti2i_cfg_rgba_cache_and_ondemand() {
+        let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if CudaDevice::count().unwrap_or(0) < 1 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        crate::qwen_image::tests::write_synthetic_qwen_image_pipeline_dir(tmp.path());
+
+        // Invalid tp_size rejected
+        assert!(QwenImage21PipelineEngine::load(tmp.path(), 3).is_err());
+
+        // 1. Load TP=1 pipeline and test T2I RGB + RGBA + CFG + custom initial latents + custom sigmas
+        let mut engine = QwenImage21PipelineEngine::load(tmp.path(), 1).unwrap();
+        assert_eq!(engine.tp_size(), 1);
+
+        let req_rgb = QwenImage21GenerationRequest {
+            prompt: "a synthwave fox <|image_pad|>".to_string(),
+            negative_prompt: None,
+            condition_images: Vec::new(),
+            width: Some(64),
+            height: Some(64),
+            output_resolution: 64,
+            num_inference_steps: Some(2),
+            true_cfg_scale: 1.0,
+            seed: 42,
+            rgba_output: false,
+            use_cuda_graph: true,
+            sigmas: None,
+            initial_latents_chw_f16: None,
+        };
+        let out_rgb = engine.generate(&req_rgb).unwrap();
+        assert_eq!(out_rgb.width, 64);
+        assert_eq!(out_rgb.height, 64);
+        assert_eq!(out_rgb.channels, 3);
+        assert_eq!(out_rgb.steps, 2);
+        assert_eq!(out_rgb.pixels_u8.len(), 64 * 64 * 3);
+        assert!(!out_rgb.png_bytes.is_empty());
+        assert!(
+            out_rgb
+                .decoded_chw_f16
+                .iter()
+                .all(|&bits| crate::cuda::f16_to_f32(bits).is_finite())
+        );
+
+        // Second call hits conditioning cache and supports RGBA + true CFG + custom sigmas + custom latents
+        let mut req_rgba = req_rgb.clone();
+        req_rgba.rgba_output = true;
+        req_rgba.true_cfg_scale = 2.5;
+        req_rgba.negative_prompt = Some("blurry low quality".to_string());
+        req_rgba.sigmas = Some(vec![1.0, 0.4]);
+        req_rgba.initial_latents_chw_f16 = Some(out_rgb.latents_chw_f16.clone());
+        let out_rgba = engine.generate(&req_rgba).unwrap();
+        assert_eq!(out_rgba.channels, 4);
+        assert_eq!(out_rgba.pixels_u8.len(), 64 * 64 * 4);
+
+        // Mismatched initial_latents_chw_f16 length fails cleanly
+        let mut bad_latents = req_rgb.clone();
+        bad_latents.initial_latents_chw_f16 = Some(vec![0u16; 3]);
+        assert!(engine.generate(&bad_latents).is_err());
+
+        // 2. Test TI2I with 1 and 2 condition images (including RGBA transparency)
+        let cond_img =
+            QwenImage21ConditionImage::from_rgba_u8(vec![180u8; 64 * 64 * 4], 64, 64).unwrap();
+        let req_ti2i = QwenImage21GenerationRequest {
+            prompt: "add neon rain".to_string(),
+            negative_prompt: Some(String::new()),
+            condition_images: vec![cond_img.clone(), cond_img],
+            width: None,
+            height: None,
+            output_resolution: 64,
+            num_inference_steps: None,
+            true_cfg_scale: 2.0,
+            seed: 7,
+            rgba_output: true,
+            use_cuda_graph: true,
+            sigmas: None,
+            initial_latents_chw_f16: None,
+        };
+        let out_ti2i = engine.generate(&req_ti2i).unwrap();
+        assert_eq!(out_ti2i.width, 64);
+        assert_eq!(out_ti2i.height, 64);
+        assert_eq!(out_ti2i.channels, 4);
+
+        // 3. Test ConditioningBackend::OnDemand on TP=1 (unloads transformer + vae workspace, reloads after VLM)
+        engine.force_ondemand_conditioning_for_test();
+        let out_ondemand = engine.generate(&req_rgb).unwrap();
+        assert_eq!(out_ondemand.pixels_u8, out_rgb.pixels_u8);
+
+        // 4. If 2 GPUs are visible, test TP=2 (auto tp=0) + OnDemand conditioning on TP=2
+        if CudaDevice::count().unwrap_or(0) >= 2 {
+            let mut engine_tp2 = QwenImage21PipelineEngine::load(tmp.path(), 0).unwrap();
+            assert_eq!(engine_tp2.tp_size(), 2);
+            let out_tp2 = engine_tp2.generate(&req_ti2i).unwrap();
+            assert_eq!(out_tp2.width, 64);
+            assert_eq!(out_tp2.height, 64);
+            assert!(compute_psnr_u8(&out_ti2i.pixels_u8, &out_tp2.pixels_u8) >= 40.0);
+
+            engine_tp2.force_ondemand_conditioning_for_test();
+            let out_tp2_ondemand = engine_tp2.generate(&req_rgb).unwrap();
+            assert!(compute_psnr_u8(&out_rgb.pixels_u8, &out_tp2_ondemand.pixels_u8) >= 40.0);
         }
     }
 }

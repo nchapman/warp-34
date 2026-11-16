@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaStream, DeviceArena, DeviceBuffer, Result, check_rc,
-    f16_to_f32_slice, f32_to_f16_slice, prepare_execution_plan,
+    f16_to_f32_slice, f32_to_f16_slice, prepare_qwen_image_execution_plan,
 };
 use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
 use crate::model::{LinearProj, MARLIN_TILE_K_W4, MARLIN_TILE_N, RawLinearHost};
@@ -101,7 +101,7 @@ impl Qwen3VlConditioningEncoder {
         device_id: i32,
         stream: &CudaStream,
     ) -> Result<Self> {
-        prepare_execution_plan(device_id)?;
+        prepare_qwen_image_execution_plan(device_id)?;
         let _dev = CudaDevice::set_current(device_id)?;
         let vision = if let Some(ref vcfg) = cfg.vision_config {
             Qwen3VisionEncoder::try_load(&archive, vcfg, quant, device_id, stream)?

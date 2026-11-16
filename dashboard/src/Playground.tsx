@@ -19,6 +19,7 @@ import {
 interface PlaygroundProps {
   model: string | null;
   decisionMode?: boolean;
+  imageMode?: boolean;
 }
 
 type RequestTab = "structured" | "json";
@@ -55,26 +56,38 @@ function formatDisplayJson(val: unknown): string {
     : formatted;
 }
 
+function endpointsForModel(isImageModel: boolean): EndpointSpec[] {
+  if (isImageModel) {
+    return ENDPOINTS.filter(
+      (e) => e.kind === "openai-images" || e.group === "System",
+    );
+  }
+  return ENDPOINTS.filter((e) => e.kind !== "openai-images");
+}
+
 function resolveRoute(
   pathEndpointId: string | undefined,
   searchParams: URLSearchParams,
   decisionMode: boolean,
   model?: string | null,
+  imageMode = false,
 ): {
   endpoint: EndpointSpec;
   presetId: string;
 } {
   const requestedEndpoint = searchParams.get("endpoint") ?? pathEndpointId;
-  const isImageModel = Boolean(model?.toLowerCase().includes("qwen-image"));
+  const isImageModel =
+    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const available = endpointsForModel(isImageModel);
   const fallbackId = decisionMode
     ? "decisions"
     : isImageModel
       ? "images-generations"
       : "chat-completions";
   const endpoint =
-    ENDPOINTS.find((e) => e.id === requestedEndpoint) ??
-    ENDPOINTS.find((e) => e.id === fallbackId) ??
-    ENDPOINTS[0];
+    available.find((e) => e.id === requestedEndpoint) ??
+    available.find((e) => e.id === fallbackId) ??
+    available[0];
   const requestedPreset = searchParams.get("preset");
   const preset =
     endpoint.presets.find((p) => p.id === requestedPreset) ??
@@ -126,11 +139,20 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
   });
 }
 
-export function Playground({ model, decisionMode = false }: PlaygroundProps) {
+export function Playground({
+  model,
+  decisionMode = false,
+  imageMode = false,
+}: PlaygroundProps) {
   const navigate = useNavigate();
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const isImageModel = Boolean(model?.toLowerCase().includes("qwen-image"));
+  const isImageModel =
+    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const availableEndpoints = useMemo(
+    () => endpointsForModel(isImageModel),
+    [isImageModel],
+  );
   const defaultEndpointId = decisionMode
     ? "decisions"
     : isImageModel
@@ -141,9 +163,12 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     searchParams,
     decisionMode,
     model,
+    imageMode,
   );
   const [endpointId, setEndpointId] = useState<string>(initial.endpoint.id);
-  const endpoint = ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0];
+  const endpoint =
+    availableEndpoints.find((e) => e.id === endpointId) ??
+    availableEndpoints[0];
 
   const [presetId, setPresetId] = useState<string>(initial.presetId);
   const activeModel = model ?? DEFAULT_MODEL;
@@ -229,6 +254,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
       searchParams,
       decisionMode,
       model,
+      imageMode,
     );
     if (resolved.endpoint.id !== endpointId || resolved.presetId !== presetId) {
       setEndpointId(resolved.endpoint.id);
@@ -249,10 +275,11 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
           : "json",
       );
     }
-  }, [pathEndpointId, searchParams, decisionMode, model]);
+  }, [pathEndpointId, searchParams, decisionMode, model, imageMode]);
 
   function selectEndpoint(nextId: string) {
-    const nextSpec = ENDPOINTS.find((e) => e.id === nextId) ?? ENDPOINTS[0];
+    const nextSpec =
+      availableEndpoints.find((e) => e.id === nextId) ?? availableEndpoints[0];
     const firstPreset = nextSpec.presets[0];
     setEndpointId(nextSpec.id);
     setPresetId(firstPreset.id);
@@ -782,15 +809,21 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                     "Tokenizer & Counts",
                     "System",
                   ] as const
-                ).map((group) => (
-                  <optgroup key={group} label={group}>
-                    {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
-                      <option key={ep.id} value={ep.id}>
-                        {ep.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
+                ).map((group) => {
+                  const groupEps = availableEndpoints.filter(
+                    (ep) => ep.group === group,
+                  );
+                  if (groupEps.length === 0) return null;
+                  return (
+                    <optgroup key={group} label={group}>
+                      {groupEps.map((ep) => (
+                        <option key={ep.id} value={ep.id}>
+                          {ep.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  );
+                })}
               </select>
             </div>
 

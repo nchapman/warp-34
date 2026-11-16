@@ -16,7 +16,7 @@
 #[cfg(feature = "cuda")]
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaGraph, CudaStream, DeviceArena, DeviceBuffer, Result,
-    Tp2Collectives, check_rc, prepare_execution_plan,
+    Tp2Collectives, check_rc, prepare_qwen_image_execution_plan,
 };
 use crate::cuda::{f16_to_f32, f32_to_f16};
 #[cfg(feature = "cuda")]
@@ -589,7 +589,7 @@ impl QwenImage21TransformerEngine {
             ));
         }
 
-        prepare_execution_plan(device_id)?;
+        prepare_qwen_image_execution_plan(device_id)?;
         let _dev = CudaDevice::set_current(device_id)?;
         let inner_dim = cfg.inner_dim();
         let head_dim = cfg.attention_head_dim;
@@ -3340,8 +3340,8 @@ impl QwenImage21TransformerTp2Engine {
         weight_prefix: &str,
         max_tokens: usize,
     ) -> Result<Self> {
-        prepare_execution_plan(0)?;
-        prepare_execution_plan(1)?;
+        prepare_qwen_image_execution_plan(0)?;
+        prepare_qwen_image_execution_plan(1)?;
         let stream0 = CudaStream::new(0)?;
         let cublas0 = CublasHandle::new(&stream0)?;
         let rank0 = QwenImage21TransformerEngine::load_with_prefix(

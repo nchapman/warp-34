@@ -778,5 +778,42 @@ describe("Playground UI integration", () => {
     expect(normalized.height).toBeUndefined();
     expect(normalized.guidance_scale).toBe(4);
     expect(normalized.cfg_scale).toBeUndefined();
+
+    // Verify only Image + System endpoints appear in the selector when serving an Image model
+    const epSelect = screen.getByLabelText("ENDPOINT") as HTMLSelectElement;
+    const optionValues = Array.from(epSelect.options).map((o) => o.value);
+    expect(optionValues).toContain("images-generations");
+    expect(optionValues).toContain("images-edits");
+    expect(optionValues).toContain("models");
+    expect(optionValues).not.toContain("chat-completions");
+    expect(optionValues).not.toContain("decisions");
+    expect(optionValues).not.toContain("tokenize");
+  });
+
+  it("hides /v1/images/* endpoints when serving an LLM model", () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/playground?endpoint=images-generations",
+    );
+    const llmSnap = snapshot({
+      model: "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+    });
+    render(
+      <Dashboard
+        state={{
+          history: [llmSnap],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    const epSelect = screen.getByLabelText("ENDPOINT") as HTMLSelectElement;
+    // Falls back to chat-completions because images-generations is not enabled on an LLM server
+    expect(epSelect.value).toBe("chat-completions");
+    const optionValues = Array.from(epSelect.options).map((o) => o.value);
+    expect(optionValues).toContain("chat-completions");
+    expect(optionValues).not.toContain("images-generations");
+    expect(optionValues).not.toContain("images-edits");
   });
 });

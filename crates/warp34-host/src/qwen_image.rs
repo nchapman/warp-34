@@ -1174,7 +1174,7 @@ impl QwenImage21PipelineConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1322,6 +1322,290 @@ mod tests {
         }
         assert!((sched_std.sigmas[39] - 0.02).abs() < 1e-6);
         assert_eq!(sched_std.sigmas[40], 0.0);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn write_f16_safetensors_file(
+        path: &Path,
+        tensors: &[(&str, Vec<usize>, Vec<u16>)],
+    ) {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape, vals) in tensors {
+            let start = data.len();
+            for &v in vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            let end = data.len();
+            header.insert(
+                (*name).to_string(),
+                json!({
+                    "dtype": "F16",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let hdr_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = (hdr_bytes.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&hdr_bytes);
+        out.extend_from_slice(&data);
+        fs::write(path, out).unwrap();
+    }
+
+    /// Writes a miniature, oracle-derived `QwenImage21Pipeline` checkpoint directory (`root`)
+    /// that loads and executes full GPU T2I + TI2I + RGBA + CFG generation in ~15 ms.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn write_synthetic_qwen_image_pipeline_dir(root: &Path) {
+        use crate::loader::SafetensorsArchive;
+
+        for sub in [
+            "processor",
+            "scheduler",
+            "text_encoder",
+            "transformer",
+            "vae",
+        ] {
+            fs::create_dir_all(root.join(sub)).unwrap();
+        }
+
+        let image_pad_id = {
+            use tokenizers::AddedToken;
+            use tokenizers::models::bpe::{BPE, Vocab};
+            let mut vocab_map = Vocab::default();
+            vocab_map.insert("[UNK]".to_owned(), 0);
+            for (next_id, ch) in (1u32..).zip(
+                ['\t', '\n', '\r']
+                    .into_iter()
+                    .chain((0x20u8..=0x7eu8).map(|b| b as char)),
+            ) {
+                vocab_map.insert(ch.to_string(), next_id);
+            }
+            let bpe = BPE::builder()
+                .vocab_and_merges(vocab_map, Vec::new())
+                .unk_token("[UNK]".to_owned())
+                .build()
+                .unwrap();
+            let mut tok = tokenizers::Tokenizer::new(bpe);
+            let added: Vec<AddedToken> = [
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+                "<|vision_start|>",
+                "<|vision_end|>",
+                "<|image_pad|>",
+                SYS_PROMPT,
+                "system\n",
+                "user\n",
+                "assistant\n",
+                "Picture ",
+            ]
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+            tok.add_special_tokens(&added);
+            let pad_id = tok.token_to_id("<|image_pad|>").unwrap() as i32;
+            tok.save(root.join("processor/tokenizer.json"), false)
+                .unwrap();
+            pad_id
+        };
+
+        fs::write(
+            root.join("model_index.json"),
+            serde_json::to_vec(&json!({
+                "_class_name": "QwenImage21Pipeline",
+                "sample_sigmas": [1.0, 0.5]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("scheduler/scheduler_config.json"),
+            serde_json::to_vec(&json!({
+                "_class_name": "FlowMatchEulerDiscreteScheduler",
+                "base_image_seq_len": 256,
+                "base_shift": 0.5,
+                "invert_sigmas": false,
+                "max_image_seq_len": 8192,
+                "max_shift": 0.9,
+                "num_train_timesteps": 1000,
+                "shift": 1.0,
+                "shift_terminal": 0.02,
+                "stochastic_sampling": false,
+                "time_shift_type": "exponential",
+                "use_beta_sigmas": false,
+                "use_dynamic_shifting": true,
+                "use_exponential_sigmas": false,
+                "use_karras_sigmas": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("text_encoder/config.json"),
+            serde_json::to_vec(&json!({
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "model_type": "qwen3_vl",
+                "vision_config": {
+                    "depth": 2,
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_heads": 4,
+                    "in_channels": 3,
+                    "out_hidden_size": 256,
+                    "patch_size": 16,
+                    "spatial_merge_size": 2,
+                    "temporal_patch_size": 2,
+                    "num_position_embeddings": 16,
+                    "deepstack_visual_indexes": [0, 1],
+                    "image_token_id": image_pad_id
+                },
+                "text_config": {
+                    "model_type": "qwen3_vl_text",
+                    "vocab_size": 128,
+                    "hidden_size": 256,
+                    "intermediate_size": 512,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 128,
+                    "rms_norm_eps": 1e-6,
+                    "rope_theta": 5000000.0,
+                    "rope_scaling": {
+                        "mrope_interleaved": true,
+                        "mrope_section": [24, 20, 20],
+                        "rope_type": "default"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("transformer/config.json"),
+            serde_json::to_vec(&json!({
+                "_class_name": "QwenImage21Transformer2DModel",
+                "patch_size": 1,
+                "in_channels": 4,
+                "out_channels": 4,
+                "num_layers": 1,
+                "attention_head_dim": 128,
+                "num_attention_heads": 2,
+                "context_in_dim": 256,
+                "mlp_ratio": 2,
+                "axes_dims_rope": [16, 56, 56],
+                "causal_condition": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("vae/config.json"),
+            serde_json::to_vec(&json!({
+                "_class_name": "AutoencoderKLQwenImage21",
+                "base_dim": 4,
+                "decoder_base_dim": 4,
+                "z_dim": 4,
+                "dim_mult": [1, 2, 4, 4, 4],
+                "num_res_blocks": 1,
+                "attn_scales": [],
+                "temperal_downsample": [false, false, true, true],
+                "in_channels": 4,
+                "out_channels": 4,
+                "is_residual": true,
+                "latents_mean": [0.0, 0.1, -0.1, 0.05],
+                "latents_std": [1.0, 1.1, 0.9, 1.05]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/fixtures/qwen_image_ops.safetensors");
+        let arch =
+            SafetensorsArchive::open(&fixture_path).expect("open qwen_image_ops.safetensors");
+        let mut entries: Vec<(String, Vec<usize>)> = arch
+            .iter_entries()
+            .map(|(k, e)| (k.to_owned(), e.shape.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // 1. text_encoder/model.safetensors
+        let mut vl_tensors = Vec::new();
+        for (key, orig_shape) in &entries {
+            if key.starts_with("model.") {
+                let mut shape = orig_shape.clone();
+                let mut bits = arch.read_f16_bits(key).unwrap();
+                if key == "model.language_model.embed_tokens.weight" {
+                    // Expand [64, 256] -> [128, 256] to cover the synthetic ASCII + special vocab
+                    let copy = bits.clone();
+                    bits.extend_from_slice(&copy);
+                    shape[0] = 128;
+                }
+                vl_tensors.push((key.as_str(), shape, bits));
+            }
+        }
+        write_f16_safetensors_file(&root.join("text_encoder/model.safetensors"), &vl_tensors);
+
+        // 2. transformer/diffusion_pytorch_model.safetensors
+        let mut dit_tensors = Vec::new();
+        for (key, orig_shape) in &entries {
+            if let Some(stripped) = key.strip_prefix("dit.weight.") {
+                let mut shape = orig_shape.clone();
+                let mut bits = arch.read_f16_bits(key).unwrap();
+                match stripped {
+                    "img_in.weight" => {
+                        // Slice [256, 8] -> [256, 4] for z_dim = 4
+                        let mut sliced = Vec::with_capacity(256 * 4);
+                        for row in bits.as_chunks::<8>().0 {
+                            sliced.extend_from_slice(&row[..4]);
+                        }
+                        bits = sliced;
+                        shape = vec![256, 4];
+                    }
+                    "proj_out.weight" => {
+                        // Slice [8, 256] -> [4, 256] for z_dim = 4
+                        bits.truncate(4 * 256);
+                        shape = vec![4, 256];
+                    }
+                    "txt_in.text_norm.weight" => {
+                        // Repeat [64] -> [256] for context_in_dim = 256
+                        bits = bits.repeat(4);
+                        shape = vec![256];
+                    }
+                    "txt_in.in_layer.weight" => {
+                        // Repeat cols [256, 64] -> [256, 256] for context_in_dim = 256
+                        let mut expanded = Vec::with_capacity(256 * 256);
+                        for row in bits.as_chunks::<64>().0 {
+                            for _ in 0..4 {
+                                expanded.extend_from_slice(row);
+                            }
+                        }
+                        bits = expanded;
+                        shape = vec![256, 256];
+                    }
+                    _ => {}
+                }
+                dit_tensors.push((stripped, shape, bits));
+            }
+        }
+        write_f16_safetensors_file(
+            &root.join("transformer/diffusion_pytorch_model.safetensors"),
+            &dit_tensors,
+        );
+
+        // 3. vae/diffusion_pytorch_model.safetensors
+        let mut vae_tensors = Vec::new();
+        for (key, orig_shape) in &entries {
+            if let Some(stripped) = key.strip_prefix("vae5.weight.") {
+                let bits = arch.read_f16_bits(key).unwrap();
+                vae_tensors.push((stripped, orig_shape.clone(), bits));
+            }
+        }
+        write_f16_safetensors_file(
+            &root.join("vae/diffusion_pytorch_model.safetensors"),
+            &vae_tensors,
+        );
     }
 
     #[test]
@@ -2271,7 +2555,8 @@ mod tests {
     #[test]
     fn gpu_qwen_image_vae_encode_decode_and_tiling_match_oracle() {
         use crate::cuda::{
-            CudaDevice, CudaStream, DeviceBuffer, f16_to_f32, f32_to_f16, prepare_execution_plan,
+            CudaDevice, CudaStream, DeviceBuffer, f16_to_f32, f32_to_f16,
+            prepare_qwen_image_execution_plan,
         };
         use crate::qwen_image::vae::{
             QwenImage21VaeEngine, QwenImage21VaeTilingConfig, QwenImage21VaeWeightsGpu,
@@ -2287,7 +2572,7 @@ mod tests {
         let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        prepare_execution_plan(0).unwrap();
+        prepare_qwen_image_execution_plan(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
         let ex = stream.exec(0, 0);
 
@@ -2850,7 +3135,7 @@ mod tests {
     fn gpu_qwen_image_gated_residual_over_65535_rows_and_pipelined_tp2_allreduce() {
         use crate::cuda::{
             CudaDevice, CudaGraph, CudaStream, DeviceBuffer, Tp2Collectives, check_rc, f16_to_f32,
-            f32_to_f16, prepare_execution_plan,
+            f32_to_f16, prepare_qwen_image_execution_plan,
         };
         use std::ffi::c_void;
         use warp34_kernels::ffi;
@@ -2861,7 +3146,7 @@ mod tests {
         let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        prepare_execution_plan(0).unwrap();
+        prepare_qwen_image_execution_plan(0).unwrap();
         let _dev = CudaDevice::set_current(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
         let ex = stream.exec(0, 0);
@@ -2923,7 +3208,7 @@ mod tests {
         // 2. Test >= 512 KiB `Tp2Collectives::all_reduce_pipelined_f16` (1 MiB = 524,288 FP16 elems)
         // including CUDA Graph capture + replay across 2 GPUs when available.
         if CudaDevice::count().unwrap_or(0) >= 2 {
-            prepare_execution_plan(1).unwrap();
+            prepare_qwen_image_execution_plan(1).unwrap();
             let n_elems = 524_288usize; // 1 MiB -> exercises 8-chunk pipelined DMA + RX kernel
             let comm = std::sync::Arc::new(Tp2Collectives::new_for_tp(2, n_elems * 2).unwrap());
             let in0: Vec<u16> = (0..n_elems)

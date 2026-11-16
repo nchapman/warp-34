@@ -460,6 +460,7 @@ pub(crate) fn run_greedy_diff(
         ..
     } = options;
     let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
+    ensure_llm_model_dir(&model, &resolved_model, "greedy-diff")?;
     if !image_urls.is_empty() && (spec_config.is_some() || verify_lossless) {
         return Err(
             "greedy-diff with --image does not support --speculative or --verify-lossless".into(),

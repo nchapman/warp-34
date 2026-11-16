@@ -75,9 +75,41 @@ pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
 
 #[cfg(feature = "cuda")]
 pub(crate) fn is_qwen_image_model(resolved_model: &str) -> bool {
-    crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(std::path::Path::new(
-        resolved_model,
-    ))
+    matches!(
+        crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)),
+        Ok(crate::loader::ModelKind::Image)
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_image_model_dir(
+    model: &str,
+    resolved_model: &str,
+    subcommand: &str,
+) -> Result<(), String> {
+    match crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)) {
+        Ok(crate::loader::ModelKind::Image) => Ok(()),
+        Ok(other) => Err(format!(
+            "model '{model}' is a {} model; use 'warp34 generate', 'warp34 chat', or 'warp34 bench', or pass a QwenImage21Pipeline model to 'warp34 {subcommand}'",
+            other.as_str()
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn ensure_llm_model_dir(
+    model: &str,
+    resolved_model: &str,
+    subcommand: &str,
+) -> Result<(), String> {
+    match crate::loader::ModelKind::detect_dir(std::path::Path::new(resolved_model)) {
+        Ok(crate::loader::ModelKind::Llm | crate::loader::ModelKind::Decision) => Ok(()),
+        Ok(crate::loader::ModelKind::Image) => Err(format!(
+            "model '{model}' is an image generation pipeline (ModelKind::Image); use 'warp34 image', 'warp34 bench-image', or 'warp34 serve' instead of 'warp34 {subcommand}'"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -124,6 +156,7 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         resolved_model,
         tp,
         tp_auto,
+        tp_explicit,
         prompt,
         negative_prompt,
         image_urls,
@@ -139,9 +172,13 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
         out_json,
         ..
     } = options;
+    ensure_image_model_dir(&model, &resolved_model, "image")?;
+    if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+        return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+    }
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
     let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
-    let requested_tp = if tp_auto { 0 } else { tp };
+    let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
         requested_tp,
@@ -203,6 +240,7 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
         resolved_model,
         tp,
         tp_auto,
+        tp_explicit,
         prompt,
         negative_prompt,
         image_urls,
@@ -219,9 +257,13 @@ pub(crate) fn run_bench_image(options: CudaCliOptions) -> Result<ExitCode, Strin
         out_json,
         ..
     } = options;
+    ensure_image_model_dir(&model, &resolved_model, "bench-image")?;
+    if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
+        return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
+    }
     let condition_images = load_cli_condition_images(&image_urls, allow_remote_images)?;
     let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
-    let requested_tp = if tp_auto { 0 } else { tp };
+    let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
         requested_tp,
@@ -1049,6 +1091,7 @@ pub(crate) fn run_chat(
         active_lora,
         ..
     } = options;
+    ensure_llm_model_dir(&model, &resolved_model, "chat")?;
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,

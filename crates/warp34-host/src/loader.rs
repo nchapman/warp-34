@@ -875,7 +875,7 @@ pub fn resolve_hf_model_dir(model_spec: &str) -> io::Result<PathBuf> {
     {
         let rev = rev.trim();
         let candidate = snapshots_dir.join(rev);
-        if candidate.join("config.json").exists() {
+        if candidate.join("config.json").exists() || candidate.join("model_index.json").exists() {
             return Ok(candidate);
         }
     }
@@ -884,7 +884,8 @@ pub fn resolve_hf_model_dir(model_spec: &str) -> io::Result<PathBuf> {
         for entry in fs::read_dir(&snapshots_dir)? {
             let entry = entry?;
             let p = entry.path();
-            if p.is_dir() && p.join("config.json").exists() {
+            if p.is_dir() && (p.join("config.json").exists() || p.join("model_index.json").exists())
+            {
                 candidates.push(p);
             }
         }
@@ -894,7 +895,7 @@ pub fn resolve_hf_model_dir(model_spec: &str) -> io::Result<PathBuf> {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no valid snapshot with config.json under {}",
+                "no valid snapshot with config.json or model_index.json under {}",
                 repo_dir.display()
             ),
         )

@@ -237,10 +237,6 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .route("/systemone", post(systemone_decide))
         .route("/v1/decisions", post(decisions_adapter))
         .route("/decisions", post(decisions_adapter))
-        .route("/v1/images/generations", post(llm_images_unsupported))
-        .route("/images/generations", post(llm_images_unsupported))
-        .route("/v1/images/edits", post(llm_images_unsupported))
-        .route("/images/edits", post(llm_images_unsupported))
         // Protect every inference, tokenization, model, and stored-response route,
         // including unversioned aliases, before reading bodies or fetching media.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -257,12 +253,6 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         ))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
         .with_state(state)
-}
-async fn llm_images_unsupported(State(s): State<Arc<OpenAiServerState>>) -> ApiError {
-    bad(format!(
-        "model '{}' is a language model; start `warp34 serve --model Qwen/Qwen-Image-2.1-Turbo` for /v1/images/*",
-        s.model_name
-    ))
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());

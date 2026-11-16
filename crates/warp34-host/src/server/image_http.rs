@@ -127,8 +127,9 @@ impl QwenImage21Worker {
             .map_err(|_| "image worker thread exited during initialization".to_string())??;
         let telemetry = Telemetry::new(TelemetryConfig {
             tp_size,
-            kv_format: "fp16".to_string(),
-            speculation: "none".to_string(),
+            kv_format: "fp16_dit_vae".to_string(),
+            speculation: "flow_match_euler".to_string(),
+            max_model_len: None,
         });
         telemetry.set_model(model_name.to_string());
         Ok(Self {
@@ -1490,5 +1491,310 @@ mod tests {
 
         // Corrupt JPEG magic bytes fail cleanly under bounded libjpeg-turbo decoder
         assert!(decode_condition_image_bytes(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x02]).is_err());
+    }
+
+    #[test]
+    fn size_spec_and_rgba_background_validation() {
+        assert_eq!(parse_size_spec(None, None, None).unwrap(), (None, None));
+        assert_eq!(
+            parse_size_spec(Some("auto"), None, None).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            parse_size_spec(Some("AUTO"), Some(512), Some(768)).unwrap(),
+            (Some(512), Some(768))
+        );
+        assert_eq!(
+            parse_size_spec(Some("512x768"), None, None).unwrap(),
+            (Some(512), Some(768))
+        );
+        assert_eq!(
+            parse_size_spec(Some("512X768"), None, None).unwrap(),
+            (Some(512), Some(768))
+        );
+        // Out-of-range width/height or malformed size rejected
+        assert!(parse_size_spec(None, Some(32), Some(512)).is_err());
+        assert!(parse_size_spec(None, Some(512), Some(4096)).is_err());
+        assert!(parse_size_spec(Some("32x32"), None, None).is_err());
+        assert!(parse_size_spec(Some("4096x4096"), None, None).is_err());
+        assert!(parse_size_spec(Some("bad"), None, None).is_err());
+        assert!(parse_size_spec(Some("abcx512"), None, None).is_err());
+        assert!(parse_size_spec(Some("512xabc"), None, None).is_err());
+
+        // resolve_rgba_output branches
+        assert!(resolve_rgba_output(Some("transparent"), false, &[]).unwrap());
+        assert!(resolve_rgba_output(Some("rgba"), false, &[]).is_err());
+        assert!(!resolve_rgba_output(Some("opaque"), false, &[]).unwrap());
+        assert!(resolve_rgba_output(Some("auto"), true, &[]).unwrap());
+        assert!(resolve_rgba_output(Some("purple"), false, &[]).is_err());
+    }
+
+    #[test]
+    fn multipart_rich_fields_validation() {
+        // Multipart rich fields & validation
+        let rgb = vec![120u8; 4 * 4 * 3];
+        let png = encode_png_bytes(&rgb, 4, 4, 3).unwrap();
+        let boundary = "----mpfull";
+        let mut mp = Vec::new();
+        for (k, v) in [
+            ("prompt", "Detailed scene"),
+            ("negative_prompt", "lowres"),
+            ("width", "128"),
+            ("height", "128"),
+            ("output_resolution", "256"),
+            ("num_inference_steps", "4"),
+            ("true_cfg_scale", "2.5"),
+            ("seed", "99"),
+            ("rgba", "true"),
+            ("n", "2"),
+            ("response_format", "b64_json"),
+            ("output_format", "png"),
+        ] {
+            mp.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        mp.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"images[]\"; filename=\"a.png\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        mp.extend_from_slice(&png);
+        mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let parsed = parse_multipart_image_request(
+            &format!("multipart/form-data; boundary={boundary}"),
+            &mp,
+            true,
+        )
+        .unwrap();
+        assert_eq!(parsed.prompt, "Detailed scene");
+        assert_eq!(parsed.negative_prompt.as_deref(), Some("lowres"));
+        assert_eq!(parsed.width, Some(128));
+        assert_eq!(parsed.height, Some(128));
+        assert_eq!(parsed.output_resolution, 256);
+        assert_eq!(parsed.num_inference_steps, Some(4));
+        assert_eq!(parsed.guidance_scale, 2.5);
+        assert_eq!(parsed.seed, 99);
+        assert!(parsed.rgba_output);
+        assert_eq!(parsed.n, 2);
+        assert_eq!(parsed.condition_images.len(), 1);
+
+        // Missing boundary or mask part rejected
+        assert!(parse_multipart_image_request("multipart/form-data", &mp, false).is_err());
+        let mp_mask = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nok\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"mask\"\r\n\r\n123\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            parse_multipart_image_request(
+                &format!("multipart/form-data; boundary={boundary}"),
+                mp_mask.as_bytes(),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn gpu_image_http_router_generations_edits_auth_health_metrics_and_route_isolation() {
+        use axum::http::StatusCode;
+
+        if crate::cuda::CudaDevice::count().unwrap_or(0) < 1 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        crate::qwen_image::tests::write_synthetic_qwen_image_pipeline_dir(tmp.path());
+        let dir_path = tmp.path().to_path_buf();
+
+        let api_key = crate::api_auth::ApiKey::new("test-image-secret".to_string()).unwrap();
+        let state = QwenImage21ServerState::from_loader_with_options(
+            "Qwen/Qwen-Image-2.1-Turbo".to_string(),
+            false,
+            true,
+            crate::server::ServeOptions {
+                api_key: Some(api_key),
+                ..Default::default()
+            },
+            move || {
+                let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                QwenImage21PipelineEngine::load(&dir_path, 1).map_err(|e| e.to_string())
+            },
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = image_router(state.clone());
+        let srv_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        // 1. Unauthenticated inference / models routes return 401
+        let unauth_resp = client
+            .get(format!("{base_url}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Public health & metrics endpoints succeed without auth
+        let health_resp = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+
+        let api_metrics_resp = client
+            .get(format!("{base_url}/api/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(api_metrics_resp.status(), StatusCode::OK);
+        let metrics_json: Value = api_metrics_resp.json().await.unwrap();
+        assert_eq!(metrics_json["config"]["kv_format"], "fp16_dit_vae");
+        assert_eq!(metrics_json["config"]["speculation"], "flow_match_euler");
+
+        // 3. Authenticated /v1/models
+        let models_resp = client
+            .get(format!("{base_url}/v1/models"))
+            .bearer_auth("test-image-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models_resp.status(), StatusCode::OK);
+        let models_json: Value = models_resp.json().await.unwrap();
+        assert_eq!(models_json["data"][0]["pipeline"], "QwenImage21Pipeline");
+
+        // 4. Non-image LLM routes are NOT enabled on an Image server (404 Not Found)
+        for unsupported_uri in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/systemone",
+            "/v1/decisions",
+            "/tokenize",
+        ] {
+            let resp = client
+                .post(format!("{base_url}{unsupported_uri}"))
+                .bearer_auth("test-image-secret")
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected {unsupported_uri} to be 404 on image server"
+            );
+        }
+
+        // 5. POST /v1/images/generations (JSON, RGBA + CFG + n=2 at 64x64)
+        let gen_resp = {
+            let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            client
+                .post(format!("{base_url}/v1/images/generations"))
+                .bearer_auth("test-image-secret")
+                .json(&json!({
+                    "prompt": "a crystalfox",
+                    "negative_prompt": "blurry",
+                    "size": "64x64",
+                    "resolution": 64,
+                    "steps": 2,
+                    "guidance_scale": 2.0,
+                    "seed": 11,
+                    "rgba": true,
+                    "n": 2
+                }))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(gen_resp.status(), StatusCode::OK);
+        let gen_json: Value = gen_resp.json().await.unwrap();
+        let data_arr = gen_json["data"].as_array().unwrap();
+        assert_eq!(data_arr.len(), 2);
+        assert_eq!(data_arr[0]["channels"], 4);
+        assert_eq!(data_arr[0]["width"], 64);
+        assert_eq!(data_arr[0]["height"], 64);
+        assert_ne!(data_arr[0]["b64_json"], data_arr[1]["b64_json"]);
+
+        // 6. POST /v1/images/edits (multipart/form-data with PNG condition image at 64x64)
+        let cond_png = encode_png_bytes(&vec![150u8; 64 * 64 * 4], 64, 64, 4).unwrap();
+        let boundary = "----editbound";
+        let mut mp = Vec::new();
+        for (k, v) in [
+            ("prompt", "make it glow"),
+            ("size", "64x64"),
+            ("resolution", "64"),
+            ("steps", "2"),
+        ] {
+            mp.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        mp.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cond.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        mp.extend_from_slice(&cond_png);
+        mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let edit_resp = {
+            let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            client
+                .post(format!("{base_url}/v1/images/edits"))
+                .bearer_auth("test-image-secret")
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(mp)
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(edit_resp.status(), StatusCode::OK);
+
+        // 7. Prometheus text metrics reflect completed requests
+        let prom_resp = client
+            .get(format!("{base_url}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(prom_resp.status(), StatusCode::OK);
+        let prom_text = prom_resp.text().await.unwrap();
+        assert!(
+            prom_text.contains("warp34_requests_total"),
+            "unexpected prom_text: {prom_text}"
+        );
+
+        // 8. Shutdown transitions /health and /v1/images/generations to 503 Service Unavailable
+        let _ = state.worker.shutdown().await;
+        let stopped_health = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stopped_health.status(), StatusCode::SERVICE_UNAVAILABLE);
+        srv_handle.abort();
     }
 }

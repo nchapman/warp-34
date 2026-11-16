@@ -18,7 +18,7 @@ use warp34_kernels::ffi;
 
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaStream, DeviceBuffer, Result, check_rc, f16_to_f32,
-    f32_to_f16, prepare_execution_plan,
+    f32_to_f16, prepare_qwen_image_execution_plan,
 };
 use crate::loader::SafetensorsArchive;
 use crate::qwen_image::QwenImage21VaeConfig;
@@ -881,7 +881,7 @@ impl QwenImage21VaeEngine {
     /// Creates a new `QwenImage21VaeEngine` on `weights.device_id`.
     pub fn new(weights: QwenImage21VaeWeightsGpu) -> Result<Self> {
         let device_id = weights.device_id;
-        prepare_execution_plan(device_id)?;
+        prepare_qwen_image_execution_plan(device_id)?;
         let stream = CudaStream::new(device_id)?;
         let cublas = CublasHandle::new(&stream)?;
         Ok(Self {
