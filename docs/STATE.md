@@ -1,5 +1,15 @@
 # warp34 — Session Orientation & Current State
 
+## Public Release Preparation: Apache-2.0 Licensing, Documentation Sync, Strict Lints, & Unit Coverage
+
+- **Licensing & Package Metadata (`LICENSE`, `NOTICE`, `Cargo.toml`, `crates/*/Cargo.toml`, `Dockerfile`):**
+  - Added root `Apache-2.0` `LICENSE` and third-party attribution `NOTICE` (`IST-DASLab/marlin`, `vLLM`, `vllm.cpp`, `SGLang`, `llama.cpp`, `Qwen`), copied both into the runtime stage of `Dockerfile`, and populated `license = "Apache-2.0"`, `repository`, `homepage`, `readme`, `keywords`, and `categories` across workspace and crate manifests.
+- **Documentation Sync & Repository Pruning (`README.md`, `docs/`, `benchmarks/MODELS.md`, `.gitignore`):**
+  - Synced `README.md`, `docs/{ROADMAP,SERVING,HARDWARE}.md`, and `benchmarks/MODELS.md` with current model families, CLI flags (`chat`, `--realistic-prompt`, `--no-webui`), and verified throughput tables; pruned 32 point-in-time audit/planning/intermediate markdown files and added `/outputs/` to `.gitignore`.
+- **Idiomatic Rust Pass, Strict Workspace Lints, & Unit Coverage (`Cargo.toml`, `crates/warp34-host/`):**
+  - Enabled `rust_2018_idioms` and 21 curated Clippy lints (`assigning_clones`, `bool_to_int_with_if`, `checked_conversions`, `cloned_instead_of_copied`, `dbg_macro`, `explicit_iter_loop`, `implicit_clone`, `inefficient_to_string`, `large_futures`, `manual_assert`, `manual_let_else`, `map_unwrap_or`, `needless_continue`, `redundant_closure`, `redundant_else`, `semicolon_if_nothing_returned`, `todo`, `trivially_copy_pass_by_ref`, `unimplemented`, `uninlined_format_args`, `use_self`) with zero warnings across `--all-targets` (CPU and CUDA).
+  - Expanded `--lib` unit test coverage (`346` CUDA/host unit tests, `191` CPU unit tests) across `hub/progress.rs`, `scheduled_vision.rs`, `server/decision_http.rs`, `cli/{oracle,commands}.rs`, `proposer/scheduled.rs`, `dflash.rs`, `decision/scoring.rs`, `model/sampling.rs`, and `engine_worker/runner.rs`.
+
 ## Context-Bounded Output Token Budgets & Speculative Boundary Fixes
 
 - **Removed hardcoded `4,096` output-token ceiling & hardened coding-agent context/KV semantics (`crates/warp34-host/src/{loader/config.rs,server.rs,server/http.rs,responses_api.rs,anthropic_api.rs,engine_worker.rs,engine_worker/runner.rs}`):**
