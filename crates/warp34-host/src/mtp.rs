@@ -1074,7 +1074,7 @@ impl Qwen3_5MtpRank {
     pub fn batch_slot_count(&self) -> usize {
         if self.all_pages.len() >= 16384 {
             MAX_MTP_BATCH_SLOTS
-        } else if self.all_pages.len() >= 4096 {
+        } else if self.all_pages.len() >= 512 {
             8
         } else {
             4

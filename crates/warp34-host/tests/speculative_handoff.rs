@@ -625,11 +625,11 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
 
     assert_eq!(burst_worker.stats.peak_active.load(Ordering::Relaxed), 4);
     assert!(
-        rounds_after_burst >= 110,
+        rounds_after_burst >= 80,
         "8-request burst under max_num_seqs=4 must stay in batched MTP instead of plain fallback, got {rounds_after_burst} rounds"
     );
     assert!(
-        rounds_after_followup >= rounds_after_burst + 50,
+        rounds_after_followup >= rounds_after_burst + 30,
         "4-request follow-up wave must execute batched MTP verify rounds, before={rounds_after_burst} after={rounds_after_followup}"
     );
     assert!(

@@ -1777,11 +1777,13 @@ impl PrePoolModelRank {
                 capacity.dflash_min_state_slots,
             )));
         }
-        if rank == 0 && capacity.state_slots.is_some() && total_state_slots < requested_state_slots
+        if rank == 0
+            && capacity.state_slots.is_some()
+            && total_state_slots < effective_requested_state_slots
         {
             eprintln!(
                 "warning: serving GDN state pool clamped from {} to {} slots (~{} concurrent active sequences) due to VRAM budget",
-                requested_state_slots,
+                effective_requested_state_slots,
                 total_state_slots,
                 (total_state_slots / 3).max(1),
             );

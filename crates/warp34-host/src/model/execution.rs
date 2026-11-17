@@ -244,6 +244,14 @@ impl Qwen3_5Engine {
             if let Some(ple_st) = &r.state_pool.ple_conv_state {
                 ple_st.zero_async(&r.stream)?;
             }
+            if let Some(tmoe) = &mut r.tiered_moe {
+                tmoe.sync_all_dirty_from_device(&r.stream)?;
+                for (store, cache) in tmoe.stores.iter().zip(&mut tmoe.caches) {
+                    if cache.adapted_slots_dirty {
+                        cache.restore_initial_if_adapted(store, &mut tmoe.ws, &r.stream)?;
+                    }
+                }
+            }
             r.stream.synchronize()?;
         }
         Ok(())

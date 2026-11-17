@@ -754,12 +754,14 @@ impl NativeProposer {
         let batch_len = items.len();
         let k_cap = match &self.ranks {
             Ranks::Mtp(_) => {
-                if batch_len >= 3 {
-                    if self.max_rows > 256 {
+                if batch_len >= 5 {
+                    if self.max_rows > 256 || engine.cfg.num_experts > 0 || engine.tp_size > 1 {
                         self.k.min(2)
                     } else {
                         self.k.min(1)
                     }
+                } else if batch_len >= 3 {
+                    self.k.min(2)
                 } else {
                     self.k
                 }
