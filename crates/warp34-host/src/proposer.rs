@@ -1861,8 +1861,7 @@ impl NativeProposer {
     ) -> Result<RadixBenchMetrics> {
         let total = prompt
             .len()
-            .checked_add(max_new)
-            .and_then(|n| n.checked_add(self.k + 1))
+            .checked_add(max_new.max(1))
             .ok_or_else(|| loader_err("speculative length overflow"))?;
         if prompt.is_empty()
             || total > self.capacity

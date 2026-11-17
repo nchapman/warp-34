@@ -458,21 +458,28 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         .or_else(|| request.get("adapter"))
         .and_then(Value::as_str);
     let (lora_id, served_model) = s.resolve_request_lora(req_model, explicit_lora)?;
-    let max_tokens = request
+    let explicit_max_tokens = match request
         .get("max_completion_tokens")
         .or_else(|| request.get("max_tokens"))
-        .map_or(Ok(256), |n| {
-            n.as_u64()
+        .filter(|v| !v.is_null())
+    {
+        None => None,
+        Some(n) => {
+            let n = n
+                .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .ok_or("invalid max_tokens")
-        })?;
-    if max_tokens == 0 {
-        return Err("max_tokens must be positive".into());
-    }
+                .ok_or("invalid max_tokens")?;
+            if n == 0 {
+                return Err("max_tokens must be positive".into());
+            }
+            Some(n)
+        }
+    };
+    let initial_max_tokens = explicit_max_tokens.unwrap_or(super::MAX_OUTPUT_TOKENS);
     let mut params = if chat {
-        super::native_sampling_params(&request, max_tokens)?
+        super::native_sampling_params(&request, initial_max_tokens)?
     } else {
-        super::completion_sampling_params(&request, max_tokens)?
+        super::completion_sampling_params(&request, initial_max_tokens)?
     };
     params.eos_token_ids.clone_from(&s.worker.eos_token_ids);
     if params
@@ -534,6 +541,18 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         .collect();
     if prompt.is_empty() {
         return Err("prompt must be nonempty".into());
+    }
+    params.max_tokens = match explicit_max_tokens {
+        Some(n) => n,
+        None if chat => s.worker.max_model_len().saturating_sub(prompt.len()).max(1),
+        None => s
+            .worker
+            .max_model_len()
+            .saturating_sub(prompt.len())
+            .clamp(1, super::DEFAULT_COMPLETION_MAX_TOKENS),
+    };
+    if params.min_tokens > params.max_tokens {
+        return Err("min_tokens exceeds max_tokens".into());
     }
     let constraint = match crate::request_constraints::RequestConstraint::parse(&request)? {
         Some(spec) => {
@@ -1152,6 +1171,7 @@ async fn responses_create(
     let prep_state = s.clone();
     let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
     meta.model.clone_from(&prepared.served_model);
+    meta.max_output_tokens = prepared.params.max_tokens;
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker

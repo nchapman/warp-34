@@ -501,10 +501,11 @@ pub fn translate_anthropic_to_chat(
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| AnthropicApiError::bad_request("invalid 'max_tokens'"))?;
-            if n == 0 || n > 4096 {
-                return Err(AnthropicApiError::bad_request(
-                    "'max_tokens' must be in 1..=4096",
-                ));
+            if n == 0 || n > crate::server::MAX_OUTPUT_TOKENS {
+                return Err(AnthropicApiError::bad_request(format!(
+                    "'max_tokens' must be in 1..={}",
+                    crate::server::MAX_OUTPUT_TOKENS
+                )));
             }
             n
         }
@@ -1459,5 +1460,21 @@ mod tests {
         assert_eq!(chat["presence_penalty"], 0.25);
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(chat["chat_template_kwargs"]["preserve_thinking"], true);
+
+        // Large max_tokens (> 4096) and thinking.budget_tokens >= 4096 are accepted
+        let (large_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 16_384,
+                "thinking": {"type": "enabled", "budget_tokens": 8_192},
+                "messages": [{"role": "user", "content": "solve"}]
+            }),
+            "q",
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(large_chat["max_tokens"], 16_384);
+        assert_eq!(large_chat["chat_template_kwargs"]["enable_thinking"], true);
     }
 }

@@ -198,4 +198,29 @@ describe("dashboard states", () => {
     expect(screen.getByText("1,000")).toBeVisible();
     expect(screen.getByText("Mean decision E2E")).toBeVisible();
   });
+  it("scales Connect output token budgets above 4096 for long-context servers", () => {
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-4B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "mtp",
+                max_model_len: 65536,
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(
+      screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384/),
+    ).toBeVisible();
+  });
 });

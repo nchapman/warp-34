@@ -50,9 +50,7 @@ pub(crate) fn try_lookup_scheduled_suffix_drafts(
 impl NativeProposer {
     #[inline]
     pub(crate) fn fits_capacity(&self, prompt_len: usize, max_new: usize) -> Option<usize> {
-        let total = prompt_len
-            .checked_add(max_new)
-            .and_then(|n| n.checked_add(self.k + 1))?;
+        let total = prompt_len.checked_add(max_new.max(1))?;
         (total <= self.capacity).then_some(total)
     }
 
@@ -452,9 +450,7 @@ impl NativeProposer {
         if slot_cap < 32 {
             return false;
         }
-        let need = prompt_len
-            .saturating_add(max_new.max(1))
-            .saturating_add(self.k);
+        let need = prompt_len.saturating_add(max_new.max(1));
         need <= slot_cap
     }
 

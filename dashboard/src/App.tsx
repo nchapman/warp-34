@@ -647,7 +647,10 @@ function ConnectionGuide({
       : kvPages && kvPages > 0
         ? kvPages * 16
         : 32768;
-  const maxOutTokens = Math.min(4096, Math.max(512, Math.floor(ctxTokens / 4)));
+  const maxOutTokens = Math.min(
+    32768,
+    Math.max(512, Math.floor(ctxTokens / 4)),
+  );
   const compactLimit = Math.floor(ctxTokens * 0.75);
 
   const guides: AgentGuideSpec[] = [
@@ -656,7 +659,7 @@ function ConnectionGuide({
       title: "Claude Code",
       protocol: "Anthropic Messages API · /v1/messages",
       summary:
-        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. Set CLAUDE_CODE_MAX_OUTPUT_TOKENS within warp34's 4,096-token per-turn output cap; warp34 natively serves /v1/messages/count_tokens and strips cch= billing headers so MambaRadixCache prefixes stay warm.",
+        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to size each turn's output budget within the active context window; warp34 natively serves /v1/messages/count_tokens and strips cch= billing headers so MambaRadixCache prefixes stay warm.",
       snippets: [
         {
           label: "Quick launch (terminal)",
@@ -962,11 +965,31 @@ function DashboardShell({ state }: { state: MetricsState }) {
           <Route path="/" element={<Overview state={state} />} />
           <Route
             path="/playground"
-            element={<Playground model={latest?.model ?? null} />}
+            element={
+              <Playground
+                model={latest?.model ?? null}
+                maxContextTokens={
+                  latest?.config.max_model_len ??
+                  (latest?.pools.kv.capacity
+                    ? latest.pools.kv.capacity * 16
+                    : null)
+                }
+              />
+            }
           />
           <Route
             path="/playground/:endpointId"
-            element={<Playground model={latest?.model ?? null} />}
+            element={
+              <Playground
+                model={latest?.model ?? null}
+                maxContextTokens={
+                  latest?.config.max_model_len ??
+                  (latest?.pools.kv.capacity
+                    ? latest.pools.kv.capacity * 16
+                    : null)
+                }
+              />
+            }
           />
           <Route
             path="/connect"

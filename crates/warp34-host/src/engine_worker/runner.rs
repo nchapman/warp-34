@@ -309,9 +309,9 @@ fn mtp_batch_pages_needed(
     prompt_len: usize,
     max_new_tokens: usize,
     reserved_pages: usize,
-    proposer_k: usize,
+    _proposer_k: usize,
 ) -> usize {
-    (prompt_len + max_new_tokens.max(1) + proposer_k + 1)
+    (prompt_len + max_new_tokens.max(1))
         .div_ceil(16)
         .max(reserved_pages)
 }

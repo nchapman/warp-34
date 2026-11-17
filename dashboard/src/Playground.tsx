@@ -34,6 +34,7 @@ import {
 
 interface PlaygroundProps {
   model: string | null;
+  maxContextTokens?: number | null;
   decisionMode?: boolean;
 }
 
@@ -120,7 +121,11 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
   });
 }
 
-export function Playground({ model, decisionMode = false }: PlaygroundProps) {
+export function Playground({
+  model,
+  maxContextTokens = null,
+  decisionMode = false,
+}: PlaygroundProps) {
   const navigate = useNavigate();
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -131,6 +136,8 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
 
   const [presetId, setPresetId] = useState<string>(initial.presetId);
   const activeModel = model ?? DEFAULT_MODEL;
+  const maxTokensLimit =
+    maxContextTokens && maxContextTokens > 0 ? maxContextTokens : 1_048_576;
 
   function updateRouteParams(nextEndpointId: string, nextPresetId: string) {
     const spec = ENDPOINTS.find((e) => e.id === nextEndpointId) ?? ENDPOINTS[0];
@@ -824,6 +831,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                           <ParameterBar
                             endpoint={endpoint}
                             body={bodyObj}
+                            maxTokensLimit={maxTokensLimit}
                             onUpdate={updateBodyObject}
                             disabled={inFlight}
                           />
@@ -1395,12 +1403,14 @@ function MethodBadge({ method }: { method: string }) {
 function ParameterBar({
   endpoint,
   body,
+  maxTokensLimit,
   onUpdate,
   disabled,
 }: {
   disabled: boolean;
   endpoint: EndpointSpec;
   body: Record<string, unknown>;
+  maxTokensLimit: number;
   onUpdate: (
     updater: (b: Record<string, unknown>) => Record<string, unknown>,
   ) => void;
@@ -1440,11 +1450,11 @@ function ParameterBar({
           className="w-24"
           type="number"
           min={minMaxTokens}
-          max={4096}
+          max={maxTokensLimit}
           value={maxTokens}
           onChange={(e) => {
             const val = Math.min(
-              4096,
+              maxTokensLimit,
               Math.max(minMaxTokens, Number(e.target.value) || minMaxTokens),
             );
             onUpdate((curr) => ({ ...curr, [maxTokensKey]: val }));
@@ -1521,7 +1531,10 @@ function ParameterBar({
                         ? curr.max_tokens
                         : 256;
                     next.thinking = { type: "enabled", budget_tokens: 1024 };
-                    next.max_tokens = Math.min(4096, Math.max(currMax, 2048));
+                    next.max_tokens = Math.min(
+                      maxTokensLimit,
+                      Math.max(currMax, 4096),
+                    );
                   } else {
                     next.thinking = { type: "disabled" };
                   }

@@ -993,7 +993,7 @@ fn run_chat_repl(
             let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
             let ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
             if kv_tokens > 0
-                && ids.len().saturating_add(max_tokens).saturating_add(4) > kv_tokens
+                && ids.len().saturating_add(max_tokens) > kv_tokens
                 && history.len() >= 2
             {
                 history.drain(0..2);

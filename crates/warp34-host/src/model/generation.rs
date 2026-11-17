@@ -100,8 +100,7 @@ impl Qwen3_5Engine {
         let mut sampler = crate::parser::SamplerV1::new(params, prompt_token_ids, constraint);
         let target_total_len = prompt_token_ids
             .len()
-            .checked_add(max_new_tokens)
-            .and_then(|v| v.checked_add(4))
+            .checked_add(max_new_tokens.max(1))
             .ok_or_else(|| loader_err("token length overflow in generate_with_radix_cache"))?;
         let needed_pages = target_total_len.div_ceil(16);
         let max_pool_pages = self.ranks[0].kv_pool.num_pages;
@@ -645,8 +644,7 @@ impl Qwen3_5Engine {
 
         let target_total_len = prompt_token_ids
             .len()
-            .checked_add(max_new_tokens)
-            .and_then(|v| v.checked_add(4))
+            .checked_add(max_new_tokens.max(1))
             .ok_or_else(|| loader_err("token length overflow in multimodal generate"))?;
         let needed_pages = target_total_len.div_ceil(16);
         if needed_pages > self.ranks[0].kv_pool.num_pages {

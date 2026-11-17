@@ -226,13 +226,20 @@ pub fn completion_logprobs(logs: &[serde_json::Value], offset: &mut usize) -> se
     json!({"tokens":tokens,"token_logprobs":probabilities,"top_logprobs":alternatives,"text_offset":offsets})
 }
 
+/// Maximum per-request output token budget (`1,048,576` tokens = `65,536` KV pages)
+/// accepted at the HTTP JSON validation boundary before per-engine `max_model_len` checks.
+pub const MAX_OUTPUT_TOKENS: usize = 65_536 * 16;
+
+/// Default output token budget (`256` tokens) for legacy `/v1/completions` when `max_tokens` is omitted.
+pub const DEFAULT_COMPLETION_MAX_TOKENS: usize = 256;
+
 pub fn native_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,
 ) -> Result<crate::parser::SamplingParams, String> {
     use crate::parser::SamplingParams;
-    if max_tokens == 0 || max_tokens > 4096 {
-        return Err("max_tokens must be in 1..=4096".into());
+    if max_tokens == 0 || max_tokens > MAX_OUTPUT_TOKENS {
+        return Err(format!("max_tokens must be in 1..={MAX_OUTPUT_TOKENS}"));
     }
     if req
         .get("stop_token_ids")
@@ -540,10 +547,15 @@ mod tests {
 
     #[test]
     fn test_native_sampling_params_bounds() {
-        // max_tokens = 0 must fail
+        // max_tokens = 0 or > MAX_OUTPUT_TOKENS must fail
         assert!(native_sampling_params(&serde_json::json!({}), 0).is_err());
-        // max_tokens > 4096 must fail
-        assert!(native_sampling_params(&serde_json::json!({}), 5000).is_err());
+        assert!(native_sampling_params(&serde_json::json!({}), MAX_OUTPUT_TOKENS + 1).is_err());
+
+        // Large output budgets (> 4096) up to MAX_OUTPUT_TOKENS are allowed at the parser layer
+        for valid_max in [5000, 16_384, 32_768, 65_536, MAX_OUTPUT_TOKENS] {
+            let p = native_sampling_params(&serde_json::json!({}), valid_max).unwrap();
+            assert_eq!(p.max_tokens, valid_max);
+        }
 
         // Valid request
         let req = serde_json::json!({

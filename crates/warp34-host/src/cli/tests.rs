@@ -906,7 +906,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, None, Some(&mtp)),
-        Some(256)
+        Some(2048)
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(16_384), Some(&mtp)),
@@ -935,8 +935,8 @@ fn positional_model_industry_aliases_and_sampling_validation() {
     assert!(extra_err.contains("unknown argument: extra"));
 
     // Subcommand-aware default max_tokens.
-    assert_eq!(parse(&["chat"]).max_tokens, 512);
-    assert_eq!(parse(&["generate"]).max_tokens, 256);
+    assert_eq!(parse(&["chat"]).max_tokens, 2048);
+    assert_eq!(parse(&["generate"]).max_tokens, 512);
     assert_eq!(parse(&["greedy-diff", "--golden", "g.json"]).max_tokens, 64);
 
     // Industry-standard flag aliases (vLLM, SGLang, llama.cpp).

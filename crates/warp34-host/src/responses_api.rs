@@ -906,25 +906,28 @@ pub fn translate_responses_to_chat(
     let (enable_thinking, reasoning_echo, response_format, text_echo) =
         parse_reasoning_and_text_config(obj)?;
 
-    let max_output_tokens = match obj
+    let explicit_max_output_tokens = match obj
         .get("max_output_tokens")
         .or_else(|| obj.get("max_tokens"))
         .filter(|v| !v.is_null())
     {
-        None => 256usize,
+        None => None,
         Some(v) => {
             let n = v
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| ResponsesApiError::bad_request("invalid max_output_tokens"))?;
-            if n == 0 || n > 4096 {
-                return Err(ResponsesApiError::bad_request(
-                    "max_output_tokens must be in 1..=4096",
-                ));
+            if n == 0 || n > crate::server::MAX_OUTPUT_TOKENS {
+                return Err(ResponsesApiError::bad_request(format!(
+                    "max_output_tokens must be in 1..={}",
+                    crate::server::MAX_OUTPUT_TOKENS
+                )));
             }
-            n
+            Some(n)
         }
     };
+    let max_output_tokens =
+        explicit_max_output_tokens.unwrap_or(crate::server::DEFAULT_COMPLETION_MAX_TOKENS);
 
     let stream = obj
         .get("stream")
@@ -987,7 +990,9 @@ pub fn translate_responses_to_chat(
     let mut chat_req = Map::new();
     chat_req.insert("model".into(), json!(model));
     chat_req.insert("messages".into(), Value::Array(messages.clone()));
-    chat_req.insert("max_tokens".into(), json!(max_output_tokens));
+    if let Some(max_out) = explicit_max_output_tokens {
+        chat_req.insert("max_tokens".into(), json!(max_out));
+    }
     chat_req.insert("stream".into(), json!(stream));
     chat_req.insert("parallel_tool_calls".into(), json!(parallel_tool_calls));
     chat_req.insert("temperature".into(), json!(temperature));

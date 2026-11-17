@@ -1794,7 +1794,7 @@ impl DFlash2Rank {
             total_tokens: m as i32,
             max_blocks_per_req: self.pages.len() as i32,
             max_q_len: m as i32,
-            max_seq_len: self.capacity as i32,
+            max_seq_len: (self.capacity + self.cfg.block_size) as i32,
             sliding_window: self.cfg.window as i32,
             mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
             sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
@@ -1807,7 +1807,7 @@ impl DFlash2Rank {
         let m = self.cfg.block_size;
         let before = self.committed;
         let after = before + m;
-        if after > self.capacity {
+        if before > self.capacity || after > self.capacity + m {
             return Err(loader_err("DFlash KV capacity exceeded"));
         }
         let mut meta = Vec::with_capacity(3 * m + 4);

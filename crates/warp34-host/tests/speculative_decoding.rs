@@ -240,6 +240,24 @@ fn exercise_http(engine: Qwen3_5Engine) {
             assert!(new_accepted >= accepted);
         }
     }
+    // Omitted max_tokens resolves to `max_model_len - prompt_len` (exact KV capacity boundary)
+    // and must still engage the native speculative proposer without falling back to plain decode.
+    let rounds_before_omitted = state.worker.stats.verify_rounds.load(Ordering::Relaxed);
+    let omitted_body = serde_json::json!({
+        "model": "native-spec-test",
+        "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+        "temperature": 0.0,
+        "stop": ["\n", "."],
+        "chat_template_kwargs": {"enable_thinking": false}
+    })
+    .to_string();
+    let omitted_resp =
+        common::raw_request(&state, "POST", "/v1/chat/completions", Some(&omitted_body));
+    assert!(omitted_resp.contains("200 OK"), "{omitted_resp}");
+    assert!(
+        state.worker.stats.verify_rounds.load(Ordering::Relaxed) > rounds_before_omitted,
+        "omitted max_tokens (exact max_model_len boundary) bypassed native proposer"
+    );
     common::shutdown(&state);
 }
 

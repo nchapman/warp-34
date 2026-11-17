@@ -221,8 +221,9 @@ pub(crate) struct ServeCliConfig {
 impl ServeCliConfig {
     /// Derives the target KV page request for `warp34 serve`:
     /// - When `--ctx-size` or `--kv-pages` was explicitly set, honors `kv_pages`.
-    /// - Otherwise, if `--max-model-len` was set and requires more pages than the default
-    ///   (or when `--speculative` is enabled, which otherwise defaults to 256 pages / 4096 tokens),
+    /// - When `--speculative` is enabled, pins the serving KV page request to
+    ///   `max_model_len.div_ceil(16)` or [`crate::model::DEFAULT_SERVING_TARGET_KV_PAGES`] (`2,048` pages = `32,768` tokens).
+    /// - Otherwise, if `--max-model-len` was set and requires more pages than the default,
     ///   auto-expands the target KV page request to accommodate `max_model_len`.
     pub(crate) fn effective_kv_pages(
         kv_pages: Option<usize>,
@@ -234,7 +235,11 @@ impl ServeCliConfig {
         }
         let needed_for_max_len = max_model_len.map(|tokens| tokens.div_ceil(16));
         if spec_config.is_some() {
-            Some(needed_for_max_len.unwrap_or(256).max(256))
+            Some(
+                needed_for_max_len
+                    .unwrap_or(crate::model::DEFAULT_SERVING_TARGET_KV_PAGES)
+                    .max(crate::model::DEFAULT_TARGET_KV_PAGES),
+            )
         } else if let Some(needed) = needed_for_max_len
             && needed > crate::model::DEFAULT_SERVING_TARGET_KV_PAGES
         {
@@ -461,8 +466,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut interactive = false;
     let mut sampling = CliSamplingOptions::default();
     let mut max_tokens = match sub {
-        "chat" => 512usize,
-        "generate" => 256usize,
+        "chat" => 2048usize,
+        "generate" => 512usize,
         _ => 64usize,
     };
     let mut prompt_len = 128usize;

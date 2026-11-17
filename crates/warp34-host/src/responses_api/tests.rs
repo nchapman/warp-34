@@ -480,6 +480,7 @@ fn validates_all_responses_bad_request_paths() {
         json!({"input": "hi", "temperature": "high"}),
         json!({"input": "hi", "top_p": "high"}),
         json!({"input": "hi", "max_output_tokens": 0}),
+        json!({"input": "hi", "max_output_tokens": crate::server::MAX_OUTPUT_TOKENS + 1}),
     ];
     for case in &bad_cases {
         assert!(
@@ -487,6 +488,22 @@ fn validates_all_responses_bad_request_paths() {
             "expected bad-request error for payload: {case}"
         );
     }
+    let (large_chat, large_meta) = translate_responses_to_chat(
+        &json!({"input": "hi", "max_output_tokens": 16_384}),
+        "q",
+        &store,
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(large_chat["max_tokens"], 16_384);
+    assert_eq!(large_meta.max_output_tokens, 16_384);
+
+    // Omitted max_output_tokens leaves chat_req["max_tokens"] unset so prepare() resolves
+    // the remaining context budget after prompt tokenization.
+    let (omitted_chat, _) =
+        translate_responses_to_chat(&json!({"input": "hi"}), "q", &store, None, 2).unwrap();
+    assert!(omitted_chat.get("max_tokens").is_none());
 }
 
 #[test]

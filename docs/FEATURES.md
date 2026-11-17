@@ -22,7 +22,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 * **CLI Flags & Argument Validation:**
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
   * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp16 | bf16` (default: `tq4`).
-  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (injects default of 256 target pages / 4,096 tokens when speculative decoding is active).
+  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, or 256 pages / 4,096 tokens in single-shot CLI commands).
   * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <positive integer>`.
   * **Model Hub & Offline Options:** `--revision <ref>`, `--draft-revision <ref>`, `--offline` (reads strictly from `HF_HUB_CACHE`).
   * **Multimodal Options:** `--image <path|url>`, `--allow-remote-images` (SSRF-protected HTTP/HTTPS retrieval).

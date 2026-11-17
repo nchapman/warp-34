@@ -140,8 +140,10 @@ plus requested output tokens before worker enqueue. It applies to all generative
 APIs, streaming and non-streaming, and to decision-model prefills (zero output
 budget). Over-limit requests fail with HTTP 400; there is no silent truncation.
 Token-count/tokenization endpoints are utilities and do not consume this budget.
-Absent output budgets still use each API's existing defaults, rather than silently
-shrinking the output budget to remaining capacity.
+When `max_completion_tokens` / `max_tokens` / `max_output_tokens` is omitted on
+`/v1/chat/completions` or `/v1/responses`, it defaults to the remaining context
+budget (`max_model_len - prompt_tokens`); legacy `/v1/completions` defaults omitted
+`max_tokens` to `min(256, max_model_len - prompt_tokens)`.
 
 ## Readiness, shutdown, and bounded recovery
 

@@ -768,4 +768,38 @@ describe("Playground UI integration", () => {
     );
     expect(screen.queryByAltText("Turn 2 attachment 1")).toBeNull();
   });
+
+  it("allows max_tokens above 4096 up to the active context limit", async () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-4B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                max_model_len: 32768,
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
+    const maxTokensInput = screen.getByLabelText(
+      "MAX_TOKENS",
+    ) as HTMLInputElement;
+    expect(maxTokensInput.max).toBe("32768");
+
+    fireEvent.change(maxTokensInput, { target: { value: "16384" } });
+    expect(maxTokensInput.value).toBe("16384");
+
+    fireEvent.change(maxTokensInput, { target: { value: "65536" } });
+    expect(maxTokensInput.value).toBe("32768");
+  });
 });

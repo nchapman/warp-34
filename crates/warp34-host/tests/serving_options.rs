@@ -164,7 +164,7 @@ fn disabled_webui_preserves_public_metrics_and_protected_apis() {
                 "Qwen/Qwen3.5-4B",
                 1,
                 KvFormatPolicy::Tq4,
-                Some(256),
+                Some(512),
                 true,
                 1,
             )
@@ -172,6 +172,7 @@ fn disabled_webui_preserves_public_metrics_and_protected_apis() {
         },
     )
     .unwrap();
+    assert_eq!(state.worker.max_model_len(), 8192);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -201,6 +202,7 @@ fn disabled_webui_preserves_public_metrics_and_protected_apis() {
                 .await
                 .unwrap();
             assert_eq!(metrics["model"], "private-engine");
+            check_large_and_omitted_output_budgets(&client, &base).await;
             stop_tx.send(()).unwrap();
             server.await.unwrap().unwrap();
         });
@@ -345,4 +347,76 @@ async fn check_context_limit(client: &reqwest::Client, base: &str) {
             assert!(response.text().await.unwrap().contains("context limit"));
         }
     }
+}
+
+async fn check_large_and_omitted_output_budgets(client: &reqwest::Client, base: &str) {
+    // 1. Explicit max_tokens > 4096 within the 8192-token context limit succeeds on /v1/chat/completions.
+    let chat_resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 5000,
+            "temperature": 0,
+            "stop": ["\n", "."],
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chat_resp.status(), 200);
+
+    // 2. Omitted max_output_tokens on /v1/responses resolves to remaining context (8192 - prompt_tokens).
+    let resp_omitted = client
+        .post(format!("{base}/v1/responses"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "input": "Reply with OK.",
+            "temperature": 0,
+            "stop": ["\n", "."],
+            "reasoning": {"effort": "none"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_omitted.status(), 200);
+    let resp_body: Value = resp_omitted.json().await.unwrap();
+    let input_toks = resp_body["usage"]["input_tokens"].as_u64().unwrap();
+    assert_eq!(
+        resp_body["max_output_tokens"].as_u64(),
+        Some(8192 - input_toks)
+    );
+
+    // 3. Anthropic /v1/messages accepts max_tokens > 4096 and thinking.budget_tokens >= 4096.
+    let anth_resp = client
+        .post(format!("{base}/v1/messages"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "max_tokens": 6000,
+            "thinking": {"type": "enabled", "budget_tokens": 5000},
+            "stop_sequences": ["\n", "."],
+            "messages": [{"role": "user", "content": "2+2="}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anth_resp.status(), 200);
+
+    // 4. Requesting prompt + max_tokens > 8192 is rejected with HTTP 400 context limit.
+    let over_resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "messages": [{"role": "user", "content": "Reply with OK."}],
+            "max_tokens": 8192
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over_resp.status(), 400);
+    assert!(over_resp.text().await.unwrap().contains("context limit"));
 }
