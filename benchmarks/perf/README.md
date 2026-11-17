@@ -6,15 +6,11 @@ run it without Cargo, CUDA libraries, engine packages, or `tools/oracle`.
 This is a black-box HTTP client, **not** an oracle, profiler, kernel microbench,
 or automatic benchmark-results claim.
 
-- **[Post-HGPTQ coverage audit and proposed refresh](COVERAGE_AUDIT.md)** — current gaps, checkpoint policy, and pod validation plan (not new results)
 - **[Where warp34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
-- [Completed campaign evidence and limitations](campaigns/completion-results.md)
 - **[Extended workload / soak runner](SOAK.md)** — duration + completion targets, sustained/burst replay, local disconnect injection, progress/resource gates and separate pass/fail receipts
-- [Single-GPU 10-minute 4/8 workload check](campaigns/soak-4b-10min.md) — memory trajectory, client latency and per-turn cache reuse; not long-duration qualification
-- [Plan and persistent task list](PLAN.md)
 - [Engine recipes, qualification, and KV matrix](engines.md)
 - [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases
-- [First 27B FP16 comparison](campaigns/27b-fp16-first.md) — warp34, vLLM, SGLang
+- [Comparison campaigns](campaigns/README.md) — 27B, 35B-A3B, Flash-Next, Decision models, and Open-SWE-Traces campaigns
 
 ## Quick start
 
@@ -68,11 +64,6 @@ fixture-specific quality gate or used to clear its publication blockers.
 
 ## Flash-Next HGPTQ refresh
 
-[Qualification outcome and retained evidence](campaigns/flash-next-hgptq.md):
-all six profiles completed the full campaign (90 trials, 432 measured requests).
-These are working-harness checks, **not locked performance baselines**; incorporate
-ongoing engine improvements before locking numbers.
-
 `campaigns/flash-next-hgptq.toml` adds six warp34 profiles: TP1/TP2 with plain
 decode, MTP-k3, and quantized DFlash2. It pins the HGPTQ target and drafter
 independently, uses an 8K target KV pool (512 pages), and reuses the existing
@@ -95,9 +86,7 @@ results from a different GPU/CPU/topology are not a controlled quant comparison.
 
 ## Completion campaigns, quality and retained evidence
 
-The [completion ledger](COMPLETION_PLAN.md) tracks current 27B and Flash Next
-work separately from historical results. The new campaign configurations are
-`campaigns/27b-completion.toml` and `campaigns/flash-next-serving.toml`.
+The campaign configurations `campaigns/27b-completion.toml` and `campaigns/flash-next-serving.toml` provide preset-driven runs (`quick`, `full`, `release`).
 
 ```sh
 python3 -m warp34perf plan campaigns/27b-completion.toml --preset quick
@@ -451,4 +440,4 @@ python3 -m warp34perf validate suite.toml
 ```
 
 Tests use pure calculations and real local HTTP/SSE servers. No engine, GPU,
-or oracle fixtures are needed. See `PLAN.md` for remaining release gates.
+or oracle fixtures are needed.

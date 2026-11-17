@@ -39,7 +39,7 @@ export GGUF=/absolute/path/to/unsloth/snapshot
 
 vLLM and SGLang now use cyankiwi AWQ: compressed-tensors pack-quantized,
 4-bit asymmetric group32. Unquantized MTP weights are present. A separate
-[vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md) passed plain/MTP-3
+`vLLM` `TP=2` smoke passed plain/MTP-3
 startup and short generation, but these **TP1 quality recipes remain unqualified**.
 New receipts are required; the historical GPTQ checks below do not qualify them. warp34
 continues to use nchapman HGPTQ; deprecated nchapman GPTQ is not a substitute.

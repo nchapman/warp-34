@@ -58,7 +58,7 @@ CUDA_VISIBLE_DEVICES=0,1 /workspace/vllm-venv/bin/vllm serve "$AWQ" \
 ```
 
 AWQ uses compressed-tensors pack-quantized 4-bit asymmetric group32 weights.
-Unquantized MTP weights are present. A separate [16K-context vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md)
+Unquantized MTP weights are present. A separate 16K-context `vLLM` `TP=2` smoke
 passed startup and short generation in plain/MTP-3 modes, but does not qualify
 this exact recipe or evaluation workload. Historical successful requests do not
 qualify this changed recipe.

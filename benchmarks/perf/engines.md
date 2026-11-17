@@ -323,10 +323,9 @@ CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
 Required KV measurements: short-context overhead, long-context decode, prefill,
 concurrency pressure, largest successful context and active sessions under a
 fixed memory budget, actual peak VRAM, and retrieval/functional quality. Evaluate
-both equal-workload latency and equal-hardware maximum capacity. The runner
-currently supplies latency/throughput shapes and retains failures; automatic
-capacity search, memory sampling, exact token buckets, and a quality battery are
-tracked in `PLAN.md`, not claimed complete.
+both equal-workload latency and equal-hardware maximum capacity. The runner currently supplies latency/throughput shapes and retains failures; automatic
+capacity search, memory sampling, exact token buckets, and quality checks are
+provided by the companion campaign and quality tools.
 
 ## Speculation and dual-card lanes
 

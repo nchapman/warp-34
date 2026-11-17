@@ -20,7 +20,7 @@ not an evaluator adapter. Earlier [mixed-KV single-GPU checks](single-gpu.md),
 and [TP2 qualification](QUALIFICATION.md) remain historical records, not a baseline
 for new models. The active suite uses nchapman HGPTQ for warp34 and cyankiwi AWQ
 for vLLM/SGLang. These quality recipes still need requalification; old results
-do not transfer. A separate [vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md)
+do not transfer. A separate `vLLM` `TP=2` smoke
 passed startup/short generation, not quality evaluation. [Updated TP2 recipes](servers.md)
 with different limits likewise remain unqualified.
 

@@ -2,7 +2,7 @@
 
 `warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4/FP8 KV) targeting **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** (primary targets: A100 40GB/80GB, RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
 
-This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. **Implementation is not production qualification.** Scope-specific grades, evidence, limitations, and release gates live in [`READINESS.md`](READINESS.md); the launch checklist lives in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).
+This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. Verified benchmark and hardware qualification results live in [`STATE.md`](STATE.md).
 
 The 22 section numbers are stable inventory references. Readiness IDs group their bullets into independently assessable contracts; implementation details inherit the assessment of their owning capability, not a separate production guarantee.
 
@@ -290,7 +290,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * `block_tq4_0`: 66 bytes per 128 elements (4.125 bpw) with independent per-128 least-squares FP16 scales.
   * Randomized orthonormal rotation: Seed-42 Rademacher + Fast Walsh-Hadamard Transform (WHT-256) eliminates outlier dimensions prior to quantization.
   * 16-centroid `Beta(256)` Lloyd-Max codebook stored in `__constant__` memory and register shuffle caches.
-  * **Boundary-Anchored KV Policy:** The last 4 full-attention layers remain in unrotated `Q8_0` (272 B/row) while preceding layers use `TQ4` (132 B/row), limiting quantization error. TQ4 is lossy: historical greedy token agreement varies by model and prompt; see [`STATE.md`](STATE.md) and the quality gate in [`READINESS.md`](READINESS.md).
+  * **Boundary-Anchored KV Policy:** The last 4 full-attention layers remain in unrotated `Q8_0` (272 B/row) or `FP8_E4M3` (264 B/row on `sm_89+`) while preceding layers use `TQ4` (132 B/row), limiting quantization error. TQ4 is lossy: historical greedy token agreement varies by model and prompt; see [`STATE.md`](STATE.md).
 * **Paged Attention & FlashAttention Kernels:**
   * Cooperative 1-warp GQA decode kernel with register-shuffled TQ4 centroid dequantization.
   * Tensor core MMA decode and prefill kernels (`mma.sync.m16n8k16`) with Split-KV grid reductions.
@@ -363,7 +363,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 
 * **Optimized Docker Deployment:**
   * Multi-stage build process decoupling the Node/pnpm React dashboard compilation from the CUDA/Rust binary build.
-  * Runtime image based on `ubuntu:26.04` (historical shared-link runtime filesystem size ~775.6 MB; the ~575.4 MB static variant was an experiment, not the current default; see [`CUBLAS_PACKAGING_EXPERIMENT.md`](CUBLAS_PACKAGING_EXPERIMENT.md)) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
+  * Runtime image based on `ubuntu:26.04` (shared-link runtime filesystem size ~775.6 MB; the ~575.4 MB static variant was an experiment, not the current default) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
   * Security hardening: Runs under an unprivileged system user (`warp34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**

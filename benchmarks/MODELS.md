@@ -37,7 +37,7 @@ pin in [quality/AUTOMATION.md](quality/AUTOMATION.md).
 
 ## Serving smoke & multi-agent head-to-head evidence
 
-Both pins passed [vLLM 0.31.0 TP2 plain/MTP-3 startup and short generation](perf/qualification/cyankiwi-vllm-tp2-smoke.md)
+Both pins passed `vLLM 0.31.0` `TP=2` plain/`MTP-3` startup and short generation
 on 2× RTX 3090 Ti, and were subsequently measured in the full `Open-SWE-Traces` multi-client head-to-head campaign (`smoke-warmup`, `swe-c4-shared`, `swe-c4-unique`, `swe-c8-burst`, `swe-c12-overload`) across `TP=1` and `TP=2` against `warp34` `nchapman/*-W4A16-HGPTQ` and `SGLang v0.5.19` (recorded in [`docs/STATE.md`](../docs/STATE.md)).
 
 ## Comparing results

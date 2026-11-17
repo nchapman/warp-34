@@ -7,8 +7,6 @@ require new qualification; archived metrics do not transfer to the new weights.
 ## 27B FP16 — refreshed configuration, historical results
 
 - Configuration: [27b-fp16-first.toml](27b-fp16-first.toml)
-- Historical results only: [27b-fp16-first.md](27b-fp16-first.md). These predate
-  the corrected checkpoint policy and are not results for the current TOML.
 - Machine: one RTX 3090 Ti, GPU 0; engines run serially.
 - Models: nchapman HGPTQ for warp34; cyankiwi AWQ for vLLM/SGLang, pinned
   in the TOML. This is a practical cross-quant comparison, not identical weights.

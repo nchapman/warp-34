@@ -1,6 +1,6 @@
 # Contributing to warp34
 
-Start with [FEATURES](docs/FEATURES.md), the [readiness register](docs/READINESS.md), [architecture/contracts](docs/ROADMAP.md), and [hardware constraints](docs/HARDWARE.md). A feature's existence is not a blanket support guarantee. Report and preserve the configuration in which behavior is expected.
+Start with [FEATURES](docs/FEATURES.md), [architecture/contracts](docs/ROADMAP.md), and [hardware constraints](docs/HARDWARE.md). A feature's existence is not a blanket support guarantee. Report and preserve the configuration in which behavior is expected.
 
 ## Bug reports
 
@@ -34,7 +34,7 @@ python3 tools/prep_test_models.py --check
 CUDA_VISIBLE_DEVICES=0,1 WARP34_STRICT_TESTS=1 mise run check
 ```
 
-Choose device IDs appropriate to the available hardware. `mise run check` includes formatting, CUDA/CPU Clippy, rustdoc, CUDA release tests, oracle-tooling/performance-tooling tests and dashboard checks. Some tests require two GPUs, large cached checkpoints, or explicit `--ignored`; see the [release checklist](docs/RELEASE_CHECKLIST.md). Native fatbinary qualification also sets `CUDA_DISABLE_PTX_JIT=1`.
+Choose device IDs appropriate to the available hardware. `mise run check` includes formatting, CUDA/CPU Clippy, rustdoc, CUDA release tests, oracle-tooling/performance-tooling tests and dashboard checks. Some tests require two GPUs, large cached checkpoints, or explicit `--ignored`. Native fatbinary qualification also sets `CUDA_DISABLE_PTX_JIT=1`.
 
 Without a GPU, run `mise run test-cpu`, formatting/CPU Clippy and relevant Python/dashboard checks; disclose that GPU validation remains outstanding. Hosted CI currently builds CUDA but does not run GPU tests, and its Rust CPU execution covers library/doctests rather than all CPU integration tests. Maintainers must obtain a scoped GPU receipt for CUDA/runtime changes before treating them as qualified. Documentation-only changes need applicable documentation/link checks, not a new model benchmark.
 
@@ -47,6 +47,4 @@ Performance-sensitive changes also need before/after measurements on matched mod
 - [ ] Checks and relevant integration tests, with exact commands and results.
 - [ ] Hardware/fixtures, ignored/skipped cases, and untested configurations disclosed.
 - [ ] Matched benchmarks for performance changes; correctness/quality preserved.
-- [ ] Changes reviewed; compatibility/docs/readiness evidence updated.
-
-Release acceptance additionally requires [G0–G7](docs/READINESS.md#release-gates). These are review requirements, not a claim that branch protection or GPU CI enforcement is already configured.
+- [ ] Changes reviewed; compatibility/docs/state evidence updated.

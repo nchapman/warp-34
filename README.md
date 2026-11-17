@@ -265,7 +265,7 @@ Clients can authenticate with either `Authorization: Bearer <key>` or `x-api-key
 
 ## Docker
 
-**Packaging choice:** CUDA libraries are shared and copied into a separate layer before the executable, so routine application updates can reuse the cached library download. Pruned static cuBLAS saved space on first install, but made every changed executable layer much larger; see [the experiment and decision record](docs/CUBLAS_PACKAGING_EXPERIMENT.md).
+**Packaging choice:** CUDA libraries are shared and copied into a separate layer before the executable, so routine application updates can reuse the cached library download. Pruned static cuBLAS saved space on first install, but made every changed executable layer much larger (~442 MB vs ~40 MB).
 
 Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`). The multi-stage build ships `warp34`, shared `libcudart`/`libcublas`/`libcublasLt`, and a small Ubuntu 26.04 runtime with TLS certificates and a curl healthcheck—no Python, Node, CUDA toolkit, or model weights. Embedded CUDA code is size-compressed; native `sm_80`, `sm_86`, and `sm_89` kernels are included in the same image.
 
@@ -332,9 +332,7 @@ For end-to-end HTTP load testing across single-stream decode, concurrent `C=8..1
 
 | Guide | What's Inside |
 |---|---|
-| [`docs/FEATURES.md`](docs/FEATURES.md) | Front-to-back capability inventory (implementation, not production qualification) |
-| [`docs/READINESS.md`](docs/READINESS.md) | Stable capability IDs, provisional grades, evidence, scope limits and release gates |
-| [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | Production qualification sequence, commands, gate tracker and release receipt |
+| [`docs/FEATURES.md`](docs/FEATURES.md) | Front-to-back capability inventory |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Reproducible bug reports, regression-first fixes and PR verification requirements |
 | [`docs/MODELS.md`](docs/MODELS.md) | Model downloads, `--revision` / `--offline`, supported architectures, quantizations, and KV policies |
 | [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) | Full architecture & 3-tier offloading reference for `Qwen3.8-Flash-Next` (`qwen4_exp`) |

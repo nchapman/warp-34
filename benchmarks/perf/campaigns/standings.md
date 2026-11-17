@@ -48,8 +48,8 @@ Native MTP2 reaches **136.25** single-request / **108.39** agent tok/s; DFlash2
 reaches **169.70 / 141.41**. C8 remains about **462–466 tok/s**: the observed
 benefit is predominantly latency-oriented, not higher saturated throughput.
 vLLM's packed-MTP recipe failed startup; that cell has no performance score.
-SGLang MTP/DFlash2 and NInfer KV/MTP/multi-device outcomes are retained in the
-[advanced report](../qualification/27b-advanced-measurements.md).
+SGLang MTP/DFlash2 and NInfer KV/MTP/multi-device outcomes are retained in
+`qualification/27b-advanced-measurements.json`.
 
 TQ4 and TQ4_all each pass six early/late retrieval checks through **251,641
 server-reported prompt tokens**, plus the long HTTP workload campaign.
@@ -108,12 +108,9 @@ TP1's complete agent workload reached **251,982 prompt tokens**.
 
 ## Evidence and refresh
 
-- [Campaign outcomes and resource interpretation](completion-results.md)
-- [27B baseline report](../qualification/27b-baselines-measurements.md)
-- [Flash serving report](../qualification/flash-serving-measurements.md)
-- [Flash capacity report](../qualification/flash-capacity-measurements.md)
-- [Detailed latency/prefix/agent reports](../qualification/reports/)
-- Guarded comparison receipts: `qualification/{27b,flash}-comparison-receipt.json`.
+- [Long-context coding-agent campaign](longctx-coding-agent.md)
+- Guarded comparison receipts: `qualification/{27b,flash}-comparison-receipt.json`
+  and `qualification/*-measurements.json`.
   Full comparison JSON and raw evidence remain under `results/` (gitignored).
 - Frozen configs provide `--preset quick`, `full`, `release` (1/3/5 within-process
   repetitions). Full was measured here; quick/release are refreshable presets,

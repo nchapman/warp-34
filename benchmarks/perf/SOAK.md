@@ -150,5 +150,5 @@ verify the SHA-256 file inventory before transferring evidence to release storag
 Still outside this increment: image/grammar/Responses lifecycle mixtures,
 autonomous tools, semantic answer scoring, rank/device fault injection, server
 termination/restart/rollback, internal pool-conservation assertions, and fully
-automated production sign-off. A short smoke run does not qualify the eight-hour
-campaign or close [G3–G6](../../docs/RELEASE_CHECKLIST.md#gate-tracker).
+automated production sign-off. A short smoke run does not qualify an eight-hour
+endurance campaign.

@@ -1,6 +1,6 @@
 # HGPTQ refresh; historical flash-next-serving.toml remains separate.
 # Pod binary built from b7f5fdd; measured artifact hashes and full serving qualification.
-# See flash-next-hgptq.md: qualification only, not a locked performance baseline.
+# Qualification campaign, not a locked performance baseline.
 # Drafter pin is the validated local-cache revision, NOT current HF main.
 # Standalone HTTP campaign; launch one profile manually, never concurrently.
 # Supported means tested on this pinned pod deployment, not quality certification.
