@@ -18,14 +18,21 @@ Prefix GPU commands with `export PATH="/opt/cuda/bin:$PATH"` and select free car
 
 ```sh
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv              # check GPU squatters first
-mise run test-prep                                                        # verify/download pinned test models & oracle fixtures
-mise run build                                                            # cargo build --release --features cuda
-mise run check-quick                                                      # fmt --check + clippy + doc + simd/cuda-bin checks
-mise run check                                                            # full check + release tests + cuda-sanitize gate
-mise run cuda-bin-check                                                   # static cuobjdump STACK/LOCAL/SHARED/REG gate (<0.2s)
-mise run cuda-sanitize                                                    # standalone compute-sanitizer memcheck+racecheck+synccheck
-mise run test-quick                                                       # cargo test --release --features cuda --lib
-mise run test-cpu                                                         # cargo test --lib (fast CPU unit tests)
+mise run test-prep                                                        # verify/download pinned 4B test checkpoints (use test-prep-all for 2B–Flash-Next)
+mise run build                                                            # dashboard build + cargo build --release --features cuda
+mise run check-quick                                                      # fast CPU gate: fmt-check + clippy (cuda & cpu) + doc-check + simd-check + cuda-bin-check
+mise run test-quick                                                       # fast GPU unit tests: cargo test --release --features cuda --lib
+mise run test-cpu                                                         # CPU-only unit & integration tests: cargo test --lib --tests
+mise run check                                                            # full release gate: check-quick + dashboard-check + oracle-check + perf-check + test + cuda-sanitize
+mise run cuda-bin-check                                                   # static cuobjdump STACK/LOCAL/SHARED/REG gate across sm_80/sm_86/sm_89 (<0.4s)
+mise run cuda-sanitize                                                    # compute-sanitizer memcheck+racecheck+synccheck across all 6 CUDA subsystems + TP=2
+mise run bench-gate                                                       # ~13s 4B throughput & parity regression gate (Plain vs MTP-3/DFlash2, synth vs realistic)
+mise run bench-gate-full                                                  # full throughput & parity regression gate across 4B, 9B+LoRA, 27B, 35B-A3B, & Flash-Next
+mise run oracle-check                                                     # host unit tests for oracle, CUDA gates, and benchmark regression harnesses
+mise run perf-check                                                       # host unit tests & TOML manifest validation for benchmarks/perf (warp34perf)
+mise run dashboard-check                                                  # frontend TypeScript, Prettier, and Vitest suite (dashboard/)
+mise run oracle-dump                                                      # live TP=1 vs TP=2 tensor parity (dump-diff) across 4B, Vision, MTP, DFlash2, & 35B MoE
+mise run oracle-greedy                                                    # live greedy-diff token parity + lossless speculative + warm radix verification
 mise run coverage                                                         # cargo llvm-cov --features cuda --lib --summary-only
 cargo test --release --features cuda --test <target> -- --test-threads=1 --exact <test>
 for p in $(pgrep -x warp34); do kill "$p"; done                              # stop warp34 processes safely
