@@ -94,11 +94,27 @@ pub(crate) fn run_generate(
         active_lora,
         ..
     } = options;
+    let gen_kv_pages = kv_pages.or_else(|| {
+        let min_pages = max_tokens.saturating_add(512).div_ceil(16);
+        if min_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+            let max_cap = if spec_config
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::proposer::SpeculativeKind::DFlash2)
+            {
+                crate::dflash::DFLASH2_MAX_KV_CAPACITY / 16
+            } else {
+                super::options::MAX_CLI_KV_PAGES
+            };
+            Some(min_pages.min(max_cap))
+        } else {
+            None
+        }
+    });
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,
         policy,
-        kv_pages,
+        gen_kv_pages,
         use_cuda_graph,
         &spec_config,
         &lora_modules,
@@ -216,8 +232,18 @@ pub(crate) fn run_bench(
         active_lora,
         ..
     } = options;
+    let min_stage_tokens =
+        super::options::bench_required_stage_tokens(&bench_stage, prompt_len, gen_len);
+    let min_stage_pages = min_stage_tokens.div_ceil(16);
     let mut engine = if matches!(bench_stage.as_str(), "scheduler" | "all") {
-        let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 512));
+        let default_pages = if spec_config.is_some() {
+            Some(min_stage_pages.max(512))
+        } else if min_stage_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+            Some(min_stage_pages)
+        } else {
+            None
+        };
+        let pages = kv_pages.or(default_pages);
         let state_slot_seqs = serve_state_slot_seqs(batch_size.max(8), spec_config.as_ref());
         let mut eng = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
             &resolved_model,
@@ -234,11 +260,17 @@ pub(crate) fn run_bench(
             .map_err(|e| e.to_string())?;
         eng
     } else {
+        let bench_kv_pages =
+            kv_pages.or(if min_stage_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+                Some(min_stage_pages)
+            } else {
+                None
+            });
         load_cli_engine_with_lora(
             &resolved_model,
             tp,
             policy,
-            kv_pages,
+            bench_kv_pages,
             use_cuda_graph,
             &spec_config,
             &lora_modules,

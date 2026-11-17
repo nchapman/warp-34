@@ -28,6 +28,51 @@ class CampaignTests(unittest.TestCase):
                     self.assertEqual({c['id'] for c in selected}, set(cases))
                     self.assertEqual(len(coverage), len(cfg['engines']) * len(cases))
 
+    def test_all_campaign_and_qualification_manifests_validate_and_align_with_cli_contract(self):
+        def flag_value(tokens, flag):
+            for idx, tok in enumerate(tokens):
+                if tok == flag:
+                    self.assertLess(idx + 1, len(tokens), f'missing value for {flag}')
+                    return tokens[idx + 1]
+                if tok.startswith(flag + '='):
+                    return tok.split('=', 1)[1]
+            return None
+
+        manifests = (
+            [ROOT / 'suite.toml']
+            + sorted((ROOT / 'campaigns').glob('*.toml'))
+            + sorted((ROOT / 'qualification').glob('*.toml'))
+        )
+        self.assertGreaterEqual(len(manifests), 23)
+        for path in manifests:
+            with self.subTest(manifest=path.name):
+                cfg = load(path)
+                self.assertTrue(cfg['engines'])
+                self.assertTrue(cfg['cases'])
+                for case in cfg['cases']:
+                    if case.get('max_tokens') is not None:
+                        self.assertGreaterEqual(case['max_tokens'], 1)
+                        self.assertLessEqual(case['max_tokens'], 1_048_576)
+                for engine in cfg['engines']:
+                    if engine['engine'] != 'warp34':
+                        continue
+                    cmd = engine.get('launch_command', '')
+                    if 'warp34 serve' not in cmd:
+                        continue
+                    tokens = shlex.split(cmd)
+                    spec = flag_value(tokens, '--speculative')
+                    kv_pages_raw = flag_value(tokens, '--kv-pages')
+                    kv_pages = int(kv_pages_raw) if kv_pages_raw is not None else (2048 if spec else 256)
+                    max_len_raw = flag_value(tokens, '--max-model-len')
+                    max_model_len = int(max_len_raw) if max_len_raw is not None else kv_pages * 16
+                    self.assertGreaterEqual(kv_pages, 1)
+                    self.assertLessEqual(kv_pages, 65_536)
+                    self.assertLessEqual(max_model_len, kv_pages * 16)
+                    if spec == 'dflash2':
+                        self.assertIsNotNone(flag_value(tokens, '--draft-model'))
+                        self.assertLessEqual(kv_pages, 16_384)
+                        self.assertLessEqual(max_model_len, 262_144)
+
     def test_primary_suite_and_swe_multiclient_campaigns_cover_all_models_and_modes(self):
         suite = load(ROOT / 'suite.toml')
         warp34_engines = [e for e in suite['engines'] if e['engine'] == 'warp34']

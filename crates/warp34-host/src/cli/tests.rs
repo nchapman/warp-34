@@ -1039,3 +1039,59 @@ fn positional_model_industry_aliases_and_sampling_validation() {
         );
     }
 }
+
+#[test]
+fn bench_and_profile_diff_cli_validation_and_forwarding() {
+    for bad_bench in [
+        &[
+            "bench",
+            "--prompt-len",
+            "1024",
+            "--gen-len",
+            "128",
+            "--kv-pages",
+            "64",
+        ][..],
+        &[
+            "bench",
+            "--speculative",
+            "dflash2",
+            "--draft-model",
+            "org/draft",
+            "--prompt-len",
+            "200000",
+            "--gen-len",
+            "100000",
+        ][..],
+    ] {
+        assert!(
+            prepare_cuda_cli(&args(bad_bench), |_, _, _| {
+                panic!("invalid bench args must fail before download")
+            })
+            .is_err(),
+            "{bad_bench:?}"
+        );
+    }
+
+    let prof_opts = parse(&[
+        "profile-diff",
+        "--model",
+        "org/target",
+        "--stage",
+        "vision",
+        "--batch-size",
+        "4",
+        "--image",
+        "rgb://https://warp34.test/sample.ppm",
+        "--allow-remote-images",
+    ]);
+    let prof_args = super::oracle::profile_bench_args(&prof_opts, std::path::Path::new("warp34"));
+    assert!(prof_args.windows(2).any(|w| w == ["--stage", "vision"]));
+    assert!(prof_args.windows(2).any(|w| w == ["--batch-size", "4"]));
+    assert!(
+        prof_args
+            .windows(2)
+            .any(|w| w == ["--image", "rgb://https://warp34.test/sample.ppm"])
+    );
+    assert!(prof_args.iter().any(|a| a == "--allow-remote-images"));
+}

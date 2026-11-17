@@ -911,6 +911,21 @@ pub(crate) const MAX_CLI_KV_PAGES: usize = 65_536;
 pub(crate) const MAX_CLI_KV_TOKENS: usize = MAX_CLI_KV_PAGES * 16;
 
 #[cfg(feature = "cuda")]
+pub(crate) fn bench_required_stage_tokens(stage: &str, prompt_len: usize, gen_len: usize) -> usize {
+    let decode_tokens = prompt_len.saturating_add(gen_len.max(1));
+    let radix_prompt_len = (prompt_len.max(128) / 64)
+        .saturating_mul(64)
+        .saturating_add(8);
+    let radix_tokens = radix_prompt_len.saturating_add(gen_len.clamp(4, 32));
+    match stage {
+        "decode" => decode_tokens,
+        "radix" => radix_tokens,
+        "all" => decode_tokens.max(radix_tokens),
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn validate_cuda_options(
     options: &CudaCliOptions,
     sub: &str,
@@ -1004,6 +1019,41 @@ pub(crate) fn validate_cuda_options(
             return Err(format!(
                 "--max-model-len ({max_len} tokens) exceeds --speculative dflash2 maximum capacity ({max_dflash_tokens} tokens / {max_dflash_pages} pages)"
             ));
+        }
+        if sub == "bench" {
+            let bench_tokens = bench_required_stage_tokens(
+                &options.bench_stage,
+                options.prompt_len,
+                options.gen_len,
+            );
+            if bench_tokens > max_dflash_tokens {
+                return Err(format!(
+                    "bench stage '{}' requires {bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds --speculative dflash2 maximum capacity ({max_dflash_tokens} tokens / {max_dflash_pages} pages)",
+                    options.bench_stage, options.prompt_len, options.gen_len
+                ));
+            }
+        }
+    }
+    if sub == "bench" {
+        let total_bench_tokens =
+            bench_required_stage_tokens(&options.bench_stage, options.prompt_len, options.gen_len);
+        if total_bench_tokens > MAX_CLI_KV_TOKENS {
+            return Err(format!(
+                "bench stage '{}' requires {total_bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds maximum supported context ({MAX_CLI_KV_TOKENS} tokens / 1M)",
+                options.bench_stage, options.prompt_len, options.gen_len
+            ));
+        }
+        if let Some(pages) = *kv_pages {
+            let cap_tokens = pages.saturating_mul(16);
+            if total_bench_tokens > cap_tokens {
+                return Err(format!(
+                    "bench stage '{}' requires {total_bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds allocated KV capacity ({cap_tokens} tokens from {pages} pages; need at least --ctx-size {total_bench_tokens} or --kv-pages {})",
+                    options.bench_stage,
+                    options.prompt_len,
+                    options.gen_len,
+                    total_bench_tokens.div_ceil(16)
+                ));
+            }
         }
     }
     if *verify_lossless && speculative_kind.is_none() {

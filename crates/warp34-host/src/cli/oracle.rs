@@ -910,6 +910,17 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
         args.push("--stage".to_string());
         args.push(options.bench_stage.clone());
     }
+    if options.batch_size != 8 {
+        args.push("--batch-size".to_string());
+        args.push(options.batch_size.to_string());
+    }
+    for url in &options.image_urls {
+        args.push("--image".to_string());
+        args.push(url.clone());
+    }
+    if options.allow_remote_images {
+        args.push("--allow-remote-images".to_string());
+    }
     if !options.lora_modules.is_empty() {
         args.push("--lora-modules".to_string());
         for spec in &options.lora_modules {
