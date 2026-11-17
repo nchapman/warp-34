@@ -1055,3 +1055,96 @@ impl Qwen3_5Engine {
         Ok(decisions)
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::parser::{SamplerV1, SamplingParams};
+
+    #[test]
+    fn row_sparse_valid_checks_count_offset_bounds_and_bans() {
+        let entries = vec![
+            ffi::Warp34SamplerSparseEntry {
+                token_id: 1,
+                banned: 0,
+                ..Default::default()
+            },
+            ffi::Warp34SamplerSparseEntry {
+                token_id: 2,
+                banned: 1,
+                ..Default::default()
+            },
+        ];
+        let mut cfg = ffi::Warp34SamplerRowCfg {
+            sparse_count: 0,
+            ..Default::default()
+        };
+        assert!(row_sparse_valid(&cfg, &entries, false));
+
+        cfg.sparse_count = -1;
+        assert!(!row_sparse_valid(&cfg, &entries, true));
+        cfg.sparse_count = 33;
+        assert!(!row_sparse_valid(&cfg, &entries, true));
+
+        cfg.sparse_count = 1;
+        cfg.sparse_offset = -1;
+        assert!(!row_sparse_valid(&cfg, &entries, true));
+        cfg.sparse_offset = 2;
+        assert!(!row_sparse_valid(&cfg, &entries, true));
+
+        cfg.sparse_count = 2;
+        cfg.sparse_offset = 0;
+        assert!(!row_sparse_valid(&cfg, &entries, false));
+        assert!(row_sparse_valid(&cfg, &entries, true));
+    }
+
+    #[test]
+    fn prepared_spec_sampler_rows_truncate_and_append_bonus() {
+        let params = SamplingParams {
+            repetition_penalty: 1.1,
+            ..SamplingParams::default()
+        };
+        let sampler = SamplerV1::new(params, &[10, 11], None);
+        let mut drafts = vec![12, 13, 14];
+        let mut prepared =
+            PreparedSpecSamplerRows::prepare_drafts(64, &[2], &sampler, &mut drafts).unwrap();
+        assert_eq!(prepared.row_cfgs.len(), 3);
+
+        // Truncating >= len is a no-op
+        prepared.truncate_drafts(5);
+        assert_eq!(prepared.row_cfgs.len(), 3);
+
+        // Partial truncate preserves prefix
+        prepared.truncate_drafts(1);
+        assert_eq!(prepared.row_cfgs.len(), 1);
+
+        let mut out_cfgs = Vec::new();
+        let mut out_masks = vec![0xdead_beef];
+        let mut out_sparse = vec![ffi::Warp34SamplerSparseEntry {
+            token_id: 99,
+            banned: 0,
+            ..Default::default()
+        }];
+        prepared
+            .append_bonus_into(64, &[2], &mut out_cfgs, &mut out_masks, &mut out_sparse)
+            .unwrap();
+        assert_eq!(out_cfgs.len(), 2); // 1 draft + 1 bonus
+        assert!(out_cfgs[0].sparse_offset >= 1);
+
+        // Truncate to 0 clears everything and bonus still appends cleanly
+        let mut drafts2 = vec![12, 13];
+        let mut prepared2 =
+            PreparedSpecSamplerRows::prepare_drafts(64, &[2], &sampler, &mut drafts2).unwrap();
+        prepared2.truncate_drafts(0);
+        assert!(prepared2.row_cfgs.is_empty());
+        assert!(prepared2.bitmask_words.is_empty());
+        assert!(prepared2.sparse_entries.is_empty());
+        let mut out_cfgs2 = Vec::new();
+        let mut out_masks2 = Vec::new();
+        let mut out_sparse2 = Vec::new();
+        prepared2
+            .append_bonus_into(64, &[2], &mut out_cfgs2, &mut out_masks2, &mut out_sparse2)
+            .unwrap();
+        assert_eq!(out_cfgs2.len(), 1);
+    }
+}

@@ -1338,3 +1338,18 @@ pub(super) fn fail_request(
     }
     release(engine, sched.cancel_request(id));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtp_batch_pages_needed_respects_reserved_and_proposer_cap() {
+        // prompt_len=16, proposer_k=4, max_new=100 -> min_spec = ceil((16 + 5)/16) = 2
+        assert_eq!(mtp_batch_pages_needed(16, 100, 1, 4), 2);
+        // reserved_pages dominates when larger
+        assert_eq!(mtp_batch_pages_needed(16, 100, 5, 4), 5);
+        // max_new=0 clamps to 1 token
+        assert_eq!(mtp_batch_pages_needed(15, 0, 1, 4), 1);
+    }
+}
