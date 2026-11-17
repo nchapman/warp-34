@@ -979,8 +979,7 @@ impl Qwen3_5Engine {
                     }
                 }
                 eprintln!(
-                    "[warp34] warning: spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
-                    spec_key
+                    "[warp34] warning: spec_verify CUDA Graph capture failed for shape {spec_key:?} ({e}); degrading shape to eager verification"
                 );
                 None
             }
@@ -1086,8 +1085,7 @@ impl Qwen3_5Engine {
                     }
                 }
                 eprintln!(
-                    "[warp34] warning: batched_spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
-                    bspec_key
+                    "[warp34] warning: batched_spec_verify CUDA Graph capture failed for shape {bspec_key:?} ({e}); degrading shape to eager verification"
                 );
                 None
             }

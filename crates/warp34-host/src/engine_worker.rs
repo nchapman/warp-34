@@ -158,18 +158,19 @@ impl Request {
     }
 
     fn set_terminal(&self, event: GenerationEvent) {
+        let outcome = match &event {
+            GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
+                Outcome::Cancelled
+            }
+            GenerationEvent::Finished { .. } => Outcome::Completed,
+            GenerationEvent::Error(_) => Outcome::Failed,
+            GenerationEvent::Token { .. } => Outcome::Failed,
+        };
         // First terminal result wins; in particular, unwinding must not replace an
         // already published result while dropping request-owned resources.
-        if self.terminal.set(event.clone()).is_ok()
+        if self.terminal.set(event).is_ok()
             && let Some(life) = &self.lifecycle
         {
-            let outcome = match event {
-                GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
-                    Outcome::Cancelled
-                }
-                GenerationEvent::Finished { .. } => Outcome::Completed,
-                _ => Outcome::Failed,
-            };
             life.finish(outcome);
         }
     }
@@ -1118,7 +1119,7 @@ fn enqueue(
         p.max_tokens.max(1)
     };
     request.reserved_pages = (request.prompt.len() + init_out).div_ceil(16);
-    p.eos_token_ids = engine.cfg.eos_token_ids.clone();
+    p.eos_token_ids.clone_from(&engine.cfg.eos_token_ids);
     if !request.images.is_empty() {
         match crate::scheduled_vision::ScheduledVision::new(
             engine,

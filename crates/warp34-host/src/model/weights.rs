@@ -47,13 +47,13 @@ pub const fn align_up_scratch(bytes: usize) -> Option<usize> {
 pub enum LinearProj {
     /// Logical projection backed by padded Marlin weights in the Hadamard basis.
     Hadamard {
-        inner: Box<LinearProj>,
+        inner: Box<Self>,
         size_n: usize,
         size_k: usize,
         block_size: usize,
     },
     WithLora {
-        inner: Box<LinearProj>,
+        inner: Box<Self>,
         lora: Box<crate::lora::DeviceLoraStack>,
     },
     MarlinW2A16 {
@@ -198,7 +198,7 @@ impl LinearProj {
 
     /// Returns the underlying projection with any outer [`LinearProj::WithLora`] wrapper peeled off.
     #[inline]
-    pub fn without_lora(&self) -> &LinearProj {
+    pub fn without_lora(&self) -> &Self {
         match self {
             Self::WithLora { inner, .. } => inner.without_lora(),
             other => other,
@@ -234,7 +234,7 @@ impl LinearProj {
         state: &std::sync::Arc<crate::lora::RankLoraState>,
     ) -> Result<()> {
         self.strip_lora();
-        let (target, had_blk): (&mut LinearProj, Option<usize>) = match self {
+        let (target, had_blk): (&mut Self, Option<usize>) = match self {
             Self::Hadamard {
                 inner, block_size, ..
             } => (inner.as_mut(), Some(*block_size)),
@@ -478,7 +478,7 @@ impl LinearProj {
 /// Raw host representation of a linear weight before sharding/uploading.
 pub(crate) enum RawLinearHost {
     Hadamard {
-        inner: Box<RawLinearHost>,
+        inner: Box<Self>,
         block_size: usize,
     },
     U2B2NMajor {

@@ -79,7 +79,7 @@ async fn await_candidate_query(
             logits,
             cached_tokens,
         } => Ok((logits, cached_tokens.max(cached_done))),
-        _ => Err(error(
+        crate::engine_worker::DecisionTapOutput::HiddenRows { .. } => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
         )),
@@ -132,7 +132,7 @@ async fn await_hidden_query(
             rows,
             cached_tokens,
         } => Ok((rows, cached_tokens.max(cached_done))),
-        _ => Err(error(
+        crate::engine_worker::DecisionTapOutput::CandidateLogits { .. } => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
         )),

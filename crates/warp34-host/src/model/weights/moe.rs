@@ -762,8 +762,7 @@ pub(crate) fn load_moe_layer_weights(
     let full_interm = cfg.moe_intermediate_size;
     if tiered_layer_id.is_none() && !full_interm.is_multiple_of(tp_size) {
         return Err(loader_err_msg(format!(
-            "moe_intermediate_size {} is not divisible by TP={tp_size}",
-            full_interm
+            "moe_intermediate_size {full_interm} is not divisible by TP={tp_size}"
         )));
     }
     // Tiered MoE partitions expert IDs across EP ranks, preserving full `moe_intermediate_size` per expert.
@@ -997,8 +996,7 @@ pub(crate) fn load_moe_layer_weights(
         };
 
         let num_workers = std::thread::available_parallelism()
-            .map(|n| (n.get() / tp_size.max(1)).clamp(1, 12))
-            .unwrap_or(4)
+            .map_or(4, |n| (n.get() / tp_size.max(1)).clamp(1, 12))
             .min(num_exp.max(1));
 
         match exp0_gate {

@@ -2035,13 +2035,11 @@ impl NativeProposer {
                 verify.extend_from_slice(&drafts);
                 let mut extras = Vec::with_capacity(k);
                 for _ in 0..k {
-                    match engine.alloc_state_slot() {
-                        Some(s) => extras.push(s),
-                        None => {
-                            engine.free_state_slots(&extras);
-                            return Err(loader_err("no speculative verification state slots"));
-                        }
-                    }
+                    let Some(s) = engine.alloc_state_slot() else {
+                        engine.free_state_slots(&extras);
+                        return Err(loader_err("no speculative verification state slots"));
+                    };
+                    extras.push(s);
                 }
                 let schedule = if k > 0 {
                     tx.begin_spec_verify(extras);

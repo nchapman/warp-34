@@ -99,7 +99,7 @@ impl OpenAiServerState {
     ) -> Arc<Self> {
         let eos: Vec<_> = worker.eos_token_ids.iter().map(|&id| id as u32).collect();
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
-            crate::constraints::ConstraintFactory::new(t.clone(), worker.vocab_size, &eos).ok()
+            crate::constraints::ConstraintFactory::new(t, worker.vocab_size, &eos).ok()
         });
         let decoded_vocab = if worker.tokenizer.is_some() {
             (0..worker.vocab_size)
@@ -1263,8 +1263,7 @@ fn count_reasoning_tokens(
         None => 0,
         Some(text) => tokenizer
             .encode(text, false)
-            .map(|e| e.len().min(output_tokens))
-            .unwrap_or(0),
+            .map_or(0, |e| e.len().min(output_tokens)),
     }
 }
 

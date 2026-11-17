@@ -6,6 +6,11 @@ members = ["crates/warp34-kernels", "crates/warp34-host"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/nchapman/warp34"
+homepage = "https://github.com/nchapman/warp34"
+readme = "README.md"
+keywords = ["llm", "inference", "cuda", "qwen", "speculative-decoding"]
+categories = ["science", "command-line-utilities"]
 
 [workspace.lints.rust]
 unsafe_code = "allow"
@@ -15,6 +20,13 @@ all = { level = "warn" }
 cognitive_complexity = "warn"
 undocumented_unsafe_blocks = "warn"
 missing_safety_doc = "warn"
+assigning_clones = "warn"
+bool_to_int_with_if = "warn"
+cloned_instead_of_copied = "warn"
+map_unwrap_or = "warn"
+redundant_closure = "warn"
+uninlined_format_args = "warn"
+use_self = "warn"
 
 [profile.release]
 lto = "thin"

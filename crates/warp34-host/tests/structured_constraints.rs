@@ -45,7 +45,7 @@ fn tokenizer() -> Tokenizer {
 
 fn setup() -> (Tokenizer, ConstraintFactory) {
     let tok = tokenizer();
-    let factory = ConstraintFactory::new(tok.clone(), 266, &[EOS as u32]).unwrap();
+    let factory = ConstraintFactory::new(&tok, 266, &[EOS as u32]).unwrap();
     (tok, factory)
 }
 
@@ -120,7 +120,7 @@ fn strict_schema_required_enum_nested_array_and_extra_keys() {
         (r#"{"city":"Rome","days":[4]}"#, false),
         (r#"{"city":"Rome","days":[1],"extra":0}"#, false),
     ] {
-        let mut c = factory.json_schema(schema.clone(), false).unwrap();
+        let mut c = factory.json_schema(&schema, false).unwrap();
         let result = feed(&mut c, &tok, text);
         assert_eq!(
             result.is_ok() && c.is_token_allowed(EOS),
@@ -133,7 +133,7 @@ fn strict_schema_required_enum_nested_array_and_extra_keys() {
 #[test]
 fn thinking_transition_clone_and_rollback_are_lossless() {
     let (tok, factory) = setup();
-    let mut c = factory.json_schema(json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}), true).unwrap();
+    let mut c = factory.json_schema(&json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}), true).unwrap();
     feed(&mut c, &tok, "Reason freely: not JSON!\n").unwrap();
     let before = c.current_bitmask();
     let count = c.committed_len();
@@ -301,8 +301,7 @@ fn tool_delimiters_inside_json_values_cannot_inject_calls_or_parameters() {
             "<tool_call>\n<function=echo>\n<parameter=value>{}</parameter>\n</function>\n</tool_call>",
             payload
                 .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| payload.to_string())
+                .map_or_else(|| payload.to_string(), str::to_owned)
         );
         let mut constraint = factory
             .tools(&tools, &ToolChoice::Named("echo".into()), false)
@@ -364,7 +363,7 @@ fn unsupported_grammars_fail_closed() {
     let (_, factory) = setup();
     assert!(
         factory
-            .json_schema(json!({"$ref":"https://example.invalid/schema"}), false)
+            .json_schema(&json!({"$ref":"https://example.invalid/schema"}), false)
             .is_err()
     );
     assert!(factory.regex("[", false).is_err());
@@ -372,7 +371,7 @@ fn unsupported_grammars_fail_closed() {
     assert!(
         factory
             .json_schema(
-                json!({"type":"object","x-guidance":{"lenient":true}}),
+                &json!({"type":"object","x-guidance":{"lenient":true}}),
                 false
             )
             .is_ok()
@@ -381,11 +380,14 @@ fn unsupported_grammars_fail_closed() {
     assert!(factory.lark("start: \"max_tokens\"", false).is_ok());
     assert!(
         factory
-            .json_schema(json!({"type":"array","contains":{"type":"integer"}}), false)
+            .json_schema(
+                &json!({"type":"array","contains":{"type":"integer"}}),
+                false
+            )
             .is_err()
     );
-    assert!(ConstraintFactory::new(tokenizer(), 260, &[]).is_err());
-    assert!(ConstraintFactory::new(tokenizer(), 260, &[999]).is_err());
+    assert!(ConstraintFactory::new(&tokenizer(), 260, &[]).is_err());
+    assert!(ConstraintFactory::new(&tokenizer(), 260, &[999]).is_err());
 }
 
 #[test]
@@ -397,8 +399,8 @@ fn deferred_advance_and_rollback_match_eager_bitmasks() {
         "required": ["ok"],
         "additionalProperties": false
     });
-    let mut eager = factory.json_schema(schema.clone(), false).unwrap();
-    let mut deferred = factory.json_schema(schema, false).unwrap();
+    let mut eager = factory.json_schema(&schema, false).unwrap();
+    let mut deferred = factory.json_schema(&schema, false).unwrap();
     let ids: Vec<i32> = tok
         .encode(r#"{"ok":true}"#, false)
         .unwrap()
@@ -448,14 +450,14 @@ fn benchmark_cached_qwen_constraint() {
     let tok = Tokenizer::from_file(path).unwrap();
     let eos = tok.token_to_id("<|im_end|>").expect("Qwen EOS");
     let start = Instant::now();
-    let factory = ConstraintFactory::new(tok.clone(), tok.get_vocab_size(true), &[eos]).unwrap();
+    let factory = ConstraintFactory::new(&tok, tok.get_vocab_size(true), &[eos]).unwrap();
     let setup_time = start.elapsed();
     let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
     let start = Instant::now();
-    let mut c = factory.json_schema(schema.clone(), false).unwrap();
+    let mut c = factory.json_schema(&schema, false).unwrap();
     let cold = start.elapsed();
     let start = Instant::now();
-    let cached = factory.json_schema(schema, false).unwrap();
+    let cached = factory.json_schema(&schema, false).unwrap();
     let warm = start.elapsed();
     assert_eq!(c.current_bitmask(), cached.current_bitmask());
     let ids = tok.encode(r#"{"ok":true}"#, false).unwrap();
@@ -489,7 +491,7 @@ fn native_ebnf_and_structural_tag_enforce_payloads() {
     assert!(c.is_token_allowed(EOS));
     let initial = factory
         .structural_tag(
-            json!({"type":"structural_tag","format":{
+            &json!({"type":"structural_tag","format":{
                 "type":"tag","begin":"<answer>","end":"</answer>",
                 "content":{"type":"json_schema","json_schema":{"const":true}}
             }}),

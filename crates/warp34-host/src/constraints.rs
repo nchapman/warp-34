@@ -63,7 +63,7 @@ pub struct ConstraintFactory {
 }
 impl ConstraintFactory {
     pub fn new(
-        tokenizer: tokenizers::Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         vocab_size: usize,
         eos_ids: &[u32],
     ) -> Result<Self, String> {
@@ -82,7 +82,7 @@ impl ConstraintFactory {
             return Err("model vocabulary is smaller than tokenizer vocabulary".into());
         }
         let eos_ids: Vec<i32> = eos_ids.iter().map(|id| *id as i32).collect();
-        let info = TokenizerInfo::from_huggingface(&tokenizer, Some(vocab_size), Some(&eos_ids))?;
+        let info = TokenizerInfo::from_huggingface(tokenizer, Some(vocab_size), Some(&eos_ids))?;
         let bytes = Arc::new(info.decoded_vocab().to_vec());
         let mut valid_mask = vec![0; vocab_size.div_ceil(32)];
         for id in vocab.values() {
@@ -121,31 +121,29 @@ impl ConstraintFactory {
     }
 
     pub fn json_object(&self, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        self.json_schema(json!({"type":"object"}), thinking)
+        self.json_schema(&json!({"type":"object"}), thinking)
     }
     pub fn json_schema(
         &self,
-        schema: Value,
+        schema: &Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        validate_json_schema(&schema)?;
+        validate_json_schema(schema)?;
         let g = self
             .compiler
             .compile_json_schema(&schema.to_string(), true, None, None, true, None)
             .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, false)
+        self.wrap(&g, thinking, false)
     }
     pub fn regex(&self, regex: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
         if regex.contains('\0') {
             return Err("regex must not contain NUL".into());
         }
-        self.wrap(
-            self.compiler
-                .compile_regex(regex)
-                .map_err(|e| e.to_string())?,
-            thinking,
-            false,
-        )
+        let g = self
+            .compiler
+            .compile_regex(regex)
+            .map_err(|e| e.to_string())?;
+        self.wrap(&g, thinking, false)
     }
     /// Accept native Lark (start rule) or EBNF (root rule).
     pub fn lark(&self, grammar: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
@@ -155,7 +153,7 @@ impl ConstraintFactory {
             self.compiler.compile_lark(grammar, &[])
         }
         .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, false)
+        self.wrap(&g, thinking, false)
     }
     pub fn structural_tags(
         &self,
@@ -168,21 +166,22 @@ impl ConstraintFactory {
             validate_json_schema(&tag.schema)?;
             native.push(json!({"type":"tag", "begin":tag.begin,"end":tag.end,"content":{"type":"json_schema","json_schema":tag.schema}}));
         }
-        self.structural_tag(json!({"type":"structural_tag","format":{"type":"triggered_tags","triggers":triggers,"tags":native}}), thinking)
+        self.structural_tag(
+            &json!({"type":"structural_tag","format":{"type":"triggered_tags","triggers":triggers,"tags":native}}),
+            thinking,
+        )
     }
     pub fn structural_tag(
         &self,
-        value: Value,
+        value: &Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        validate_tag_schemas(&value)?;
-        self.wrap(
-            self.compiler
-                .compile_structural_tag(&value.to_string())
-                .map_err(|e| e.to_string())?,
-            thinking,
-            false,
-        )
+        validate_tag_schemas(value)?;
+        let g = self
+            .compiler
+            .compile_structural_tag(&value.to_string())
+            .map_err(|e| e.to_string())?;
+        self.wrap(&g, thinking, false)
     }
     pub fn tools(
         &self,
@@ -205,7 +204,7 @@ impl ConstraintFactory {
         else {
             let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size)
                 .with_terminal_eos_ids(self.eos_ids.clone());
-            c.mask = self.valid_mask.as_ref().clone();
+            c.mask.clone_from(self.valid_mask.as_ref());
             c.base_mask = Arc::clone(&self.valid_mask);
             return Ok(c);
         };
@@ -214,22 +213,22 @@ impl ConstraintFactory {
             .compiler
             .compile_structural_tag(&value.to_string())
             .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, true)
+        self.wrap(&g, thinking, true)
     }
     fn wrap(
         &self,
-        g: CompiledGrammar,
+        g: &CompiledGrammar,
         thinking: bool,
         implicit_tool: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
         let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size);
         c.matcher = Some(
-            GrammarMatcher::with_options(&g, Some(self.eos_ids.clone()), false, None)
+            GrammarMatcher::with_options(g, Some(self.eos_ids.clone()), false, None)
                 .map_err(|e| e.to_string())?,
         );
         c.bytes = Arc::clone(&self.bytes);
         c.base_mask = Arc::clone(&self.valid_mask);
-        c.eos_ids = self.eos_ids.clone();
+        c.eos_ids.clone_from(&self.eos_ids);
         c.gate = thinking.then(Vec::new);
         c.implicit_tool = implicit_tool;
         c.refresh()?;
@@ -792,7 +791,7 @@ mod tests {
     fn implicit_tool_boundary_preserves_marker() {
         let f = factory();
         let g = f.compiler.compile_regex("<tool_call>a").unwrap();
-        let mut c = f.wrap(g, true, true).unwrap();
+        let mut c = f.wrap(&g, true, true).unwrap();
         c.advance(259).unwrap();
         assert!(c.is_token_allowed(97));
         c.rollback(1).unwrap();

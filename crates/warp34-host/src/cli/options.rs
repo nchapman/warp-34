@@ -335,10 +335,10 @@ impl ServeCliConfig {
             "--api-key-env" => self.api_key_env = Some(value),
             "--served-model-name" | "--alias" | "-a" => self.model_name = Some(value),
             "--max-num-seqs" | "--max-running-requests" | "--parallel" | "-np" => {
-                self.options.max_num_seqs = value.parse().map_err(|_| "invalid --max-num-seqs")?
+                self.options.max_num_seqs = value.parse().map_err(|_| "invalid --max-num-seqs")?;
             }
             "--max-model-len" => {
-                self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?)
+                self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?);
             }
             _ => unreachable!(),
         }
@@ -390,6 +390,7 @@ impl ServeCliConfig {
                 .transpose()?,
         };
         self.options.api_key = value
+            .as_deref()
             .map(crate::api_auth::ApiKey::new)
             .transpose()
             .map_err(|_| "invalid API key".to_string())?;
@@ -460,7 +461,7 @@ pub(crate) fn revision_value(args: &[String], index: &mut usize) -> Result<Strin
 // None means help was requested; stop parsing immediately, before validation.
 #[cfg(feature = "cuda")]
 pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let mut serve = ServeCliConfig::default();
     let mut model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ".to_string();
     let mut explicit_model_flag = false;

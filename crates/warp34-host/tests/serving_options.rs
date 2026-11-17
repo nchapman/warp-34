@@ -46,7 +46,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
         return;
     }
     let options = ServeOptions {
-        api_key: Some(ApiKey::new("deployment-test-key".into()).unwrap()),
+        api_key: Some(ApiKey::new("deployment-test-key").unwrap()),
         max_num_seqs: 2,
         max_model_len: Some(256),
         ..Default::default()
@@ -155,7 +155,7 @@ fn disabled_webui_preserves_public_metrics_and_protected_apis() {
         "private-engine".into(),
         false,
         ServeOptions {
-            api_key: Some(ApiKey::new("deployment-test-key".into()).unwrap()),
+            api_key: Some(ApiKey::new("deployment-test-key").unwrap()),
             webui: false,
             max_num_seqs: 1,
             ..Default::default()

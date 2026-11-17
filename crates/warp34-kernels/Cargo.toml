@@ -4,6 +4,11 @@ description = "vLLM-aligned CUDA kernels (sm_80, sm_86, sm_89) and FFI seam for 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 build = "build.rs"
 
 [lints]

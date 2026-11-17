@@ -148,7 +148,7 @@ fn profile_diff_presets_and_spec_classification() {
             .args(["profile-diff", "--preset", preset])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{:?}", out);
+        assert!(out.status.success(), "{out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("Kernel Scoreboard (ms/round)"), "{stdout}");
         assert!(stdout.contains("TOK/S (effective)"), "{stdout}");
@@ -176,5 +176,5 @@ fn profile_diff_presets_and_spec_classification() {
         ])
         .output()
         .unwrap();
-    assert!(py_check.status.success(), "{:?}", py_check);
+    assert!(py_check.status.success(), "{py_check:?}");
 }

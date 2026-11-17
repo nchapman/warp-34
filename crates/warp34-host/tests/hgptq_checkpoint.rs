@@ -64,11 +64,10 @@ fn qualify_model(model_dir: &std::path::Path, tp: usize) -> Vec<i32> {
 #[test]
 #[ignore = "requires pinned HGPTQ checkpoints and two free CUDA GPUs"]
 fn pinned_hgptq_text_graph_mtp_and_tp2() {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
-        });
+    let cache = std::env::var_os("HF_HUB_CACHE").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub"),
+        PathBuf::from,
+    );
     for rel_dir in [
         "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
         "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
@@ -94,11 +93,10 @@ fn pinned_hgptq_text_graph_mtp_and_tp2() {
 #[test]
 #[ignore = "requires pinned HGPTQ checkpoints and two free CUDA GPUs"]
 fn pinned_hgptq_vision_matches_vllm_and_tp2() {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
-        });
+    let cache = std::env::var_os("HF_HUB_CACHE").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub"),
+        PathBuf::from,
+    );
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/oracle/fixtures/coco_sample.png");
     let (rgb, h, w) = vision::load_cli_image_with_policy(fixture.to_str().unwrap(), false).unwrap();
@@ -187,11 +185,10 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
 #[test]
 #[ignore = "requires pinned HGPTQ 27B + DFlash2-W4A16-HGPTQ checkpoints and two free CUDA GPUs"]
 fn pinned_hgptq_dflash2_lossless_and_tp2() {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
-        });
+    let cache = std::env::var_os("HF_HUB_CACHE").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub"),
+        PathBuf::from,
+    );
     let target_dir = cache
         .join("models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2");
     let draft_dir = cache
@@ -244,11 +241,10 @@ fn pinned_hgptq_dflash2_lossless_and_tp2() {
 #[test]
 #[ignore = "requires pinned HGPTQ 35B-A3B MoE checkpoint and two free CUDA GPUs"]
 fn pinned_hgptq_moe_35b_text_vision_mtp_and_tp2() {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
-        });
+    let cache = std::env::var_os("HF_HUB_CACHE").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub"),
+        PathBuf::from,
+    );
     let dir = cache
         .join("models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/4f5de21c886d79e17af5b8a4bfc625e226703fb6");
     assert!(

@@ -55,7 +55,7 @@ impl PinnedSlabPool {
         prefer_mapped: bool,
     ) -> Result<HostPackStorage> {
         if !prefer_mapped || layer_bytes == 0 {
-            return HostPackStorage::alloc_unzeroed(layer_bytes, false);
+            return Ok(HostPackStorage::alloc_unzeroed(layer_bytes, false));
         }
         if let Some((ref slab, used)) = self.current
             && used.saturating_add(layer_bytes) <= slab.0.len_bytes
@@ -120,7 +120,7 @@ impl Drop for HostPackStorage {
 impl HostPackStorage {
     /// Allocates unzeroed pinned storage (or zeroed heap fallback).
     /// Callers MUST initialize all `0..bytes` via `raw_mut_ptr()` before calling `as_slice()`.
-    fn alloc_unzeroed(bytes: usize, prefer_mapped: bool) -> Result<Self> {
+    fn alloc_unzeroed(bytes: usize, prefer_mapped: bool) -> Self {
         let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         if prefer_mapped
             && bytes > 0
@@ -128,12 +128,12 @@ impl HostPackStorage {
             && let Ok(m) = MappedHostBuffer::alloc_unzeroed(bytes)
         {
             TOTAL_PINNED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-            return Ok(Self::Mapped(m));
+            return Self::Mapped(m);
         }
         if prefer_mapped && bytes > 0 {
             warn_pinned_heap_fallback_once();
         }
-        Ok(Self::Heap(vec![0u8; bytes]))
+        Self::Heap(vec![0u8; bytes])
     }
 
     fn raw_mut_ptr(&mut self) -> *mut u8 {
@@ -343,7 +343,7 @@ impl HostExpertStore {
         )?;
         let mut storage = match preallocated {
             Some(pre) if pre.len_bytes() == bytes => pre,
-            _ => HostPackStorage::alloc_unzeroed(bytes, prefer_mapped)?,
+            _ => HostPackStorage::alloc_unzeroed(bytes, prefer_mapped),
         };
         let dst_base_ptr = storage.raw_mut_ptr();
 
@@ -376,8 +376,7 @@ impl HostExpertStore {
         }
 
         let num_threads = std::thread::available_parallelism()
-            .map(|n| (n.get() / ep_size.max(1)).clamp(1, 16))
-            .unwrap_or(8)
+            .map_or(8, |n| (n.get() / ep_size.max(1)).clamp(1, 16))
             .min(count.max(1));
         let experts_per_chunk = count.div_ceil(num_threads).max(1);
         let num_chunks = count.div_ceil(experts_per_chunk);
@@ -708,7 +707,7 @@ impl HostExpertStore {
             bytes <= max_pinned_bytes,
             format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
         )?;
-        let mut storage = HostPackStorage::alloc_unzeroed(bytes, true)?;
+        let mut storage = HostPackStorage::alloc_unzeroed(bytes, true);
         // SAFETY: `raw_packs` has `bytes` initialized bytes and `storage.raw_mut_ptr()` points to `bytes` writable bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(raw_packs.as_ptr(), storage.raw_mut_ptr(), bytes);
@@ -794,8 +793,7 @@ impl HostExpertStore {
             vec![acc]
         } else {
             let max_workers = std::thread::available_parallelism()
-                .map(|n| n.get().min(16))
-                .unwrap_or(4)
+                .map_or(4, |n| n.get().min(16))
                 .min(tasks.len());
             let chunk_len = tasks.len().div_ceil(max_workers);
             let mut out_vecs = vec![Vec::new(); tasks.len()];

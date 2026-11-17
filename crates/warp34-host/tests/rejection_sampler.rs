@@ -79,7 +79,7 @@ fn enumerated_proposal_and_acceptance_draws_recover_target_marginal() {
     // The first emitted token must follow p, not q or p sampled on rejection.
     let mut counts = [0usize; 2];
     for proposal_draw in 0..4 {
-        let draft = if proposal_draw < 3 { 0 } else { 1 };
+        let draft = i32::from(proposal_draw >= 3);
         for accept_draw in 0..12 {
             let result = RejectionSampler::stochastic(
                 &[draft],

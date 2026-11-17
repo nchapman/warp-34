@@ -19,8 +19,8 @@ pub struct ApiKey {
 
 impl ApiKey {
     /// Reject empty keys and anything other than visible ASCII, without echoing input.
-    pub fn new(value: String) -> Result<Self, String> {
-        if !valid_token(&value) {
+    pub fn new(value: &str) -> Result<Self, String> {
+        if !valid_token(value) {
             return Err("API key must be nonempty visible ASCII without whitespace".into());
         }
         Ok(Self {
@@ -126,7 +126,7 @@ mod tests {
                 }))
             }
         })).layer(middleware::from_fn_with_state(
-            enabled.then(|| ApiKey::new(SECRET.into()).unwrap()), authenticate,
+            enabled.then(|| ApiKey::new(SECRET).unwrap()), authenticate,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -148,14 +148,14 @@ mod tests {
             "sécret",
             "secret\0",
         ] {
-            let error = ApiKey::new(input.into()).err().expect("must reject");
+            let error = ApiKey::new(input).err().expect("must reject");
             assert_eq!(
                 error,
                 "API key must be nonempty visible ASCII without whitespace"
             );
             assert!(!error.contains("secret"));
         }
-        assert!(ApiKey::new(SECRET.into()).is_ok());
+        assert!(ApiKey::new(SECRET).is_ok());
     }
 
     #[tokio::test]

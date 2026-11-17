@@ -486,8 +486,7 @@ fn test_parse_quant_rejects_unsupported_schemes_with_clear_diagnostics() {
         let err = cfg_with_quant(qcfg.clone()).expect_err(label);
         assert!(
             err.to_string().contains(needle),
-            "case '{label}' error '{}' did not contain '{needle}'",
-            err
+            "case '{label}' error '{err}' did not contain '{needle}'"
         );
     }
 }

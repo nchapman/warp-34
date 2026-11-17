@@ -305,8 +305,7 @@ impl SafetensorsArchive {
                 .collect::<io::Result<Vec<_>>>()?
         } else {
             let workers = std::thread::available_parallelism()
-                .map(|n| n.get().clamp(1, 8))
-                .unwrap_or(4)
+                .map_or(4, |n| n.get().clamp(1, 8))
                 .min(shard_names.len());
             let chunk_len = shard_names.len().div_ceil(workers).max(1);
             std::thread::scope(|s| -> io::Result<Vec<ShardParseResult>> {
@@ -594,9 +593,8 @@ impl SafetensorsArchive {
         if dst.len() < 2 * 1024 * 1024 {
             read_and_convert(dst, base_offset)?;
         } else {
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get().clamp(1, 8))
-                .unwrap_or(4);
+            let num_threads =
+                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8));
             let chunk_elems = dst.len().div_ceil(num_threads).max(1);
             std::thread::scope(|s| -> io::Result<()> {
                 let mut handles = Vec::with_capacity(num_threads);
@@ -676,9 +674,8 @@ impl SafetensorsArchive {
                 *w = u32::from_le(*w);
             }
         } else {
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get().clamp(1, 8))
-                .unwrap_or(4);
+            let num_threads =
+                std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 8));
             let chunk_elems = dst.len().div_ceil(num_threads).max(1);
             std::thread::scope(|s| -> io::Result<()> {
                 let mut handles = Vec::with_capacity(num_threads);
@@ -1140,7 +1137,7 @@ impl SafetensorsArchive {
         if vals[0] <= 0 || vals[1] <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("non-positive dimensions {:?} in '{name}'", vals),
+                format!("non-positive dimensions {vals:?} in '{name}'"),
             ));
         }
         Ok([vals[0] as usize, vals[1] as usize])

@@ -605,8 +605,7 @@ impl DecisionModelProfile {
             .or_else(|| dc.get("max_length"))
             .or_else(|| dc.get("validated_length"))
             .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(32768);
+            .map_or(32768, |v| v as usize);
         let system_prompt = dc
             .get("system_prompt")
             .and_then(Value::as_str)
@@ -899,9 +898,9 @@ pub fn compile_systemone_request(
                                 )));
                             };
                             if k == "true" {
-                                yes = s.to_owned();
+                                s.clone_into(&mut yes);
                             } else {
-                                no = s.to_owned();
+                                s.clone_into(&mut no);
                             }
                         }
                     }
@@ -935,8 +934,7 @@ pub fn compile_systemone_request(
                         )));
                     }
                     values.push(Value::String(ck.clone()));
-                    value_descriptions
-                        .push(cv.as_str().map(str::to_owned).unwrap_or_else(|| ck.clone()));
+                    value_descriptions.push(cv.as_str().map_or_else(|| ck.clone(), str::to_owned));
                     keys.push(ck.clone());
                 }
             }

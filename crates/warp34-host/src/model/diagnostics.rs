@@ -59,8 +59,7 @@ impl Qwen3_5Engine {
             .cfg
             .vision_config
             .as_ref()
-            .map(|v| (v.spatial_merge_size, v.image_token_id))
-            .unwrap_or((2, 248056));
+            .map_or((2, 248056), |v| (v.spatial_merge_size, v.image_token_id));
         let grids: Vec<[usize; 3]> = images.iter().map(|img| img.grid_thw).collect();
         let (mrope_planes, _) = crate::vision::compute_mrope_positions(
             prompt_token_ids,

@@ -1013,26 +1013,25 @@ impl AnthropicSseFormatter {
         let mut out = self.ensure_started(cached_tokens);
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
-            let index = match self.active {
-                ActiveBlock::Thinking { index } => index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_block_index;
-                    self.next_block_index += 1;
-                    out.push((
-                        "content_block_start".into(),
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                            }
-                        }),
-                    ));
-                    self.active = ActiveBlock::Thinking { index: idx };
-                    idx
-                }
+            let index = if let ActiveBlock::Thinking { index } = self.active {
+                index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::Thinking { index: idx };
+                idx
             };
             out.push((
                 "content_block_delta".into(),
@@ -1048,26 +1047,25 @@ impl AnthropicSseFormatter {
         }
 
         if let Some(c_chunk) = delta.content_delta.filter(|s| !s.is_empty()) {
-            let index = match self.active {
-                ActiveBlock::Text { index } => index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_block_index;
-                    self.next_block_index += 1;
-                    out.push((
-                        "content_block_start".into(),
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "text",
-                                "text": "",
-                            }
-                        }),
-                    ));
-                    self.active = ActiveBlock::Text { index: idx };
-                    idx
-                }
+            let index = if let ActiveBlock::Text { index } = self.active {
+                index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "text",
+                            "text": "",
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::Text { index: idx };
+                idx
             };
             out.push((
                 "content_block_delta".into(),

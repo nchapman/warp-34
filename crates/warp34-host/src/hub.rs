@@ -362,8 +362,7 @@ fn local_model(spec: &str, options: &HubOptions) -> io::Result<Option<PathBuf>> 
 fn repo_id(spec: &str) -> io::Result<String> {
     let id = spec
         .strip_prefix("models--")
-        .map(|s| s.replace("--", "/"))
-        .unwrap_or_else(|| spec.into());
+        .map_or_else(|| spec.into(), |s| s.replace("--", "/"));
     let parts: Vec<_> = id.split('/').collect();
     if parts.is_empty()
         || parts.len() > 2

@@ -344,12 +344,12 @@ fn tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative() {
             .filter_map(|&id| u32::try_from(id).ok())
             .collect();
         let factory = ConstraintFactory::new(
-            engine.tokenizer.as_ref().unwrap().clone(),
+            engine.tokenizer.as_ref().unwrap(),
             engine.cfg.vocab_size,
             &eos_u32,
         )
         .unwrap();
-        let constraint = factory.json_schema(schema.clone(), false).unwrap();
+        let constraint = factory.json_schema(&schema, false).unwrap();
         let prompt = engine
             .encode("<|im_start|>user\nReturn JSON.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
             .unwrap();
@@ -498,7 +498,7 @@ fn build_fast_greedy_test_fixture(
                 output_count: 0,
                 logit_bias: 0.5,
                 in_prompt: 0,
-                banned: if r == 4 { 1 } else { 0 },
+                banned: u16::from(r == 4),
             });
             2
         } else {

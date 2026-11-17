@@ -16,18 +16,20 @@ fn main() {
     let out = PathBuf::from(var("OUT_DIR").expect("OUT_DIR"));
     let cuda_home = var_os("CUDA_HOME")
         .or_else(|| var_os("CUDA_PATH"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let opt_cuda = PathBuf::from("/opt/cuda");
-            let usr_local_cuda = PathBuf::from("/usr/local/cuda");
-            if opt_cuda.join("bin/nvcc").exists() {
-                opt_cuda
-            } else if usr_local_cuda.join("bin/nvcc").exists() {
-                usr_local_cuda
-            } else {
-                opt_cuda
-            }
-        });
+        .map_or_else(
+            || {
+                let opt_cuda = PathBuf::from("/opt/cuda");
+                let usr_local_cuda = PathBuf::from("/usr/local/cuda");
+                if opt_cuda.join("bin/nvcc").exists() {
+                    opt_cuda
+                } else if usr_local_cuda.join("bin/nvcc").exists() {
+                    usr_local_cuda
+                } else {
+                    opt_cuda
+                }
+            },
+            PathBuf::from,
+        );
     let nvcc = cuda_home.join("bin/nvcc");
     assert!(
         nvcc.exists(),
@@ -74,10 +76,7 @@ fn main() {
             "{flags}\n{}\n{header_digest:016x}\n{dependency_epoch}\n",
             mtime(src).unwrap_or(0)
         );
-        let up_to_date = obj.exists()
-            && fs::read_to_string(&stamp)
-                .map(|s| s == content)
-                .unwrap_or(false);
+        let up_to_date = obj.exists() && fs::read_to_string(&stamp).is_ok_and(|s| s == content);
         if !up_to_date {
             plan.push((src.clone(), obj, stamp, content));
         }
@@ -96,12 +95,11 @@ fn main() {
                 "op_dflash2" => 6,
                 _ => 7,
             };
-            let inv_len = u64::MAX - fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            let inv_len = u64::MAX - fs::metadata(src).map_or(0, |m| m.len());
             (priority, inv_len)
         });
         let default_jobs = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
+            .map_or(8, |n| n.get())
             .min(16);
         let jobs = var("WARP34_NVCC_JOBS")
             .ok()

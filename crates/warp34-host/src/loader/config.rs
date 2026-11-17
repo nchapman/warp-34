@@ -850,10 +850,10 @@ impl ModelConfig {
             .get("indexer_n_heads")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
-        let indexer_kv_heads =
-            tc.get("indexer_kv_heads")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(if indexer_n_heads > 0 { 1 } else { 0 }) as usize;
+        let indexer_kv_heads = tc
+            .get("indexer_kv_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(indexer_n_heads > 0)) as usize;
         let indexer_head_dim =
             tc.get("indexer_head_dim")
                 .and_then(|v| v.as_u64())
@@ -1410,8 +1410,7 @@ impl ModelConfig {
                     let r_bits = ro
                         .get("bits")
                         .and_then(|v| v.as_u64())
-                        .map(|x| x as usize)
-                        .unwrap_or(bits);
+                        .map_or(bits, |x| x as usize);
                     let r_gs = if ro.contains_key("group_size") {
                         Self::parse_group_size_i64(ro.get("group_size"), 128)?
                     } else {
@@ -1578,8 +1577,7 @@ impl ModelConfig {
             let layer_bits = v
                 .get("bits")
                 .and_then(|x| x.as_u64())
-                .map(|x| x as usize)
-                .unwrap_or(bits);
+                .map_or(bits, |x| x as usize);
             if layer_bits >= 16 {
                 continue;
             }
@@ -1837,9 +1835,10 @@ impl ModelConfig {
             }
         }
         let group_size = min_group_size.unwrap_or_else(|| {
-            self.layer_routed_expert_bits_and_group_size(0)
-                .map(|(_, gs, _)| if gs > 0 { gs } else { 32 })
-                .unwrap_or_else(|| self.quant.group_size_or(32))
+            self.layer_routed_expert_bits_and_group_size(0).map_or_else(
+                || self.quant.group_size_or(32),
+                |(_, gs, _)| if gs > 0 { gs } else { 32 },
+            )
         });
         crate::moe_offload::ExpertPackLayout::new_with_bits(
             self.moe_intermediate_size,

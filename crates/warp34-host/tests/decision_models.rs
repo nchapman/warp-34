@@ -399,8 +399,7 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
             resp2["usage"]
         );
         eprintln!(
-            "[bench] GLiDE 4B (midloop 2x, 3 questions, order_passes=2 => 6 queries): {:.2} ms",
-            glide_p2_ms
+            "[bench] GLiDE 4B (midloop 2x, 3 questions, order_passes=2 => 6 queries): {glide_p2_ms:.2} ms"
         );
 
         // Verify token generation requests on a headless (`lm_head = None`) model fail closed with 400.
@@ -577,8 +576,7 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
         let body_d3_2 = r_d3_2.text().await.unwrap();
         assert_eq!(status_d3_2, 200, "r_d3_2 failed: {body_d3_2}");
         eprintln!(
-            "[bench] d3 4B state_once+prefix_bidir (4 questions): order_passes=1 {:.2} ms, order_passes=2 {:.2} ms",
-            d3_p1_ms, d3_p2_ms
+            "[bench] d3 4B state_once+prefix_bidir (4 questions): order_passes=1 {d3_p1_ms:.2} ms, order_passes=2 {d3_p2_ms:.2} ms"
         );
         *tp1_pair_sink.lock().unwrap() = Some((b1, b2));
     }));

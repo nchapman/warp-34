@@ -10,11 +10,10 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
     if image_urls.is_empty() {
         return Ok((raw_prompt.to_string(), Vec::new()));
     }
-    let (patch_size, temporal_patch_size, merge_size) = cfg
-        .vision_config
-        .as_ref()
-        .map(|v| (v.patch_size, v.temporal_patch_size, v.spatial_merge_size))
-        .unwrap_or((16, 2, 2));
+    let (patch_size, temporal_patch_size, merge_size) =
+        cfg.vision_config.as_ref().map_or((16, 2, 2), |v| {
+            (v.patch_size, v.temporal_patch_size, v.spatial_merge_size)
+        });
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
@@ -201,8 +200,7 @@ pub(crate) fn run_generate(
         format!(" images={}", mm_images.len())
     };
     eprintln!(
-        "[warp34 generate] model={model} tp={tp} kv={kv_format}{img_tag} prompt_toks={} gen_toks={} ttft={:.2}ms decode={:.2}tok/s ({:.2}ms/tok)",
-        prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms
+        "[warp34 generate] model={model} tp={tp} kv={kv_format}{img_tag} prompt_toks={prompt_len} gen_toks={gen_len} ttft={ttft_ms:.2}ms decode={decode_tok_per_s:.2}tok/s ({itl_ms:.2}ms/tok)"
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -359,10 +357,7 @@ pub(crate) fn run_bench(
         };
         let accepted = engine.speculative.as_ref().map(|p| p.last_accepted.clone());
         let verify_rounds = accepted.as_ref().map(Vec::len);
-        let total_accepted: usize = accepted
-            .as_ref()
-            .map(|v| v.iter().copied().sum())
-            .unwrap_or(0);
+        let total_accepted: usize = accepted.as_ref().map_or(0, |v| v.iter().copied().sum());
         let mean_accepted_drafts = verify_rounds.and_then(|r| {
             if r > 0 {
                 Some(total_accepted as f64 / r as f64)
@@ -547,8 +542,7 @@ pub(crate) fn run_bench(
                 .cfg
                 .vision_config
                 .as_ref()
-                .map(|v| v.spatial_merge_size)
-                .unwrap_or(2);
+                .map_or(2, |v| v.spatial_merge_size);
             let visual_tokens: usize = mm_imgs_a
                 .iter()
                 .map(|img| img.num_merged_tokens(merge_sz))
@@ -750,16 +744,14 @@ pub(crate) fn run_serve(
     } = options;
     let model = serve
         .model_name
-        .map(|name| name.trim().to_string())
-        .unwrap_or(model);
+        .map_or(model, |name| name.trim().to_string());
     let max_num_seqs = serve.options.max_num_seqs;
     let max_model_len = serve.options.max_model_len;
     let auth_enabled = serve.options.api_key.is_some();
     let spec_label = match spec_config.as_ref().map(|s| s.kind) {
-        Some(crate::proposer::SpeculativeKind::Mtp) => format!(
-            "mtp (k={})",
-            spec_config.as_ref().map(|s| s.mtp_k).unwrap_or(3)
-        ),
+        Some(crate::proposer::SpeculativeKind::Mtp) => {
+            format!("mtp (k={})", spec_config.as_ref().map_or(3, |s| s.mtp_k))
+        }
         Some(crate::proposer::SpeculativeKind::DFlash2) => "dflash2".to_string(),
         None => "none".to_string(),
     };
@@ -945,11 +937,7 @@ fn run_chat_repl(
     mut sampling: CliSamplingOptions,
 ) -> Result<ExitCode, String> {
     use std::io::{BufRead, Write};
-    let kv_tokens = engine
-        .ranks
-        .first()
-        .map(|r| r.kv_pool.num_pages * 16)
-        .unwrap_or(0);
+    let kv_tokens = engine.ranks.first().map_or(0, |r| r.kv_pool.num_pages * 16);
     eprintln!(
         "[warp34 chat] model={model} tp={tp} kv={kv_format} ({kv_tokens} tokens) thinking={}\n\
          Interactive multi-turn REPL (MambaRadixCache prefix reuse enabled).\n\
@@ -978,8 +966,7 @@ fn run_chat_repl(
         if let Some(cmd) = input.strip_prefix('/') {
             let (verb, rest) = cmd
                 .split_once(char::is_whitespace)
-                .map(|(v, r)| (v, r.trim()))
-                .unwrap_or((cmd, ""));
+                .map_or((cmd, ""), |(v, r)| (v, r.trim()));
             match verb {
                 "exit" | "quit" | "q" => break,
                 "help" | "?" => {

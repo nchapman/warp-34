@@ -311,11 +311,10 @@ pub(crate) fn load_greedy_cases(
     let golden_p = Path::new(golden_arg);
     let mut cases = Vec::new();
     if golden_p.is_dir() {
-        let prompts_path = golden_p
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("prompts.json"))
-            .unwrap_or_else(|| Path::new("tools/oracle/prompts.json").to_path_buf());
+        let prompts_path = golden_p.parent().and_then(|p| p.parent()).map_or_else(
+            || Path::new("tools/oracle/prompts.json").to_path_buf(),
+            |p| p.join("prompts.json"),
+        );
         let prompts_str = fs::read_to_string(&prompts_path)
             .map_err(|e| format!("failed to read {}: {e}", prompts_path.display()))?;
         let prompts_json: serde_json::Value =

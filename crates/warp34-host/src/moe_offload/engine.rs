@@ -1330,7 +1330,7 @@ impl RankTieredMoe {
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }
-                    cache.bridge_runtime = bridge_runtime.clone();
+                    cache.bridge_runtime.clone_from(&bridge_runtime);
                     cache.register_cpu_bridge_async(store, k_static, stream)?;
                 } else {
                     if bridge_runtime.is_none() {
@@ -1338,7 +1338,7 @@ impl RankTieredMoe {
                             device_id, ep_rank, ep_size,
                         )?);
                     }
-                    cache.bridge_runtime = bridge_runtime.clone();
+                    cache.bridge_runtime.clone_from(&bridge_runtime);
                 }
             }
         }

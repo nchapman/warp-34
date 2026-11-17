@@ -23,7 +23,7 @@ fn parallel_tool_calls_false_stops_after_one_call() {
     let tokenizer =
         tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&fixture["tokenizer"]).unwrap())
             .unwrap();
-    let factory = ConstraintFactory::new(tokenizer.clone(), 260, &[256]).unwrap();
+    let factory = ConstraintFactory::new(&tokenizer, 260, &[256]).unwrap();
     let tools = serde_json::json!([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]);
     for choice in [ToolChoice::Auto, ToolChoice::Required] {
         let mut c = factory
@@ -63,13 +63,16 @@ fn masks_and_rollback_match_official_xgrammar() {
         tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&fixture["tokenizer"]).unwrap())
             .unwrap();
     let vocab = fixture["vocab_size"].as_u64().unwrap() as usize;
-    let factory =
-        ConstraintFactory::new(tokenizer, vocab, &[fixture["eos"].as_u64().unwrap() as u32])
-            .unwrap();
+    let factory = ConstraintFactory::new(
+        &tokenizer,
+        vocab,
+        &[fixture["eos"].as_u64().unwrap() as u32],
+    )
+    .unwrap();
     for case in fixture["cases"].as_array().unwrap() {
         let mut constraint = match case["kind"].as_str().unwrap() {
             "regex" => factory.regex(case["source"].as_str().unwrap(), false),
-            "schema" => factory.json_schema(case["source"].clone(), false),
+            "schema" => factory.json_schema(&case["source"], false),
             "grammar" => factory.lark(case["source"].as_str().unwrap(), false),
             "qwen_tools" => factory.tools(
                 &case["source"],

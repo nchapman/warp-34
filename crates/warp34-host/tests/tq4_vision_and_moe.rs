@@ -881,8 +881,7 @@ fn live_qwen3_vision_encoder_and_multimodal_radix_cache() {
         .cfg
         .vision_config
         .as_ref()
-        .map(|v| v.image_token_id)
-        .unwrap_or(248056);
+        .map_or(248056, |v| v.image_token_id);
     // Construct a 68-token multimodal prompt (> 64 tokens so 1 full radix checkpoint is donated at C=64)
     // containing 4 `<|image_pad|>` tokens at positions 4..8.
     let mut prompt_ids = vec![

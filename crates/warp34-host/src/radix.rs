@@ -431,11 +431,10 @@ impl MambaRadixCache {
                 path_nodes.push(split_id);
                 cur_node = split_id;
                 break;
-            } else {
-                path_nodes.push(child_id);
-                cur_node = child_id;
-                key_offset += prefix_len;
             }
+            path_nodes.push(child_id);
+            cur_node = child_id;
+            key_offset += prefix_len;
         }
 
         if self.nodes[cur_node.0].mamba_value.is_some() {
@@ -520,8 +519,7 @@ impl MambaRadixCache {
         if self.nodes[node_id.0].mamba_value.is_some() {
             assert!(
                 self.nodes[node_id.0].mamba_lock_ref > 0,
-                "dec_lock_ref on node {:?} with mamba_lock_ref == 0",
-                node_id
+                "dec_lock_ref on node {node_id:?} with mamba_lock_ref == 0"
             );
             if self.nodes[node_id.0].mamba_lock_ref == 1 {
                 self.mamba_evictable_slots += 1;
@@ -533,8 +531,7 @@ impl MambaRadixCache {
         while cur != RadixNodeId::ROOT {
             assert!(
                 self.nodes[cur.0].full_lock_ref > 0,
-                "dec_lock_ref on node {:?} with full_lock_ref == 0",
-                cur
+                "dec_lock_ref on node {cur:?} with full_lock_ref == 0"
             );
             let pages = self.nodes[cur.0].value.len();
             if self.nodes[cur.0].full_lock_ref == 1 {
@@ -625,10 +622,9 @@ impl MambaRadixCache {
             if prefix_len < child_key_len {
                 cur_node = self.split_node(child_id, prefix_len);
                 break;
-            } else {
-                self.nodes[child_id.0].is_decode_tail = false;
-                cur_node = child_id;
             }
+            self.nodes[child_id.0].is_decode_tail = false;
+            cur_node = child_id;
         }
 
         let mamba_already_existed;
@@ -701,8 +697,7 @@ impl MambaRadixCache {
         assert!(self.nodes[leaf_id.0].children.is_empty());
         assert!(
             self.nodes[leaf_id.0].mamba_value.is_some(),
-            "leaf node {:?} must not be a tombstone prior to eviction",
-            leaf_id
+            "leaf node {leaf_id:?} must not be a tombstone prior to eviction"
         );
 
         let pages = self.nodes[leaf_id.0].value.len();
@@ -1094,8 +1089,8 @@ impl ReqRadixState {
         self.token_ids.clear();
         self.token_ids
             .extend_from_slice(&prompt_tokens[..match_res.matched_tokens]);
-        self.kv_pages = match_res.kv_pages.clone();
-        self.draft_pages = match_res.draft_pages.clone();
+        self.kv_pages.clone_from(&match_res.kv_pages);
+        self.draft_pages.clone_from(&match_res.draft_pages);
         self.protected_pages = self.kv_pages.len();
         self.last_locked_node = match_res.last_node;
         self.cow_src_state_slot = match_res.mamba_slot;

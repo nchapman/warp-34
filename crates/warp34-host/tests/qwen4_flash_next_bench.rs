@@ -255,10 +255,10 @@ fn test_qwen4_exp_reference_bench_suite() {
     eprintln!(
         "[REF-BENCH chat-512 SUMMARY] mean_decode={:.2} tok/s min={:.2} tok/s max={:.2} tok/s",
         suite_mean,
-        suite_tok_s.iter().cloned().fold(f64::INFINITY, f64::min),
+        suite_tok_s.iter().copied().fold(f64::INFINITY, f64::min),
         suite_tok_s
             .iter()
-            .cloned()
+            .copied()
             .fold(f64::NEG_INFINITY, f64::max),
     );
 

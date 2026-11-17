@@ -131,8 +131,7 @@ fn split_spec_revision(spec: &str) -> (&str, Option<String>) {
 pub fn split_hf_repo_and_subfolder(spec: &str) -> io::Result<(String, Option<String>)> {
     let normalized = spec
         .strip_prefix("models--")
-        .map(|s| s.replace("--", "/"))
-        .unwrap_or_else(|| spec.to_string());
+        .map_or_else(|| spec.to_string(), |s| s.replace("--", "/"));
     let parts: Vec<&str> = normalized.split('/').collect();
     if parts.len() < 2 {
         return Err(io::Error::new(
@@ -659,8 +658,7 @@ impl LoraAdapterHost {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "LoRA adapter '{name}': rank mismatch on '{suffix}': lora_A shape {:?} vs lora_B shape {:?}",
-                        a_shape, b_shape
+                        "LoRA adapter '{name}': rank mismatch on '{suffix}': lora_A shape {a_shape:?} vs lora_B shape {b_shape:?}"
                     ),
                 ));
             }

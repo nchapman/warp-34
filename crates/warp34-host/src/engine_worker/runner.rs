@@ -176,7 +176,7 @@ pub(super) fn run_loop(
             step_plain(engine, &mut sched, requests, receiver, shutdown)
         };
         if let Err(error) = result {
-            abort_active_batch(engine, &mut sched, requests, &mut speculation, error);
+            abort_active_batch(engine, &mut sched, requests, &mut speculation, &error);
         }
         complete_tick(engine, &mut sched, requests, stats);
         publish_pools(engine, &sched.radix, &stats.telemetry);
@@ -1241,7 +1241,7 @@ fn abort_active_batch(
     sched: &mut SchedulerV1,
     requests: &mut HashMap<u64, Request>,
     speculation: &mut SpeculativeLoopState,
-    error: WorkerError,
+    error: &WorkerError,
 ) {
     let SpeculativeLoopState {
         speculative_id,

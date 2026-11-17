@@ -719,7 +719,7 @@ impl CudaEvent {
         self.host_failures.check()
     }
 
-    pub fn elapsed_ms(&self, end: &CudaEvent) -> Result<f32> {
+    pub fn elapsed_ms(&self, end: &Self) -> Result<f32> {
         let mut ms = 0.0f32;
         check_rc(
             // SAFETY: `ms` is a stack `f32` out-parameter; `self` and `end` are live timing events.

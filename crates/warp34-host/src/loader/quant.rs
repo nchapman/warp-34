@@ -140,9 +140,7 @@ pub fn dequant_u2b2_n_major_to_f16(
     if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 16))
-            .unwrap_or(4);
+        let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 16));
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {
             for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
@@ -205,9 +203,7 @@ pub fn dequant_u4b8_n_major_to_f16(
     if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 16))
-            .unwrap_or(4);
+        let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 16));
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {
             for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
@@ -496,9 +492,7 @@ pub fn dequant_u8b128_n_major_to_f16(
     if size_n < 1024 {
         dequant_rows(0, &mut out);
     } else {
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().clamp(1, 16))
-            .unwrap_or(4);
+        let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 16));
         let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
         std::thread::scope(|s| {
             for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {

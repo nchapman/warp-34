@@ -10,9 +10,7 @@ pub const MAX_CONSTRAINT_SPEC_BYTES: usize = 64 * 1024;
 pub const MAX_TOOLS_SPEC_BYTES: usize = 512 * 1024;
 
 fn check_spec_size_limit(name: &str, value: &Value, limit: usize) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value)
-        .map(|v| v.len())
-        .unwrap_or(limit + 1);
+    let bytes = serde_json::to_vec(value).map_or(limit + 1, |v| v.len());
     if bytes > limit {
         return Err(format!("{name} exceeds {limit} byte limit ({bytes} bytes)"));
     }
@@ -208,10 +206,10 @@ impl RequestConstraint {
     ) -> Result<TokenBitmaskConstraint, String> {
         match self {
             Self::JsonObject => factory.json_object(thinking),
-            Self::JsonSchema(schema) => factory.json_schema(schema.clone(), thinking),
+            Self::JsonSchema(schema) => factory.json_schema(schema, thinking),
             Self::Regex(regex) => factory.regex(regex, thinking),
             Self::Grammar(grammar) => factory.lark(grammar, thinking),
-            Self::StructuralTag(value) => factory.structural_tag(value.clone(), thinking),
+            Self::StructuralTag(value) => factory.structural_tag(value, thinking),
             Self::Tools {
                 tools,
                 choice,

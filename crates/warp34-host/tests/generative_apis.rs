@@ -49,7 +49,7 @@ fn parse_sse_frames(raw: &str) -> Vec<(String, Value)> {
         let mut data_lines = Vec::new();
         for line in block.lines() {
             if let Some(rest) = line.strip_prefix("event:") {
-                ev = rest.trim().to_owned();
+                rest.trim().clone_into(&mut ev);
             } else if let Some(rest) = line.strip_prefix("data:") {
                 data_lines.push(rest.trim());
             }

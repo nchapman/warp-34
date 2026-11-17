@@ -1320,10 +1320,7 @@ fn verify_qwen4_exp_quantized_kv(dir: &Path, extended_prompt: &[i32]) {
         (KvFormatPolicy::Tq4, 0.99),
         (KvFormatPolicy::Tq4All, 0.99),
     ];
-    if warp34_host::cuda::CudaDevice::props_for(0)
-        .map(|p| p.supports_fp8_kv())
-        .unwrap_or(false)
-    {
+    if warp34_host::cuda::CudaDevice::props_for(0).is_ok_and(|p| p.supports_fp8_kv()) {
         policies.push((KvFormatPolicy::Fp8, 0.999));
     }
     for (policy, min_cos) in policies {

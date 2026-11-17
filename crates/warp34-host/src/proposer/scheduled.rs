@@ -363,31 +363,23 @@ impl NativeProposer {
                 }
             }
         } else {
-            (
-                match RejectionSampler::greedy(&drafts, &out[0]) {
-                    Ok(decision) => decision,
-                    Err(_) => {
-                        if !tx.spec_slots.is_empty() {
-                            engine.free_state_slots(&tx.resolve_spec_verify(1));
-                        }
-                        seq.radix_state.active_state_slot = tx.committed_slot;
-                        return Err(loader_err("greedy rejection geometry"));
-                    }
-                },
-                Vec::new(),
-            )
+            let Ok(decision) = RejectionSampler::greedy(&drafts, &out[0]) else {
+                if !tx.spec_slots.is_empty() {
+                    engine.free_state_slots(&tx.resolve_spec_verify(1));
+                }
+                seq.radix_state.active_state_slot = tx.committed_slot;
+                return Err(loader_err("greedy rejection geometry"));
+            };
+            (decision, Vec::new())
         };
         let processed = decision.processed_rows();
         if k > 0 {
-            let freed = match decision.commit(&mut tx, sampler, 0) {
-                Ok(freed) => freed,
-                Err(_) => {
-                    if !tx.spec_slots.is_empty() {
-                        engine.free_state_slots(&tx.resolve_spec_verify(1));
-                    }
-                    seq.radix_state.active_state_slot = tx.committed_slot;
-                    return Err(loader_err("speculative sampler commit"));
+            let Ok(freed) = decision.commit(&mut tx, sampler, 0) else {
+                if !tx.spec_slots.is_empty() {
+                    engine.free_state_slots(&tx.resolve_spec_verify(1));
                 }
+                seq.radix_state.active_state_slot = tx.committed_slot;
+                return Err(loader_err("speculative sampler commit"));
             };
             engine.free_state_slots(&freed);
         } else {

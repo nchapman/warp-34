@@ -678,8 +678,7 @@ fn load_35b_tp1_or_skip_low_vram(model: &str) -> Option<Qwen3_5Engine> {
         Err(err) => {
             let total_vram_0 = CudaDevice::set_current(0)
                 .and_then(|d| d.mem_info())
-                .map(|(_, total)| total)
-                .unwrap_or(0);
+                .map_or(0, |(_, total)| total);
             if total_vram_0 < 20 * 1024 * 1024 * 1024
                 && err.to_string().contains("insufficient VRAM")
             {

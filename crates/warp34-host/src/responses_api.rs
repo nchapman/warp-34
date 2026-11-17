@@ -1489,38 +1489,37 @@ impl ResponsesSseFormatter {
         let mut out = Vec::new();
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
-            let output_index = match self.active {
-                ActiveItem::Reasoning { output_index } => output_index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_output_index;
-                    self.next_output_index += 1;
-                    let item_id = self.ids.reasoning_id.clone();
+            let output_index = if let ActiveItem::Reasoning { output_index } = self.active {
+                output_index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item_id = self.ids.reasoning_id.clone();
 
-                    let mut a1 = Map::new();
-                    a1.insert("output_index".into(), json!(idx));
-                    a1.insert(
-                        "item".into(),
-                        json!({
-                            "id": item_id,
-                            "type": "reasoning",
-                            "status": "in_progress",
-                            "summary": [],
-                            "content": [],
-                        }),
-                    );
-                    out.push(self.emit("response.output_item.added", a1));
+                let mut a1 = Map::new();
+                a1.insert("output_index".into(), json!(idx));
+                a1.insert(
+                    "item".into(),
+                    json!({
+                        "id": item_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                        "content": [],
+                    }),
+                );
+                out.push(self.emit("response.output_item.added", a1));
 
-                    let mut a2 = Map::new();
-                    a2.insert("item_id".into(), json!(self.ids.reasoning_id));
-                    a2.insert("output_index".into(), json!(idx));
-                    a2.insert("content_index".into(), json!(0));
-                    a2.insert("part".into(), json!({"type": "reasoning_text", "text": ""}));
-                    out.push(self.emit("response.reasoning_part.added", a2));
+                let mut a2 = Map::new();
+                a2.insert("item_id".into(), json!(self.ids.reasoning_id));
+                a2.insert("output_index".into(), json!(idx));
+                a2.insert("content_index".into(), json!(0));
+                a2.insert("part".into(), json!({"type": "reasoning_text", "text": ""}));
+                out.push(self.emit("response.reasoning_part.added", a2));
 
-                    self.active = ActiveItem::Reasoning { output_index: idx };
-                    idx
-                }
+                self.active = ActiveItem::Reasoning { output_index: idx };
+                idx
             };
             self.reasoning_accum.push_str(&r_chunk);
             let mut dm = Map::new();
@@ -1539,49 +1538,48 @@ impl ResponsesSseFormatter {
                 (!trimmed.is_empty()).then(|| trimmed.to_owned())
             };
             if let Some(c_chunk) = c_chunk {
-                let output_index = match self.active {
-                    ActiveItem::Message { output_index } => output_index,
-                    _ => {
-                        self.close_active(&mut out);
-                        let idx = self.next_output_index;
-                        self.next_output_index += 1;
-                        let msg_idx = self.next_msg_index;
-                        self.next_msg_index += 1;
-                        let item_id = if msg_idx == 0 {
-                            self.ids.message_id.clone()
-                        } else {
-                            format!("{}_{msg_idx}", self.ids.message_id)
-                        };
-                        self.current_msg_id = item_id.clone();
-                        self.current_msg_accum.clear();
+                let output_index = if let ActiveItem::Message { output_index } = self.active {
+                    output_index
+                } else {
+                    self.close_active(&mut out);
+                    let idx = self.next_output_index;
+                    self.next_output_index += 1;
+                    let msg_idx = self.next_msg_index;
+                    self.next_msg_index += 1;
+                    let item_id = if msg_idx == 0 {
+                        self.ids.message_id.clone()
+                    } else {
+                        format!("{}_{msg_idx}", self.ids.message_id)
+                    };
+                    self.current_msg_id.clone_from(&item_id);
+                    self.current_msg_accum.clear();
 
-                        let mut a1 = Map::new();
-                        a1.insert("output_index".into(), json!(idx));
-                        a1.insert(
-                            "item".into(),
-                            json!({
-                                "id": item_id,
-                                "type": "message",
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": [],
-                            }),
-                        );
-                        out.push(self.emit("response.output_item.added", a1));
+                    let mut a1 = Map::new();
+                    a1.insert("output_index".into(), json!(idx));
+                    a1.insert(
+                        "item".into(),
+                        json!({
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        }),
+                    );
+                    out.push(self.emit("response.output_item.added", a1));
 
-                        let mut a2 = Map::new();
-                        a2.insert("item_id".into(), json!(self.current_msg_id));
-                        a2.insert("output_index".into(), json!(idx));
-                        a2.insert("content_index".into(), json!(0));
-                        a2.insert(
-                            "part".into(),
-                            json!({"type": "output_text", "text": "", "annotations": []}),
-                        );
-                        out.push(self.emit("response.content_part.added", a2));
+                    let mut a2 = Map::new();
+                    a2.insert("item_id".into(), json!(self.current_msg_id));
+                    a2.insert("output_index".into(), json!(idx));
+                    a2.insert("content_index".into(), json!(0));
+                    a2.insert(
+                        "part".into(),
+                        json!({"type": "output_text", "text": "", "annotations": []}),
+                    );
+                    out.push(self.emit("response.content_part.added", a2));
 
-                        self.active = ActiveItem::Message { output_index: idx };
-                        idx
-                    }
+                    self.active = ActiveItem::Message { output_index: idx };
+                    idx
                 };
                 self.current_msg_accum.push_str(&c_chunk);
                 self.text_accum.push_str(&c_chunk);
@@ -1661,7 +1659,7 @@ impl ResponsesSseFormatter {
             } else {
                 format!("{}_{msg_idx}", self.ids.message_id)
             };
-            self.current_msg_id = item_id.clone();
+            self.current_msg_id.clone_from(&item_id);
             self.current_msg_accum.clear();
 
             let mut a1 = Map::new();
