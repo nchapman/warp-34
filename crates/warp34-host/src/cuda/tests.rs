@@ -174,7 +174,7 @@ fn run_prefill_tile_benchmark(
                         },
                         "prefill tile benchmark",
                     )
-                    .unwrap()
+                    .unwrap();
                 };
                 invoke();
                 stream.synchronize().unwrap();
@@ -278,7 +278,7 @@ fn prefill_variant_fixture(benchmark: bool) {
             264usize,
         ));
     } else {
-        let err = match crate::cache::KvPool::new(
+        let Err(err) = crate::cache::KvPool::new(
             0,
             ffi::WARP34_KV_NAMESPACE_TARGET_FULL_ATTN,
             &[0],
@@ -287,9 +287,8 @@ fn prefill_variant_fixture(benchmark: bool) {
             16,
             2,
             crate::cache::KvFormatPolicy::Fp8,
-        ) {
-            Ok(_) => panic!("KvFormatPolicy::Fp8 must be rejected on < sm_89"),
-            Err(e) => e,
+        ) else {
+            panic!("KvFormatPolicy::Fp8 must be rejected on < sm_89");
         };
         assert!(err.to_string().contains("sm_89+"), "unexpected err: {err}");
     }

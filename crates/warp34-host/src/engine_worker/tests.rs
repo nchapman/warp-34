@@ -269,10 +269,9 @@ async fn check_locally_owned_panic(pulled_batch: bool) {
                 #[allow(clippy::useless_vec)]
                 let _pulled = vec![(0, 1, Vec::<i32>::new(), reqs.remove(&1).unwrap())];
                 panic!("panic while MTP owns pulled requests");
-            } else {
-                let _admitting = rx.try_recv().unwrap();
-                panic!("panic during admission before registry insert");
             }
+            let _admitting = rx.try_recv().unwrap();
+            panic!("panic during admission before registry insert");
         },
     );
     assert!(matches!(stream.events.recv().await,

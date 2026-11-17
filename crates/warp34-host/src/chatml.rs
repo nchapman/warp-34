@@ -170,7 +170,7 @@ pub fn format_chatml_prompt_with_options(
     for (index, message) in messages.iter().enumerate() {
         let mut content = message.content.as_deref().unwrap_or("").trim();
         match message.role.as_str() {
-            "system" => continue,
+            "system" => {}
             "tool" => {
                 if index == 0 || messages[index - 1].role != "tool" {
                     out.push_str("<|im_start|>user");

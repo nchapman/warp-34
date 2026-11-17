@@ -56,21 +56,15 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             }
         })
         .ok_or("checkpoint has no MoE layer")?;
-    let (gu, gs, dn, ds, group) = match moe.experts {
-        MoeExpertStorage::W4A16 {
-            gate_up_packed_ptr,
-            gate_up_scales_ptr,
-            down_packed_ptr,
-            down_scales_ptr,
-            group_size,
-        } => (
-            gate_up_packed_ptr,
-            gate_up_scales_ptr,
-            down_packed_ptr,
-            down_scales_ptr,
-            group_size,
-        ),
-        _ => return Err("first MoE layer must use W4A16 storage".into()),
+    let MoeExpertStorage::W4A16 {
+        gate_up_packed_ptr: gu,
+        gate_up_scales_ptr: gs,
+        down_packed_ptr: dn,
+        down_scales_ptr: ds,
+        group_size: group,
+    } = moe.experts
+    else {
+        return Err("first MoE layer must use W4A16 storage".into());
     };
     let (h, n, e, k) = (
         engine.cfg.hidden_size,

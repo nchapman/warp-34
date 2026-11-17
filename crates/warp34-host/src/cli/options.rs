@@ -211,7 +211,7 @@ impl CliSamplingOptions {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         let params = self.to_sampling_params(1, &[]);
-        params.validate().map_err(|e| e.to_string())
+        params.validate()
     }
 }
 

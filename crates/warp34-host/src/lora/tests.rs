@@ -1056,16 +1056,18 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         },
         crate::hub::ModelRole::Target,
     ) else {
-        if std::env::var("WARP34_STRICT_TESTS").as_deref() == Ok("1") {
-            panic!("missing cached {model_spec} in WARP34_STRICT_TESTS=1");
-        }
+        assert!(
+            std::env::var("WARP34_STRICT_TESTS").as_deref() != Ok("1"),
+            "missing cached {model_spec} in WARP34_STRICT_TESTS=1"
+        );
         return;
     };
     let mut lora_spec = LoraModuleSpec::parse(lora_spec_str).unwrap();
     let Ok(lora_dir) = crate::hub::resolve_lora_adapter(&mut lora_spec, true) else {
-        if std::env::var("WARP34_STRICT_TESTS").as_deref() == Ok("1") {
-            panic!("missing cached {lora_spec_str} in WARP34_STRICT_TESTS=1");
-        }
+        assert!(
+            std::env::var("WARP34_STRICT_TESTS").as_deref() != Ok("1"),
+            "missing cached {lora_spec_str} in WARP34_STRICT_TESTS=1"
+        );
         return;
     };
     assert!(lora_dir.join("adapter_config.json").is_file());

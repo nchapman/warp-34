@@ -17,8 +17,7 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
-        let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)
-            .map_err(|e| e.to_string())?;
+        let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)?;
         crate::vision::validate_image_aspect_ratio(h, w)?;
         let pre = crate::vision::preprocess_rgb_image(
             &rgb,

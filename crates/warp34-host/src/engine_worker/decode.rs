@@ -106,13 +106,11 @@ fn capture_batch_candidate_taps(
     let mut cand_reqs = Vec::<(u64, usize, usize, Vec<i32>)>::new();
     let mut selected_row_idx = 0usize;
     for (i, s) in slices.iter().enumerate() {
-        let is_selected = emit_mask[i];
-        let sel_row = selected_row_idx;
-        if is_selected {
-            selected_row_idx += 1;
-        } else {
+        if !emit_mask[i] {
             continue;
         }
+        let sel_row = selected_row_idx;
+        selected_row_idx += 1;
         if let Some(req) = requests.get(&s.req_id)
             && let Some(DecisionReadoutTap::CandidateLogits { token_ids, .. }) = &req.decision_tap
         {

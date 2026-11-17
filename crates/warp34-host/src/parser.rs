@@ -1298,7 +1298,6 @@ impl Qwen3Parser {
                         self.buffer.drain(..ts + Self::TOOL_START.len());
                         self.in_reasoning = false;
                         self.in_tool_call = true;
-                        continue;
                     }
                     (Some(te), _) => {
                         let text = &self.buffer[..te];
@@ -1306,7 +1305,6 @@ impl Qwen3Parser {
                         self.reasoning_accum.push_str(text);
                         self.buffer.drain(..te + Self::THINK_END.len());
                         self.in_reasoning = false;
-                        continue;
                     }
                     (None, Some(ts)) => {
                         let text = &self.buffer[..ts];
@@ -1315,7 +1313,6 @@ impl Qwen3Parser {
                         self.buffer.drain(..ts + Self::TOOL_START.len());
                         self.in_reasoning = false;
                         self.in_tool_call = true;
-                        continue;
                     }
                     (None, None) => {
                         let keep = Self::longest_tag_prefix_suffix(
@@ -1332,61 +1329,61 @@ impl Qwen3Parser {
                         break;
                     }
                 }
-            } else {
-                // In CONTENT state: check for `<think>` (if thinking wasn't initially active),
-                // absorb duplicate `</think>`, or transition to `<tool_call>`.
-                let think_start = self.buffer.find(Self::THINK_START);
-                let dup_think_end = self.buffer.find(Self::THINK_END);
-                let tool_start = self
-                    .tools
-                    .as_ref()
-                    .is_none_or(|tools| !tools.is_empty())
-                    .then(|| self.buffer.find(Self::TOOL_START))
-                    .flatten();
-
-                let earliest = [
-                    think_start.map(|p| (p, 0u8)),
-                    dup_think_end.map(|p| (p, 1u8)),
-                    tool_start.map(|p| (p, 2u8)),
-                ]
-                .into_iter()
-                .flatten()
-                .min_by_key(|&(pos, _)| pos);
-
-                if let Some((pos, kind)) = earliest {
-                    let text = &self.buffer[..pos];
-                    c_out.push_str(text);
-                    self.content_accum.push_str(text);
-                    match kind {
-                        0 => {
-                            self.buffer.drain(..pos + Self::THINK_START.len());
-                            self.in_reasoning = true;
-                        }
-                        1 => {
-                            // Absorb duplicate `</think>` silently (`vllm/parser/qwen3.py:130-134`)
-                            self.buffer.drain(..pos + Self::THINK_END.len());
-                        }
-                        _ => {
-                            self.buffer.drain(..pos + Self::TOOL_START.len());
-                            self.in_tool_call = true;
-                        }
-                    }
-                    continue;
-                }
-
-                let keep = Self::longest_tag_prefix_suffix(
-                    &self.buffer,
-                    &[Self::THINK_START, Self::THINK_END, Self::TOOL_START],
-                );
-                let emit_len = self.buffer.len() - keep;
-                if emit_len > 0 {
-                    let text = &self.buffer[..emit_len];
-                    c_out.push_str(text);
-                    self.content_accum.push_str(text);
-                    self.buffer.drain(..emit_len);
-                }
-                break;
+                continue;
             }
+            // In CONTENT state: check for `<think>` (if thinking wasn't initially active),
+            // absorb duplicate `</think>`, or transition to `<tool_call>`.
+            let think_start = self.buffer.find(Self::THINK_START);
+            let dup_think_end = self.buffer.find(Self::THINK_END);
+            let tool_start = self
+                .tools
+                .as_ref()
+                .is_none_or(|tools| !tools.is_empty())
+                .then(|| self.buffer.find(Self::TOOL_START))
+                .flatten();
+
+            let earliest = [
+                think_start.map(|p| (p, 0u8)),
+                dup_think_end.map(|p| (p, 1u8)),
+                tool_start.map(|p| (p, 2u8)),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|&(pos, _)| pos);
+
+            if let Some((pos, kind)) = earliest {
+                let text = &self.buffer[..pos];
+                c_out.push_str(text);
+                self.content_accum.push_str(text);
+                match kind {
+                    0 => {
+                        self.buffer.drain(..pos + Self::THINK_START.len());
+                        self.in_reasoning = true;
+                    }
+                    1 => {
+                        // Absorb duplicate `</think>` silently (`vllm/parser/qwen3.py:130-134`)
+                        self.buffer.drain(..pos + Self::THINK_END.len());
+                    }
+                    _ => {
+                        self.buffer.drain(..pos + Self::TOOL_START.len());
+                        self.in_tool_call = true;
+                    }
+                }
+                continue;
+            }
+
+            let keep = Self::longest_tag_prefix_suffix(
+                &self.buffer,
+                &[Self::THINK_START, Self::THINK_END, Self::TOOL_START],
+            );
+            let emit_len = self.buffer.len() - keep;
+            if emit_len > 0 {
+                let text = &self.buffer[..emit_len];
+                c_out.push_str(text);
+                self.content_accum.push_str(text);
+                self.buffer.drain(..emit_len);
+            }
+            break;
         }
 
         if !r_out.is_empty() {

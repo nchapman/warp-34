@@ -340,9 +340,7 @@ impl Qwen3_5Engine {
             .map_err(|e| loader_err_ctx("SafetensorsArchive::open", e.to_string()))?;
         let decision_profile =
             crate::decision::DecisionModelProfile::from_dir_and_config(dir, &cfg, Some(&archive))
-                .map_err(|e| {
-                loader_err_ctx("DecisionModelProfile::from_dir_and_config", e.to_string())
-            })?;
+                .map_err(|e| loader_err_ctx("DecisionModelProfile::from_dir_and_config", e))?;
         let has_vision_weights = cfg.vision_config.is_some()
             && (archive
                 .resolve_name("model.visual.patch_embed.proj.weight")

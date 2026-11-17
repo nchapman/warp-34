@@ -50,7 +50,7 @@ impl ScheduledVision {
     ) -> Result<Self, String> {
         let config = vision_config.ok_or("model does not support images")?;
         let (merge, image_token) = (config.spatial_merge_size, config.image_token_id);
-        let mut valid = merge > 0 && !prompt.is_empty() && prompt.len() <= i32::MAX as usize;
+        let mut valid = merge > 0 && !prompt.is_empty() && i32::try_from(prompt.len()).is_ok();
         let mut visual_counts = Vec::with_capacity(images.len());
         for image in &images {
             let [t, h, w] = image.grid_thw;

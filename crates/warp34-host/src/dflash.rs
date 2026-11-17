@@ -131,7 +131,7 @@ impl DFlash2Config {
             let value = body
                 .get("sliding_window")
                 .and_then(Value::as_u64)
-                .filter(|&v| v > 0 && v <= i32::MAX as u64)
+                .filter(|&v| v > 0 && i32::try_from(v).is_ok())
                 .ok_or_else(|| loader_err("invalid DFlash sliding window"))?;
             value as usize
         } else {

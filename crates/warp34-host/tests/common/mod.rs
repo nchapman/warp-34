@@ -85,7 +85,7 @@ pub fn raw_request(
                 })
                 .await
                 .unwrap();
-        })
+        });
     });
     let mut socket = TcpStream::connect(address).unwrap();
     socket

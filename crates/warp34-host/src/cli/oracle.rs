@@ -263,11 +263,9 @@ pub(crate) fn compare_tp1_vs_tp2_tensors(
             drafter_rel_l2 = rel;
             drafter_cosine = cos;
             compared_drafter_hidden = true;
-        } else if is_multimodal
-            && (name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out"))
+        } else if !(is_multimodal
+            && (name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out")))
         {
-            continue;
-        } else {
             let (mdiff, rel, cos) = evaluate_moe_or_golden_tensor_diff(
                 name,
                 shape1,
