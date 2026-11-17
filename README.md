@@ -1,15 +1,15 @@
 # warp34
 
-`warp34` is a Rust and CUDA inference engine built specifically for the **Qwen 3.5, 3.6, and 3.8 hybrid model family** running on **1 to 4 NVIDIA RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs**.
+`warp34` is a Rust and CUDA inference engine built specifically for the **Qwen 3.5, 3.6, and 3.8 hybrid model family** running on **1 to 4 NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs**.
 
-If you have one or more RTX 3090s or 4090s and want to run modern Qwen models—dense hybrids, sparse MoEs, vision-language models, the `Qwen3.8-Flash-Next` (Qwen4 preview) architecture, or zero-decode decision models—`warp34` is built to get more speed and context out of your cards than general-purpose engines like `vLLM` or `SGLang`.
+If you have one or more NVIDIA A100s, RTX 3090s, or RTX 4090s and want to run modern Qwen models—dense hybrids, sparse MoEs, vision-language models, the `Qwen3.8-Flash-Next` (Qwen4 preview) architecture, Multi-LoRA adapters, or zero-decode decision models—`warp34` is built to get more speed and context out of your cards than general-purpose engines like `vLLM` or `SGLang`.
 
 ### What you need to know up front
 
-- **It is a single binary with zero Python at runtime.** `warp34` handles Safetensors loading, Hugging Face Hub downloads (including Xet transfers), scheduling, speculative decoding, multi-GPU coordination, an OpenAI/Anthropic/Decision HTTP server, and an embedded live web dashboard.
+- **It is a single binary with zero Python at runtime.** `warp34` handles Safetensors loading, Hugging Face Hub downloads (including Xet transfers and transient-outage cache fallback), scheduling, speculative decoding, Multi-LoRA routing, multi-GPU coordination, an OpenAI/Anthropic/Decision HTTP server, an interactive terminal `chat` REPL, and an embedded live web dashboard + API Playground.
 - **It is purpose-built for hybrid recurrent + attention models.** Qwen 3.5/3.6/3.8 models interleave 3 layers of Gated DeltaNet (GDN linear attention) with 1 layer of full attention. `warp34` treats both states as first-class citizens: prefix caching (`MambaRadixCache`), speculative decoding (`DFlash2` and `MTP`), and continuous batching all checkpoint and roll back GDN recurrent state and paged KV cache together atomically.
-- **It fits huge contexts and huge models onto 24 GB cards.** Our **TurboQuant 4-bit KV cache (`TQ4`)** compresses full-attention KV by **3.07×** (`tq4`) to **3.88×** (`tq4_all`) directly inside the FlashAttention/paged-decode kernels, letting a single 24 GB GPU run `Qwen3.8-27B` up to **262K context** or fit `Qwen3.6-35B-A3B` comfortably on one card.
-- **It scales across consumer motherboards without NCCL.** Multi-GPU (`--tp 2` and `--tp 4`) uses custom `~18 µs` collectives that automatically pick **1-hop NVLink P2P** when a bridge is present or **2-hop pinned system memory over PCIe** when P2P is disabled on consumer boards—all fully captured inside CUDA Graphs.
+- **It fits huge contexts and huge models onto 24 GB cards.** Our **TurboQuant 4-bit KV cache (`TQ4`)** compresses full-attention KV by **3.07×** (`tq4`) to **3.88×** (`tq4_all`) directly inside the FlashAttention/paged-decode kernels (plus native hardware **`FP8 E4M3` KV** on `sm_89+`), letting a single 24 GB GPU run `Qwen3.8-27B` up to **262K context** or fit `Qwen3.6-35B-A3B` with `MTP-3` and Vision on one card.
+- **It scales across datacenter NVLink and consumer PCIe motherboards without NCCL.** Multi-GPU (`--tp 2` and `--tp 4`) uses custom `~18 µs` collectives that automatically pick **1-hop NVLink P2P** when a bridge/NVSwitch is present or **2-hop pinned system memory over PCIe** when P2P is disabled on consumer boards—all fully captured inside CUDA Graphs.
 
 ---
 
@@ -17,7 +17,7 @@ If you have one or more RTX 3090s or 4090s and want to run modern Qwen models—
 
 ### 1. Clone and build
 
-You need an x86-64 Linux machine, an RTX 30-series or 40-series GPU, CUDA 13.4 (`/opt/cuda`), and [Git LFS](https://git-lfs.com/) (for test fixtures). [mise](https://mise.jdx.dev/) manages the pinned Rust, Node, and pnpm toolchain.
+You need an x86-64 Linux machine, an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU, CUDA 13.4 (`/opt/cuda`), and [Git LFS](https://git-lfs.com/) (for test fixtures). [mise](https://mise.jdx.dev/) manages the pinned Rust, Node, and pnpm toolchain.
 
 ```sh
 git lfs install
@@ -36,11 +36,11 @@ Point `warp34 serve` at a Hugging Face repo ID or a local directory. It will pul
 ```sh
 ./target/release/warp34 serve \
   --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
-  --kv-format tq4 --tp 1 --port 8000
+  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
+  --kv-format tq4 -c 32k --tp 1 --port 8000
 ```
 
-While it is running, open **`http://127.0.0.1:8000/`** in your browser to see the live telemetry dashboard (throughput, TTFT, prefix hit rate, and separate KV vs. GDN state capacity).
+While it is running, open **`http://127.0.0.1:8000/`** in your browser to use the live telemetry dashboard, interactive API Playground (`/playground`), and coding-agent setup guide (`/connect`). Pass `--no-webui` if you want an API-only server.
 
 ### 3. Talk to it
 
@@ -56,17 +56,20 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-For quick offline testing or benchmarking from the terminal without spinning up a server:
+For quick interactive chat, one-off generation, or benchmarking from the terminal without spinning up a server:
 
 ```sh
-# One-off generation:
+# Interactive multi-turn chat REPL (or pass --prompt for a single turn):
+./target/release/warp34 chat nchapman/Qwen3.5-4B-W4A16-HGPTQ
+
+# One-off raw generation:
 ./target/release/warp34 generate --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --prompt "Hello!"
 
-# Benchmark prefill + decode with lossless speculative verification check:
+# Benchmark prefill + decode with realistic coding prompt and lossless speculative verification:
 ./target/release/warp34 bench \
   --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
-  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --verify-lossless
+  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
+  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --realistic-prompt --verify-lossless
 ```
 
 ---
@@ -77,32 +80,33 @@ The core Qwen 3.5 family (`model_type: "qwen3_5"` and `"qwen3_5_moe"`—which al
 
 ### Supported models & formats
 
-- **Dense hybrids:** `0.8B`, `4B`, `9B`, and `27B` (`Qwen3.8-27B`).
-- **Sparse MoE hybrid:** `Qwen3.6-35B-A3B` (`256` routed experts + `1` shared expert, `3B` active parameters per token). With `--kv-format tq4`, the entire `35B-A3B` model runs on a **single 24 GB GPU** at **186.5 tok/s** (`C=1`) and **710.2 tok/s** (`C=8`), or across **2× GPUs (`TP=2`)** at **319.6 tok/s** (`C=1`, `MTP k=2`) and **1,009.7 tok/s** (`C=8`).
-- **Multimodal Vision (`Qwen3.5-VL`):** Native support for `4B`, `27B`, and `35B-A3B` vision checkpoints (`Qwen3_VisionTransformer` 24/27-layer ViT, 2×2 spatial merger, 3D `mRoPE`, PNG/JPEG/PPM decoding, and content-hashed vision prefix caching).
-- **Quantization:** `GPTQ`, `AWQ`, `compressed-tensors`, and `AutoRound` (`W4A16` symmetric/asymmetric and `W8A16`), plus unquantized `FP16`/`BF16`. All quantized linear layers are repacked in parallel at load time into unified Marlin tiles (`~7–10s` warm load time on 27B/35B).
+- **Dense hybrids:** `0.8B`, `2B`, `4B`, `9B`, and `27B` (`Qwen3.8-27B`).
+- **Sparse MoE hybrid:** `Qwen3.6-35B-A3B` (`256` routed experts + `1` shared expert, `3B` active parameters per token). With `W4A16-HGPTQ` and `--kv-format tq4`, the entire `35B-A3B` model (plus `MTP-3` and Vision) runs on a **single 24 GB GPU** at **205.0 tok/s** (`Plain`) and **429.1 tok/s** (`MTP-3`), or across **2× GPUs (`TP=2`)** at **261.5 tok/s** (`Plain`), **553.4 tok/s** (`MTP-3`), and **1,043.8 tok/s** (`B=8` batched `MTP-3`).
+- **Multimodal Vision (`Qwen3.5-VL`):** Native support for `2B`, `4B`, `9B`, `27B`, `35B-A3B`, and `Flash-Next` vision checkpoints (`Qwen3_VisionTransformer` 24/27-layer ViT, 2×2 spatial merger, 3D `mRoPE`, PNG/JPEG/PPM decoding, and content-hashed vision prefix caching).
+- **Quantization & Multi-LoRA:** `W4A16-HGPTQ` (producer-fused in-register $H_{64}$ block-Hadamard GPTQ), mixed `W2.6A16-HGPTQ-RCO`, standard `GPTQ`, `AWQ`, `compressed-tensors`, and `AutoRound` (`W4A16` symmetric/asymmetric and `W8A16`), plus unquantized `FP16`/`BF16`. Supports up to **62 concurrent PEFT LoRA adapters** (`--lora name=repo_or_path`) with per-request routing across dense and MoE checkpoints.
 
 ### Speculative decoding (`DFlash2` and `MTP`)
 
-Standard engines struggle to combine speculative decoding with hybrid recurrent models—for example, `vLLM 0.31.0` cannot combine hybrid prefix caching with draft models and its `DFlash2` implementation stalls on `TP=2`. `warp34` supports two speculative engines that compose cleanly with `TP=1/2/4` and prefix caching:
+Standard engines struggle to combine speculative decoding with hybrid recurrent models—for example, `vLLM 0.31.0` cannot combine hybrid prefix caching with external draft models and its `DFlash2` implementation stalls on `TP=2`. `warp34` supports two speculative engines that compose cleanly with `TP=1/2/4` and prefix caching:
 
 1. **`DFlash2` Block-Parallel Drafter (`--speculative dflash2`):**
-   - Taps multi-layer target hidden states (`TapPlan`) to condition a fast, native-`BF16` block drafter (`M=16` verify rows on `4B`, `M=8` verify rows with a `2048` sliding window on `27B`).
-   - Preserves native `BF16` weights and activations for the drafter (preventing the `FP16` overflow seen on the 4B drafter) while keeping the target model on an `FP16` spine.
+   - Taps multi-layer target hidden states (`TapPlan`) to condition a fast block drafter (`M=16` verify rows on `4B`, `M=8` verify rows with a `2048` sliding window on `27B` and `Flash-Next`), supporting both native `BF16` drafters and `W4A16-HGPTQ` quantized drafters (`2.16 GiB` on `27B`).
+   - Preserves native `BF16` activations for the drafter (preventing the `FP16` overflow seen on the 4B drafter) while keeping the target model on an `FP16` spine.
 2. **Native Multi-Token Prediction (`--speculative mtp --mtp-k 1..3`):**
-   - Uses the checkpoint's built-in 1-layer TP-sharded MTP sidecar (dense or MoE), including batched multi-sequence verify (`B = 2..4`).
-   - Quantizes the MTP `draft_lm_head` on the GPU at load time into `MarlinW4A16` (`group_size = 64`), shrinking its memory bandwidth footprint by **3.56×** without touching the target model's lossless verification head.
+   - Uses the checkpoint's built-in 1-layer TP-sharded MTP sidecar (dense or MoE), including batched multi-sequence verify (`B = 2..8`).
+   - Quantizes unquantized MTP `draft_lm_head` weights on the GPU at load time into `MarlinW4A16` (`group_size = 64`), shrinking its memory bandwidth footprint by **3.56×** without touching the target model's lossless verification head.
 
-### Reference throughput (`prompt_len=512`, `gen_len=128`, `--kv-format tq4`, verified lossless)
+### Reference throughput (`--kv-format tq4` / `fp8`, verified lossless)
 
-| Model | Mode | 1× RTX 3090 Ti | 1× RTX 4090 | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) | 4× RTX 3090 (`TP=4`) |
-|---|---|---:|---:|---:|---:|---:|
-| **Qwen3.5-4B** | `DFlash2 (M=16)` | `1,228–1,388 tok/s` | — | — | — | — |
-| **Qwen3.8-27B** | Plain (`M=1`) | `51.6 tok/s` | `55.0 tok/s` | `86.4 tok/s` | `92.5 tok/s` | `129.1 tok/s` |
-| **Qwen3.8-27B** | `MTP (k=3)` | `120.7 tok/s` | `125.8 tok/s` | `163.9 tok/s` | `175.4 tok/s` | `291.0 tok/s` |
-| **Qwen3.8-27B** | `DFlash2 (k=7)` | `240.6 tok/s` | `253.0 tok/s` | `192.2 tok/s` | `204.3 tok/s` | `438.3 tok/s` |
+| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 1× A100 80GB (`sm_80`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) | 2× A100 80GB (NVLink) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Qwen3.5-4B** | Plain / `MTP-3` / `DFlash2` | `204` / `542` / `1,577` | `223` / `586` / `1,734` | `308` / `728` / `1,632` | — | — | — |
+| **Qwen3.8-27B** | Plain (`M=1`) | `51.8 tok/s` | `54.7 tok/s` | `78.2 tok/s` | `85.4 tok/s` | `91.8 tok/s` | `135.4 tok/s` |
+| **Qwen3.8-27B** | `MTP (k=3)` | `150.1 tok/s` | `153.6 tok/s` | `221.3 tok/s` | `252.1 tok/s` | `257.6 tok/s` | `348.5 tok/s` |
+| **Qwen3.8-27B** | `DFlash2 (k=7)` | `247.9 tok/s` | `305.5 tok/s` | `370.9 tok/s` | `365.1 tok/s` | `400.6 tok/s` | `475.1 tok/s` |
+| **Qwen3.6-35B-A3B** | Plain / `MTP (k=3)` | `205.0` / `429.1` | `246.0` / `473.1` | `297.2` / `531.6` | `261.5` / `553.4` | `294.7` / `605.7` | `404.4` / `749.3` |
 
-*(On 2× RTX 3090 with an NVLink bridge, `27B TP=2` 512-token prefill TTFT drops by up to **79%** and `DFlash2` decode climbs to **197.0 tok/s**.)*
+*(On `4× RTX 3090 (TP=4)`, `27B` reaches `291.0 tok/s` with `MTP-3` and `438.3 tok/s` with `DFlash2`. Note that speculative speedups depend on draft acceptance rate $\tau$: the table above reports standard `warp34 bench` peak acceptance, while `warp34 bench --realistic-prompt` and the `Open-SWE-Traces` multi-agent campaigns measure natural coding-prompt acceptance where `27B MTP-3` achieves `96–113 tok/s` on `TP=1` and `156–164 tok/s` on `TP=2`.)*
 
 ---
 
@@ -127,11 +131,11 @@ Running a 180B-parameter checkpoint on 1 or 2 consumer 24 GB GPUs without swap-t
 ```sh
 # Run Qwen3.8-Flash-Next on 1, 2, or 4 GPUs with 3-token MTP speculation:
 ./target/release/warp34 serve \
-  --model albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE \
-  --speculative mtp --mtp-k 3 --kv-format tq4 --tp 2 --port 8000
+  --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ \
+  --speculative mtp --mtp-k 3 --kv-format tq4 -c 32k --tp 2 --port 8000
 ```
 
-On `TP=2` with `MTP-3`, `warp34` reaches **92.8–136.0 tok/s** on warm interactive chat, **65.3–69.3 tok/s** on live HTTP `short-chat` serving (`4,096` TQ4 pages), and **147.2 tok/s** on `TP=4 / EP=4` (`100%` VRAM-resident). See [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) for the complete architecture guide.
+On `TP=2` with `MTP-3`, `warp34` reaches **92.8–136.0 tok/s** on warm interactive chat (`187.2 tok/s` on 2× A100 80GB NVLink), **65.3–69.3 tok/s** on live HTTP `short-chat` serving (`4,096` TQ4 pages), and **147.2 tok/s** on `TP=4 / EP=4` (`100%` VRAM-resident). See [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) for the complete architecture guide.
 
 ---
 
@@ -148,20 +152,19 @@ Sometimes you don't want a model to chat—you want it to read a ticket, documen
 
 1. **`noul` (boolean / proposition probability):** Returns `"noul": 0.0..1.0` representing $P(\text{true})$ for yes/no or proposition checks.
 2. **`choice` (categorical classification):** Evaluates named option keys (`2..64` options) and returns the winning key, full `"probabilities"` map, and calibrated `"confidence"`.
-3. **`score` (ordinal rubric scoring):** Evaluates ordered rubric levels (`0..K-1`) and returns the expected value $\sum_i i \cdot p_i$, the `"legend"`, per-level `"probabilities"`, and ordinal `"confidence"`.
+3. **`score` (ordinal rubric scoring):** Evaluates ordered rubric levels (`0..K-1`) and returns the integer `score` / expected value $\sum_i i \cdot p_i$, the `"legend"`, per-level `"probabilities"`, and ordinal `"confidence"`.
 
 ### Auto-detected decision model profiles
 
-When you load a checkpoint, `warp34` automatically inspects `config.json` and any sidecar head weights (`joint_head.safetensors` or `head.safetensors`) to select the right readout pipeline:
+When you load a checkpoint (or attach a Decision LoRA adapter via `--lora`), `warp34` automatically inspects `decision_config.json`, `config.json`, and `readout.safetensors` to select the right readout pipeline:
 
 | Profile | Example Checkpoints | How It Evaluates Decisions |
 |---|---|---|
-| **`Clef`** | `Cloudflare/clef` (27B) | Encodes `STATE:`, optional vision media, and **all questions (`1..64`) into one joint prefill pass**, then runs `ClefJointHead` (`EvidenceRoutingLayer` + `TransformerDecoderLayer` + on-demand lexical `lm_head` priors). |
-| **`Kev`** | Qwen 3.5 `KevModel` checkpoints (`head.safetensors`) | Encodes FIM/box delimiters (`<\|box_start\|>...<\|box_end\|>`), reads post-norm hidden states before `lm_head`, and scores via `PointerHead` (`f64` dot-product, skipping the full vocabulary GEMM). |
-| **`Nimble`** | `Bespoke-Nimble-9B` | Compiles `SafeJson` prompts and reads calibrated last-row `lm_head` candidate logits (`A..Z`, `nimble_temperature`). |
-| **`OpenJev`** | `OpenJevModel` checkpoints | Reads single-token candidate logits across `A..Z` and `a..z` (`2..52` options) with `true`-first `noul` ordering. |
-| **`Lev` / `Xor`** | Dense (`Lev`) & MoE (`Xor`) decision checkpoints | Evaluates **both forward and reverse option orders (`V = 2`)** and averages probabilities in `f64` to cancel positional bias; uses a 9-level rating scale (`0..8`) for `noul` on `Lev`. |
-| **`Tev1` (Default)** | `togethercomputer/Tev1-4B`, `Tev1-0.8B`, or **any standard Qwen 3.5 / 3.6 / 3.8 model** | Works on any loaded Qwen chat model with no special head required—uses `"state"`-first JSON formatting, a non-thinking `<think>\n\n</think>\n\n` prefix, and LCP shared-prefix batching across `MambaRadixCache`. |
+| **`CodeReadout` (`GLiDE`)** | `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `fastino/GLiDE-*`, or `GLiDE` LoRA adapters | Uses `CodeReadoutHead` (`readout.safetensors`, up to 64 option codes, optional `lm_head` omitted), `noncausal_full_attention`, optional `midloop` damped-Euler recurrence, and top-1/top-2 margin confidence (`96.88%` on JevBench Public / `100%` on MultiQ with `GLiDE-9B`). |
+| **`CodeReadout` (`d3`)** | `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ`, `vllm-sr/d3-*` | Uses `CodeReadoutHead` (`readout.safetensors`), `header-v1` multi-question summary layout, `state_once` single-prefill multi-question taps, `prefix_bidir` bidirectional state attention, `temperature_by_questions`, and normalized-entropy confidence (`95.31%` on JevBench Public / `100%` on MultiQ with `d3-ultra`). |
+| **`CausalLm` (Default)** | **Any standard Qwen 3.5 / 3.6 / 3.8 model** (`nchapman/Qwen3.5-4B-W4A16-HGPTQ`, `Qwen3.8-27B-W4A16-HGPTQ`, etc.) | Works on any loaded Qwen chat model with no special head required—uses `"state"`-first JSON formatting, a non-thinking `<think>\n\n</think>\n\nAnswer: ` prefix, last-row `lm_head` candidate logits (`A..X`), and LCP shared-prefix batching across `MambaRadixCache`. |
+
+*(Optional `order_passes: 2` evaluates both forward and reverse option orders and averages probabilities in `f64` to cancel positional bias.)*
 
 ### Example `/v1/systemone` request
 
@@ -198,7 +201,7 @@ curl -fsS http://127.0.0.1:8000/v1/systemone \
   }'
 ```
 
-When multiple questions share the same `state` on single-question profiles (`Kev`, `Nimble`, `Tev1`, etc.), `warp34` warms the shared prefix once into `MambaRadixCache` (KV pages + GDN state snapshot) and fans out only the short question suffixes. See [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for the full wire contract and calibration math.
+When multiple questions share the same `state`, `warp34` either taps all question answers in a single `state_once` prefill (`d3`) or warms the shared prefix once into `MambaRadixCache` (KV pages + GDN state snapshot) and fans out only the short question suffixes. See [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for the full wire contract and JevBench results.
 
 ---
 
@@ -253,20 +256,20 @@ export WARP34_API_KEY="your-secret-key"
 
 Clients can authenticate with either `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-### Live dashboard & Prometheus metrics
+### Live dashboard, API Playground, & Prometheus metrics
 
-- **`GET /`** serves the embedded warm-dark React dashboard (bundled directly into the `warp34` binary—no Node runtime needed at serving time).
+- **`GET /`** serves the embedded shadcn dark React dashboard, **`GET /playground`** serves the interactive multi-API Playground (`Chat`, `Responses`, `Anthropic Messages`, `SystemOne`, `Decisions`), and **`GET /connect`** serves the coding-agent setup guide (all bundled directly into the `warp34` binary—no Node runtime needed at serving time; disable with `--no-webui`).
 - **`GET /metrics`** exports Prometheus counters, gauges, and latency histograms; **`GET /api/metrics`** serves the same telemetry as versioned JSON.
 
 ---
 
 ## Docker
 
-**Packaging choice:** CUDA libraries are shared and copied into a separate layer before the executable, so routine application updates can reuse the cached library download. Pruned static cuBLAS saved space on first install, but made every changed executable layer much larger; see [the experiment and decision record](docs/CUBLAS_PACKAGING_EXPERIMENT.md). Actual RTX 4090 validation remains pending with a separate agent.
+**Packaging choice:** CUDA libraries are shared and copied into a separate layer before the executable, so routine application updates can reuse the cached library download. Pruned static cuBLAS saved space on first install, but made every changed executable layer much larger; see [the experiment and decision record](docs/CUBLAS_PACKAGING_EXPERIMENT.md).
 
-Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`). The multi-stage build ships `warp34`, shared `libcudart`/`libcublas`/`libcublasLt`, and a small Ubuntu 26.04 runtime with TLS certificates and a curl healthcheck—no Python, Node, CUDA toolkit, or model weights. Embedded CUDA code is size-compressed; native `sm_86` and `sm_89` kernels are included in the same image.
+Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`). The multi-stage build ships `warp34`, shared `libcudart`/`libcublas`/`libcublasLt`, and a small Ubuntu 26.04 runtime with TLS certificates and a curl healthcheck—no Python, Node, CUDA toolkit, or model weights. Embedded CUDA code is size-compressed; native `sm_80`, `sm_86`, and `sm_89` kernels are included in the same image.
 
-**Host requirements:** Linux `amd64` with an x86-64-v3 CPU (AVX2/FMA), an RTX 30- or 40-series GPU with enough VRAM for the selected model, a CUDA 13-capable NVIDIA driver, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). CUDA 13.x minor-version compatibility starts at driver branch R580; a current driver is recommended because newer CUDA features/PTX can require newer drivers. The host does **not** need the CUDA toolkit installed. The container checks the CUDA 13 driver capability before startup.
+**Host requirements:** Linux `amd64` with an x86-64-v3 CPU (AVX2/FMA), an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU with enough VRAM for the selected model, a CUDA 13-capable NVIDIA driver, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). CUDA 13.x minor-version compatibility starts at driver branch R580; a current driver is recommended because newer CUDA features/PTX can require newer drivers. The host does **not** need the CUDA toolkit installed. The container checks the CUDA 13 driver capability before startup.
 
 ```sh
 docker pull ghcr.io/nchapman/warp34:dev
@@ -335,11 +338,11 @@ For end-to-end HTTP load testing across single-stream decode, concurrent `C=8..1
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Reproducible bug reports, regression-first fixes and PR verification requirements |
 | [`docs/MODELS.md`](docs/MODELS.md) | Model downloads, `--revision` / `--offline`, supported architectures, quantizations, and KV policies |
 | [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) | Full architecture & 3-tier offloading reference for `Qwen3.8-Flash-Next` (`qwen4_exp`) |
-| [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) | `/v1/systemone` and `/v1/decisions` schemas, supported profiles (`Clef`, `Kev`, `Nimble`, `Tev1`, `OpenJev`, `Lev`/`Xor`), and confidence math |
+| [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) | `/v1/systemone` and `/v1/decisions` schemas, supported profiles (`CodeReadout` `GLiDE` & `d3`, `CausalLm`), and JevBench results |
 | [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) | Wire contracts for `/v1/chat/completions`, `/v1/responses`, and Anthropic `/v1/messages` |
 | [`docs/SERVING.md`](docs/SERVING.md) | Server flags, authentication (`--api-key-env`), concurrency limits, and image security |
 | [`docs/METRICS.md`](docs/METRICS.md) | Live web dashboard, Prometheus `/metrics`, and `/api/metrics` JSON schema |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Subsystem architecture, donor map (`vLLM` / `SGLang` / `vllm.cpp` / `warp3090`), and seam contracts |
-| [`docs/HARDWARE.md`](docs/HARDWARE.md) | RTX 30-series (`sm_86`) and 40-series (`sm_89`) rooflines, PCIe/NVLink topology, and ISA traps |
+| [`docs/HARDWARE.md`](docs/HARDWARE.md) | NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) rooflines, PCIe/NVLink topology, and ISA traps |
 | [`docs/STATE.md`](docs/STATE.md) | Current verified hardware benchmark matrix and engineering state |
 | [`docs/contracts/`](docs/contracts/) | Frozen precision, KV layout, GDN state-transaction, and multi-GPU collective contracts |

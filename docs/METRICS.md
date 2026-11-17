@@ -1,6 +1,8 @@
 # Metrics and built-in dashboard
 
-`warp34 serve` includes a read-only, ultraviolet-dark React dashboard at **`GET /`**.
+`warp34 serve` includes a built-in shadcn dark React dashboard at **`GET /`**,
+an interactive API Playground at **`GET /playground`**, and a coding-agent setup
+guide at **`GET /connect`** (disable UI routes with `--no-webui`).
 No external collector, CDN, Node runtime, or frontend files are needed at runtime:
 Vite's production assets are embedded in the Rust executable. Prometheus remains
 optional; use it for durable history, alerting, and fleet-wide aggregation.
@@ -9,8 +11,8 @@ optional; use it for durable history, alerting, and fleet-wide aggregation.
 
 | Route | Contract |
 |---|---|
-| `/` | Embedded dashboard; HTML revalidates on navigation |
-| `/assets/*` | Content-hashed, immutable production assets |
+| `/`, `/playground`, `/connect` | Embedded dashboard, interactive API Playground, and Connect guide; HTML revalidates on navigation (`404` when `--no-webui` is passed) |
+| `/assets/*` | Content-hashed, immutable production assets (`404` when `--no-webui` is passed) |
 | `/metrics` | Prometheus text exposition 0.0.4, with HELP/TYPE metadata |
 | `/api/metrics` | Versioned JSON snapshot (`schema_version: 1`), `Cache-Control: no-store` |
 | `/health` | Existing worker-health endpoint, independent of dashboard polling |
@@ -23,12 +25,14 @@ are included. The configured model name is operational metadata; if you use a lo
 path as the served model name, that name is visible too.
 
 **Exposure:** [optional API-key authentication](SERVING.md) protects inference,
-model-list, tokenization, and stored-Responses APIs. The dashboard, `/health`,
+model-list, tokenization, and stored-Responses APIs (including requests sent from
+`/playground`). The dashboard pages, `/health`,
 `/metrics`, and `/api/metrics` remain **unauthenticated**, even when a key is enabled.
 Bind to loopback, use a trusted private network, or protect the entire service with
 an authenticated TLS reverse proxy. Without `--api-key` or `--api-key-env`,
 credentials used to scope stored Responses do not enforce access control.
-The dashboard adds no generation, benchmarking, or administrative actions.
+Overview and Connect are read-only, while Playground issues ordinary client API requests
+to the same origin.
 Its production CSP restricts scripts and connections to the same origin, and assets
 are served from an embedded allowlist, never the filesystem.
 

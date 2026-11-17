@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) — Architecture & Verification Reference
 
-> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_86,sm_89`) foundation.
+> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_80,sm_86,sm_89`) foundation.
 >
 > **Strategic Scope:** `Qwen3.8-Flash-Next` is the first open-weight release of the **Qwen4 architecture family** (`qwen4_exp` / `qwen4_exp_text`). Every primitive introduced here — **HyperConnection (`GatedResidual`)**, **Qwen Sparse Attention (`QSA`)**, **N-Gram Per-Layer Embeddings (`PLE`)**, **Tiered 512-Expert MoE Offloading**, and **Multi-Stream `Qwen4` `MTP`** — is a first-class, reusable `warp34` subsystem that composes cleanly with `CudaDeviceProps`, `KvPool`, `StateBundlePool`, `MambaRadixCache`, `CUDAGraphRunner`, and `warp34` oracle verification contracts.
 >
@@ -28,9 +28,9 @@
 | **512-Expert Sparse MoE (`48` layers)** | `num_experts = 512`, `top_k = 10` routed + `1` shared expert, `moe_intermediate_size = 640`, `shared_expert_intermediate_size = 640` (`~62.8 GB` at `W4A16 g128`) | `csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu`, `src/{moe_offload,moe_cpu_bridge}.rs` |
 | **Qwen4 Multi-Token Predictor (`MTP`)** | `1` layer (`full_attention` QSA + `512`-expert `INT4 g32` MoE), `residual_linear_shared` (`fc_embedding` + `fc_hidden`), dual-stream output (`[T, 2560]` + `[T, 10240]`), `K = 3` (`M_verify = 4`) | `src/mtp.rs`, `src/mtp/propose.rs` |
 
-### 1.2 Canonical Checkpoint Target
+### 1.2 Canonical Checkpoint Targets
 
-Our primary reference checkpoint is [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) (pinned revision `ef554143369a706525336f6b42a09094835dc077`), alongside compatibility with upstream `Qwen/Qwen3.8-Flash-Next` and standard AutoRound / GPTQ / Compressed-Tensors `W4A16` checkpoints:
+Our primary reference checkpoints are **`nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ`** (`6ee06d2936b111f19eb5eb331044cb8b8b28562b`, `94 GiB` with `H_64` routed/shared/MTP experts + 4-bit `lut4-gptq` `PLE`, plus `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ` `27cb8fb1695586fd8265c960708e079215be2404`) and [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) (pinned revision `ef554143369a706525336f6b42a09094835dc077`), alongside compatibility with upstream `Qwen/Qwen3.8-Flash-Next` and standard AutoRound / GPTQ / Compressed-Tensors `W4A16` checkpoints:
 - **Target Backbone (`~72.6 GiB`):**
   - Routed MoE experts (`48 × 512` experts, `gate_proj`/`up_proj`/`down_proj`): Intel AutoRound symmetric `W4A16` (`bits = 4`, `group_size = 128`, `~62.8 GiB` total = `~2.56 MiB` per expert, `~1.31 GiB` per layer).
   - Dense weights (GDN projections, QSA projections & indexer, shared experts, `GatedResidual` norms & projections, token embeddings, `lm_head`): `~9.8 GiB` total (`BF16` / `W4A16` per checkpoint `extra_config`).

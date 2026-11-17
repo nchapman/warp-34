@@ -1,6 +1,6 @@
 [package]
 name = "warp34-kernels"
-description = "vLLM-aligned CUDA kernels (sm_86) and FFI seam for warp34"
+description = "vLLM-aligned CUDA kernels (sm_80, sm_86, sm_89) and FFI seam for warp34"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

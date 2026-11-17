@@ -1,6 +1,6 @@
 # warp34 — Architecture & Donor Reference Map
 
-> **Posture:** `warp34` is a clean-room Rust + CUDA inference engine for **Qwen 3.5 / 3.6 / 3.8 hybrid models** on **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** (primary reference targets: RTX 3090 / 3090 Ti and RTX 4090).
+> **Posture:** `warp34` is a clean-room Rust + CUDA inference engine for **Qwen 3.5 / 3.6 / 3.8 hybrid models** on **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** (primary reference targets: A100 40GB/80GB, RTX 3090 / 3090 Ti, and RTX 4090).
 >
 > **Source-of-Truth Rubric:** Every subsystem has **one explicit reference donor** chosen by where the mechanism is proven:
 > 1. **`vLLM 0.31.0` (`8352b2427`)** — Primary donor for the **`FP16` model spine**, **Marlin GEMMs** (`W4A16` / `W8A16` / `W4A8` / `moe_wna16`), **layer fusions** (`GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, GDN `chunk` + `fused_recurrent`), **native `MTP`**, **9-step GPU sampler**, and **Qwen3 reasoning/tool/vision parsers**.

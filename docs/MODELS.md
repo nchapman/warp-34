@@ -26,9 +26,15 @@ remains the public API model name and the model identifier in benchmark reports.
 ## Revisions, cache, and offline mode
 
 - `--revision` accepts a branch, tag, or full commit SHA; the default is `main`.
-  Every online invocation resolves the requested ref and checks the repository
-  listing. Cached file payloads are reused; **online startup still needs network
-  access and a writable cache**, even when weights are already present.
+  When `--revision` is a pinned 40-character commit SHA and a verified snapshot
+  manifest already exists in the local cache, `warp34` reuses the snapshot immediately
+  with zero network round-trips. For mutable refs (`main`, tags, or branches),
+  online startup queries the repository info once to resolve the current commit SHA
+  and skips the file-tree download walk if that commit is already verified on disk.
+  If Hugging Face returns a transient network, timeout, rate-limit (HTTP 429), or
+  server error (HTTP 5xx) while resolving a mutable ref, `warp34` logs a warning and
+  falls back to a verified complete cached snapshot if one exists locally (while
+  keeping explicit 401/403/404 and incomplete-snapshot checks fail-closed).
 - Metadata and weights are fetched by the **same immutable commit**, not by a
   branch that could change midway through downloading. The resolved commit is
   printed to stderr. A mutable cache ref is published atomically only after the
@@ -42,7 +48,7 @@ remains the public API model name and the model identifier in benchmark reports.
   Xet transfer support. It uses the standard `models--owner--repo/{blobs,refs,snapshots}`
   layout, interoperable with `hf download` / Python `huggingface_hub`.
 - warp34 additionally records the required file list under each repository's
-  `.warp34/<commit>.json`. This is bookkeeping, not another copy of model weights.
+  `.warp34/<commit>.json` (and `.warp34/lora-<commit>.json` for LoRA adapters). This is bookkeeping, not another copy of model weights.
   Offline startup checks every recorded file. Existing caches made by other tools
   without that manifest are accepted after checking configuration, tokenizer,
   available decision heads, Safetensors headers, and every indexed shard. Without
@@ -109,11 +115,11 @@ local-path loads bypass the Hub client entirely.
 The downloader selects the formats the existing runtime can actually load:
 
 - Root model configuration, generation/quantization configuration, tokenizer
-  assets, chat templates, and image/video processor metadata when present.
+  assets, chat templates, decision configuration (`decision_config.json`), and
+  image/video processor metadata when present.
 - `model.safetensors.index.json` and **exactly its referenced shards**, or
   `model.safetensors` for an unsharded checkpoint.
-- `head.safetensors`, `joint_head.safetensors`, and `joint_head_config.json` when
-  present, so decision-model heads are not silently omitted.
+- `readout.safetensors` when present, so `CodeReadout` decision-model heads (`GLiDE` and `d3`) are not silently omitted.
 
 It does not fetch alternate checkpoints just because their names end in
 `.safetensors`, nor pickle/PyTorch `.bin`, GGUF, training artifacts, or repository
@@ -131,9 +137,9 @@ execution.
 
 | Category | Supported formats & configurations |
 |---|---|
-| **Architectures** | `Qwen3_5ForCausalLM` / `Qwen3_5ForConditionalGeneration` (dense `0.8B`, `4B`, `9B`, `27B`), `Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration` (`35B-A3B` 256-expert MoE), `Qwen4ExpForCausalLM` (`Qwen3.8-Flash-Next` 512-expert MoE with `HyperConnection`, `QSA`, `PLE`, and `Qwen4MTP`), `DFlashDraftModel` (`4B`, `27B`), and System One decision heads (`Clef`, `Kev`, `Nimble`, `Tev1`, `OpenJev`, `Xor` / `Lev`). |
-| **Weight Quantization** | `GPTQ` (`sym=true` and `sym=false`, `4-bit` and `8-bit`, `desc_act=false`), `AWQ` (`4-bit`, symmetric and asymmetric), `compressed-tensors` (`pack-quantized` `4-bit` and `8-bit`, symmetric and asymmetric), `AutoRound` (`4-bit`, symmetric and asymmetric), FP8 `PLE` (`F8_E4M3` + `BF16` per-row scale), and unquantized `FP16` / `BF16`. |
-| **KV Cache Policies** | `--kv-format fp16` (16-bit baseline), `--kv-format q8_0` (`1.88×` compression, `272 B/row`), `--kv-format tq4` (`3.07×` hybrid: rotated `Q8_0` on the first 2 and last 2 full-attention layers + rotated LSQ `TQ4` `132 B/row` on interior layers), and `--kv-format tq4_all` (`3.88×` uniform `TQ4`). |
+| **Architectures** | `Qwen3_5ForCausalLM` / `Qwen3_5ForConditionalGeneration` (dense `0.8B`, `2B`, `4B`, `9B`, `27B`), `Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration` (`35B-A3B` 256-expert MoE), `Qwen4ExpForCausalLM` / `Qwen4ExpForConditionalGeneration` (`Qwen3.8-Flash-Next` 512-expert MoE with `HyperConnection`, `QSA`, `PLE`, and `Qwen4MTP`), `DFlashDraftModel` (`4B`, `27B`, `Flash-Next`), PEFT LoRA adapters (`--lora`), and System One decision heads (`CodeReadout` `GLiDE` & `d3`, `CausalLm`). |
+| **Weight Quantization** | `W4A16-HGPTQ` (block-Hadamard `H_64` / `H_16` `compressed-tensors` `pack-quantized`), mixed `W2.6A16-HGPTQ-RCO` (`2-bit` + `4-bit`), standard `GPTQ` (`sym=true` and `sym=false`, `4-bit` and `8-bit`, `desc_act=false`), `AWQ` (`4-bit`, symmetric and asymmetric), `compressed-tensors` (`pack-quantized` `4-bit` and `8-bit`, symmetric and asymmetric), `AutoRound` (`4-bit`, symmetric and asymmetric), FP8 / `lut4-gptq` `PLE`, and unquantized `FP16` / `BF16`. |
+| **KV Cache Policies** | `--kv-format fp16` / `bf16` (16-bit baseline), `--kv-format fp8` (`2.0×` hardware `FP8_E4M3` `264 B/row` on `sm_89+`), `--kv-format q8_0` (`1.88×` compression, `272 B/row`), `--kv-format tq4` (`3.07×`–`3.10×` hybrid: rotated `Q8_0` or `FP8_E4M3` on the 4 tail-anchor full-attention layers + rotated LSQ `TQ4` `132 B/row` on preceding layers), and `--kv-format tq4_all` (`3.88×` uniform `TQ4`). |
 | **Multi-GPU & Offload** | `--tp 1`, `--tp 2` (NVLink P2P VRAM or pinned-sysmem PCIe), and `--tp 4` (`EP=4` 100% VRAM-resident 512-expert MoE); `--moe-offload auto|gpu-lru|cpu-hybrid` with three-tier 0-ULP CPU MoE evaluation (`AVX-512`, `AVX2+FMA+F16C`, or portable scalar). |
 
 ## Library callers and tests

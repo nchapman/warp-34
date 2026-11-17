@@ -35,12 +35,10 @@ Use the pins in each campaign for warp34; `tools/prep_test_models.py` prepares
 the core test pins. The quality suite has its own explicitly documented HGPTQ
 pin in [quality/AUTOMATION.md](quality/AUTOMATION.md).
 
-## Serving smoke evidence
+## Serving smoke & multi-agent head-to-head evidence
 
 Both pins passed [vLLM 0.31.0 TP2 plain/MTP-3 startup and short generation](perf/qualification/cyankiwi-vllm-tp2-smoke.md)
-on 2× RTX 3090 Ti. This is not a throughput, quality, cache-reuse, TP1, or SGLang
-qualification. Updated campaign and quality-suite configurations still require
-exact-setting qualification.
+on 2× RTX 3090 Ti, and were subsequently measured in the full `Open-SWE-Traces` multi-client head-to-head campaign (`smoke-warmup`, `swe-c4-shared`, `swe-c4-unique`, `swe-c8-burst`, `swe-c12-overload`) across `TP=1` and `TP=2` against `warp34` `nchapman/*-W4A16-HGPTQ` and `SGLang v0.5.19` (recorded in [`docs/STATE.md`](../docs/STATE.md)).
 
 ## Comparing results
 
@@ -50,11 +48,10 @@ and speculation can all affect throughput and generated tokens. Report those
 settings and qualify output quality separately. Do not call a configuration the
 "strongest" without testing the relevant supported alternatives.
 
-**The multi-agent vLLM comparisons recorded with commit `f8bf8a3` are withdrawn
-as approved baselines.** The 35B run used an uncensored derivative, and the 27B
-run used a deprecated in-house GPTQ export. Their speedup and cache-hit ratios
-must not be attributed to cyankiwi or used to claim that the corrected baseline
-has been beaten. Fresh measurements are required.
+**The earlier multi-agent vLLM comparisons recorded with commit `f8bf8a3` were withdrawn
+and superseded by the tuned `cyankiwi` official-base AWQ campaign in [`docs/STATE.md`](../docs/STATE.md).** The earlier 35B run had used an uncensored derivative, and the earlier 27B
+run had used a deprecated in-house GPTQ export. Their speedup and cache-hit ratios
+must not be attributed to cyankiwi.
 
 Keep archived results, logs, and qualification receipts byte-for-byte faithful
 to the checkpoints actually used. Historical references in those records are

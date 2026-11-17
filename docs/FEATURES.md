@@ -1,6 +1,6 @@
 # warp34 — Comprehensive Front-to-Back Feature Inventory
 
-`warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV) targeting **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** (primary targets: RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
+`warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4/FP8 KV) targeting **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** (primary targets: A100 40GB/80GB, RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
 
 This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. **Implementation is not production qualification.** Scope-specific grades, evidence, limitations, and release gates live in [`READINESS.md`](READINESS.md); the launch checklist lives in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).
 
@@ -13,17 +13,17 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 
 * **CLI Dispatch & Subcommands:**
   * `generate`: Standalone single/multimodal generation supporting plain, MTP, and DFlash2 execution across TP=1/2/4.
-  * `bench`: Multi-stage benchmarking framework (`--stage decode | radix | scheduler | vision | all`) with configurable prompt/generation lengths, batch sizes, and JSON export (`--out <json>`).
+  * `bench`: Multi-stage benchmarking framework (`--stage decode | radix | scheduler | vision | all`) with configurable prompt/generation lengths, batch sizes, custom or realistic coding prompts (`--prompt`, `--prompt-file`, `--realistic-prompt`), and JSON export (`--out-json <json>`).
   * `greedy-diff`: Automated token-for-token validation harness against reference golden outputs (`--golden <dir|json>`) with `--verify-lossless` (speculative parity) and `--verify-radix-warm` (prefix cache parity) verification.
   * `dump-diff`: Layer-by-layer tensor inspection harness dumping per-layer inputs/outputs across norms, attention, GDN, and MLP against `vLLM` / `SGLang` Safetensors fixtures (`--compare-tp2`).
   * `profile-diff`: Side-by-side SQLite/JSON performance profiler comparing round latencies (`ms/round`) and launch counts across 7 kernel categories against `vLLM 0.31.0` and `SGLang v0.5.19`.
   * `serve`: HTTP server implementing OpenAI Chat, OpenAI Responses, Anthropic Messages, and TypeSafe Decision model APIs.
-  * `chat`: Single-turn terminal execution runner formatting ChatML prompts, evaluating reasoning and tool blocks via `Qwen3Parser`, and reporting generation statistics (prompt/cached/generated tokens, TTFT, decode tok/s) to stderr.
+  * `chat`: Interactive multi-turn terminal REPL (`warp34 chat <model>`) and single-turn runner (`--prompt`) formatting ChatML prompts, streaming reasoning and tool blocks via `Qwen3Parser`, and reporting generation statistics (prompt/cached/generated tokens, TTFT, decode tok/s) to stderr.
 * **CLI Flags & Argument Validation:**
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
-  * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp16 | bf16` (default: `tq4`).
-  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, 1,024 pages / 16,384 tokens in `chat`, or 256 pages / 4,096 tokens in single-shot CLI commands).
-  * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <tokens>` (supports `k`/`M` suffixes).
+  * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp8 | fp16 | bf16` (default: `tq4`; `fp8` requires `sm_89+`).
+  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `-c` / `--ctx-size <tokens>` or `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, 1,024 pages / 16,384 tokens in `chat`, or 256 pages / 4,096 tokens in single-shot CLI commands).
+  * **Serving & LoRA Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>` (`--alias`), `--no-webui`, `--lora <name=path_or_repo>` (`--lora-modules`), `--max-num-seqs <1..16>` (default 16), `--max-model-len <tokens>` (supports `k`/`M` suffixes).
   * **Model Hub & Offline Options:** `--revision <ref>`, `--draft-revision <ref>`, `--offline` (reads strictly from `HF_HUB_CACHE`).
   * **Multimodal Options:** `--image <path|url>`, `--allow-remote-images` (SSRF-protected HTTP/HTTPS retrieval).
 
@@ -65,16 +65,14 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 ---
 
 ## 3. Specialized Decision-Model Serving Engine
-*Location: `crates/warp34-host/src/decision.rs`, `crates/warp34-host/src/clef.rs`*
+*Location: `crates/warp34-host/src/decision.rs`, `crates/warp34-host/src/decision/`*
 
 * **TypeSafe Decision Model Endpoints:**
-  * Exposes `POST /v1/systemone` (and unversioned `/systemone`) and `POST /v1/decisions` (and `/decisions`) for specialized decision pipelines without modifying generative routes.
-  * **Clef (`ClefModel`):** Joint schema head (`ClefJointHead` + `joint_head.safetensors`) performing multi-question joint cross-attention over document text and multimodal image tokens.
-  * **Kev (`KevModel`):** Pointer head (`KevPointerHead` + `head.safetensors`) computing query-key dot-product attention over `<|box_end|>` and `<|fim_suffix|>` anchors.
-  * **Nimble (`NimbleModel`):** Parallel schema prompt scoring with `SafeJson` validation and calibrated temperature across up to 26 single-letter options (`A..Z`).
-  * **Tev1 (`Tev1Model`):** Generative classification scoring over options `A..X` (up to 24 choices).
-  * **OpenJev:** 52-choice evaluation (`A..Z` and `a..z`) with `true`-first probability normalization.
-  * **Xor / Lev:** Dual forward and reverse option-order probability averaging to eliminate positional prompt bias.
+  * Exposes `POST /v1/systemone` (and unversioned `/systemone`) and `POST /v1/decisions` (and `/decisions`) for specialized zero-decode decision pipelines without modifying generative routes.
+  * **`CodeReadout` (`GLiDE` — `fastino/GLiDE-*`, `nchapman/GLiDE-*-W4A16-HGPTQ`, and `GLiDE` Decision LoRA adapters):** Projects post-final-`GemmaRMSNorm` hidden states through `CodeReadoutHead` (`readout.safetensors`, up to 64 option codes, optional `lm_head` omitted), supporting `noncausal_full_attention`, `midloop` damped-Euler recurrence (`warp34_midloop_damped_euler_f16`), `true`-first `noul` ordering, and `Top1Top2Margin` confidence.
+  * **`CodeReadout` (`d3` — `vllm-sr/d3-*`, `nchapman/d3-*-W4A16-HGPTQ`):** Projects post-final-`GemmaRMSNorm` hidden states at each question's `Answer:` token via `CodeReadoutHead`, supporting `header-v1` multi-question summary layout, `state_once` single-prefill multi-question taps, `prefix_bidir` bidirectional state attention, `temperature_by_questions`, `false`-first `noul` ordering, and `NormalizedEntropy` confidence.
+  * **`CausalLm` (Default Qwen Generative Scorer):** Evaluates any standard Qwen 3.5 / 3.6 / 3.8 model via last-row `lm_head` candidate-token logits across single-token labels `A..X` (up to 24 options) with `"state"`-first JSON formatting and LCP shared-prefix batching across `MambaRadixCache`.
+  * **Positional Bias Cancellation (`order_passes: 2`):** Evaluates both forward and reverse option permutations and averages probabilities in `f64`.
 
 ---
 
@@ -205,7 +203,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Clean-room implementation of `Qwen3_5MTP` / `Qwen3_5MoeMTP` (vLLM donor, `crates/warp34-host/src/mtp.rs`).
   * Single-layer TP-sharded predictor with projection, gated attention, dense/MoE FFN, and borrowed target LM head.
   * Online LM-head quantization: Quantizes unquantized target LM heads into a private `MarlinW4A16` (group size 64) proposal head on the fly when VRAM headroom permits.
-  * Pre-captured proposal CUDA Graphs supporting up to 4 concurrent speculative slots (`MAX_MTP_BATCH_SLOTS = 4`).
+  * Pre-captured proposal CUDA Graphs supporting up to 8 concurrent speculative slots (`MAX_MTP_BATCH_SLOTS = 8` when `all_pages >= 512`, `4` otherwise).
 * **DFlash2 Block Speculation:**
   * Clean-room 5-layer native BF16 speculative drafter (`DFLASH2_NUM_LAYERS = 5`, SGLang `DFlashWorkerV2` donor).
   * Verifies `M = K + 1` proposals (up to 16 tokens, e.g. M=8 on 27B/80B models, M=16 on 4B models) in a single batched forward pass.
@@ -369,6 +367,6 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
   * Security hardening: Runs under an unprivileged system user (`warp34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**
-  * Compiles native SASS cubins for both Ampere (`sm_86`) and Ada Lovelace (`sm_89`) plus compute_86 PTX fallback.
+  * Compiles native SASS cubins for NVIDIA A100 (`sm_80`), Ampere (`sm_86`), and Ada Lovelace (`sm_89`) plus `compute_89` PTX fallback.
   * Embedded device code compression enabled (`WARP34_NVCC_EXTRA=--compress-mode=size`).
-  * Dynamic hardware detection (`warp34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 142 SMs on RTX 4090).
+  * Dynamic hardware detection (`warp34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 108 SMs on A100 and 142 SMs on RTX 4090).
