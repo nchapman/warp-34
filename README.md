@@ -98,13 +98,13 @@ Standard engines struggle to combine speculative decoding with hybrid recurrent 
 
 ### Reference throughput (`--kv-format tq4` / `fp8`, verified lossless)
 
-| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 1× A100 80GB (`sm_80`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) | 2× A100 80GB (NVLink) |
+| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 1× A100 (`sm_80`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) | 2× A100 (`sm_80`) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **Qwen3.5-4B** | Plain / `MTP-3` / `DFlash2` | `204` / `542` / `1,577` | `223` / `586` / `1,734` | `308` / `728` / `1,632` | — | — | — |
-| **Qwen3.8-27B** | Plain (`M=1`) | `51.8 tok/s` | `54.7 tok/s` | `78.2 tok/s` | `85.4 tok/s` | `91.8 tok/s` | `135.4 tok/s` |
+| **Qwen3.5-4B** | Plain / `MTP-3` / `DFlash2` | `204` / `542` / `1,577` | `223` / `621` / `1,757` | `308` / `728` / `1,705` | `258` / `664` / `1,520` | `328` / `871` / `2,055` | `248` / `626` / `1,318` |
+| **Qwen3.8-27B** | Plain (`M=1`) | `51.8 tok/s` | `54.7 tok/s` | `78.2 tok/s` | `85.4 tok/s` | `97.4 tok/s` | `135.4 tok/s` |
 | **Qwen3.8-27B** | `MTP (k=3)` | `150.1 tok/s` | `153.6 tok/s` | `221.3 tok/s` | `252.1 tok/s` | `257.6 tok/s` | `348.5 tok/s` |
 | **Qwen3.8-27B** | `DFlash2 (k=7)` | `247.9 tok/s` | `305.5 tok/s` | `370.9 tok/s` | `365.1 tok/s` | `400.6 tok/s` | `475.1 tok/s` |
-| **Qwen3.6-35B-A3B** | Plain / `MTP (k=3)` | `205.0` / `429.1` | `246.0` / `473.1` | `297.2` / `531.6` | `261.5` / `553.4` | `294.7` / `605.7` | `404.4` / `749.3` |
+| **Qwen3.6-35B-A3B** | Plain / `MTP (k=3)` | `205.0` / `429.1` | `246.0` / `473.1` | `297.2` / `531.6` | `261.5` / `553.4` | `315.3` / `672.0` | `404.4` / `749.3` |
 
 *(On `4× RTX 3090 (TP=4)`, `27B` reaches `291.0 tok/s` with `MTP-3` and `438.3 tok/s` with `DFlash2`. Note that speculative speedups depend on draft acceptance rate $\tau$: the table above reports standard `warp34 bench` peak acceptance, while `warp34 bench --realistic-prompt` and the `Open-SWE-Traces` multi-agent campaigns measure natural coding-prompt acceptance where `27B MTP-3` achieves `96–113 tok/s` on `TP=1` and `156–164 tok/s` on `TP=2`.)*
 

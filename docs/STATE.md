@@ -1,5 +1,34 @@
 # warp34 — Session Orientation & Current State
 
+## Multi-Architecture Hardware Verification (`sm_80` 2× A100-SXM4-40GB, `sm_86` 2× RTX 3090 / 3090 Ti, `sm_89` 2× RTX 4090)
+
+- **Live Multi-Arch Verification Suite (`tools/check_cuda_sanitizer.py`, `crates/warp34-host/src/model/weights.rs`, `crates/warp34-host/src/cli/oracle.rs`, `tools/oracle/goldens/4B/`):**
+  - Verified the `sm_80,sm_86,sm_89` multi-arch fatbinary across three rented 2-GPU Vast.ai systems (`2× NVIDIA A100-SXM4-40GB` `sm_80` 108 SMs, `2× NVIDIA GeForce RTX 4090` `sm_89` 128 SMs, and `2× NVIDIA GeForce RTX 3090` non-Ti `sm_86` 82 SMs) alongside local `2× RTX 3090 Ti` (`sm_86` 84 SMs):
+    - **117/117 `compute-sanitizer` (`memcheck`, `racecheck`, `synccheck`)** runs (`0` errors) across all 6 CUDA kernel subsystems (`gdn`, `attention`, `marlin_moe`, `norms_rope_act`, `sampling`, `collectives`) + `TP=2` cross-GPU collectives on every architecture.
+    - **4/4 `warp34-kernels` + 345/345 `warp34-host` GPU/host unit tests** passing on all three remote 2-GPU systems (`346/346` locally including `forced_simd_tier_throughput_and_parity` which invokes `rustc`).
+    - **`dump-diff --compare-tp2` (`TP=1` vs `TP=2` tensor & top-1 parity)** passing across `4B` (Plain, `MTP-3`, `DFlash2`) and `35B-A3B MoE` (Plain, `MTP-3`, `tp1_top1 == tp2_top1 == 271`, `draft_exact = 3/3`) on `sm_80`, `sm_86`, and `sm_89`.
+    - **`greedy-diff` (`TP=1` & `TP=2`, `--verify-lossless --verify-radix-warm`)** passing `first_step=4/4 adjudicated=4/4 lossless=4/4 radix_warm=4/4` on both `Qwen/Qwen3.5-4B` (`FP16`) and `nchapman/Qwen3.5-4B-W4A16-HGPTQ` across `sm_80`, `sm_86`, and `sm_89`.
+  - **Multi-Arch Parity & Tooling Fixes:**
+    - Raised `SMALL_N_GEMM_DECODE_MAX_DIM` (`2560 -> 9216`) and `SMALL_N_GEMM_PLE_MAX_N` (`12288 -> 18432`) in `crates/warp34-host/src/model/weights.rs` so all transformer-block `DenseF16` projections in unquantized `Qwen/Qwen3.5-4B` (`TP=1` and `TP=2` `down_proj`, `o_proj`, `out_proj`, `gate_up_proj`) dispatch to the `M`-invariant `warp34_small_n_gemm_f16` kernel across `M <= 16` decode and speculative verify rounds, eliminating `M=1` vs `M=4` `cuBLAS` reduction-order tie flips on `sm_89`.
+    - Recaptured `tools/oracle/goldens/4B/{chat,agentic}*.{ids,top5.json}` from `vLLM 0.31.0` (`dtype=float16`) against `Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a` to match `.mise.toml` `oracle-greedy`, and updated `GOLDEN_MOE_TEXT_RESIDUAL_MAX_LAST_REL_L2` (`0.22`) / `GOLDEN_MOE_TEXT_RESIDUAL_MIN_LAST_COSINE` (`0.975`) in `crates/warp34-host/src/cli/oracle.rs` for `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ@184b46c573e43deb31519e79ae67b3a599404515`.
+    - Added `discover_prebuilt_test_executables()` (`WARP34_PREBUILT_TESTS=1` or automatic fallback when `cargo` is absent) to `tools/check_cuda_sanitizer.py` so prebuilt `target/release/deps/` binaries run `compute-sanitizer` directly on minimal CUDA images.
+  - **Verified Multi-Arch `warp34 bench` Throughput (`--stage all --kv-format tq4`, `lossless_parity: true` on all radix & vision stages):**
+    - **`2× RTX 4090` (`sm_89`, 128 SMs):**
+      - `4B` (`TP=1`): Plain **`222.5 tok/s`** (`B=8` sched **`1,373.8 tok/s`** decode / `5,838.6 tok/s` total), `MTP-3` **`621.1 tok/s`** (`1.61 ms` ITL, `B=8` sched **`1,631.2 tok/s`** decode / `6,932.6 tok/s` total), `DFlash2` **`1,757.1 tok/s`** (`0.57 ms` ITL).
+      - `4B` (`TP=2`): Plain **`327.7 tok/s`** (`B=8` sched **`1,791.1 tok/s`** decode / `7,612.2 tok/s` total), `MTP-3` **`871.3 tok/s`** (`1.15 ms` ITL, `B=8` sched **`1,979.8 tok/s`** decode / `8,414.1 tok/s` total), `DFlash2` **`2,054.8 tok/s`** (`0.49 ms` ITL).
+      - `27B` (`TP=2`): Plain **`97.4 tok/s`** (`B=8` sched `473.2 tok/s` decode / `2,011.2 tok/s` total), `MTP-3` **`246.2 tok/s`** (`4.06 ms` ITL, `B=8` sched **`587.5 tok/s`** decode / `2,497.1 tok/s` total), `DFlash2` **`327.9 tok/s`** (`3.05 ms` ITL).
+      - `35B-A3B MoE` (`TP=2`): Plain **`315.3 tok/s`** (`3.17 ms` ITL, `B=8` sched **`1,370.5 tok/s`** decode / `5,824.6 tok/s` total), `MTP-3` **`672.0 tok/s`** (`1.49 ms` ITL, `B=8` sched **`1,312.2 tok/s`** decode / `5,576.6 tok/s` total).
+    - **`2× A100-SXM4-40GB` (`sm_80`, 108 SMs):**
+      - `4B` (`TP=1`): Plain **`208.6 tok/s`** (`B=8` sched **`1,309.9 tok/s`** decode / `5,567.3 tok/s` total), `MTP-3` **`581.4 tok/s`** (`1.72 ms` ITL, `B=8` sched **`1,448.5 tok/s`** decode / `6,156.2 tok/s` total), `DFlash2` **`1,704.5 tok/s`** (`0.59 ms` ITL).
+      - `4B` (`TP=2`): Plain **`247.7 tok/s`** (`B=8` sched `984.7 tok/s`), `MTP-3` **`626.0 tok/s`** (`1.60 ms` ITL, `B=8` sched `1,019.7 tok/s` / `4,333.5 tok/s` total), `DFlash2` **`1,318.3 tok/s`** (`0.76 ms` ITL).
+      - `27B` (`TP=2`): Plain **`67.4 tok/s`**, `MTP-3` **`124.9 tok/s`** (`8.01 ms` ITL), `DFlash2` **`149.8 tok/s`** (`6.68 ms` ITL).
+      - `35B-A3B MoE` (`TP=2`): Plain **`176.8 tok/s`** (`5.66 ms` ITL, `B=8` sched `398.1 tok/s` / `1,691.8 tok/s` total), `MTP-3` **`410.8 tok/s`** (`2.43 ms` ITL, `B=8` sched **`712.4 tok/s`** decode / `3,027.5 tok/s` total).
+    - **`2× RTX 3090` non-Ti (`sm_86`, 82 SMs):**
+      - `4B` (`TP=1`): Plain **`113.1 tok/s`** (`B=8` sched `665.4 tok/s`), `MTP-3` **`318.4 tok/s`** (`B=8` sched `793.9 tok/s` / `3,374.1 tok/s` total), `DFlash2` **`709.6 tok/s`** (`1.41 ms` ITL).
+      - `4B` (`TP=2`): Plain **`93.2 tok/s`** (`B=8` sched `494.4 tok/s`), `MTP-3` **`257.6 tok/s`** (`B=8` sched `533.1 tok/s`), `DFlash2` **`576.0 tok/s`** (`1.74 ms` ITL).
+      - `27B` (`TP=2`): Plain **`28.9 tok/s`** (`B=8` sched `138.0 tok/s`), `MTP-3` **`72.1 tok/s`**, `DFlash2` **`113.8 tok/s`**.
+      - `35B-A3B MoE` (`TP=2`): Plain **`79.1 tok/s`** (`B=8` sched `370.7 tok/s`), `MTP-3` **`180.7 tok/s`** (`B=8` sched `386.0 tok/s` / `1,640.5 tok/s` total).
+
 ## Public Release Preparation: Apache-2.0 Licensing, Documentation Sync, Strict Lints, & Unit Coverage
 
 - **Licensing & Package Metadata (`LICENSE`, `NOTICE`, `Cargo.toml`, `crates/*/Cargo.toml`, `Dockerfile`):**

@@ -303,12 +303,37 @@ def select_cases(
     return out
 
 
+def discover_prebuilt_test_executables(
+    repo_root: pathlib.Path, targets: set[str]
+) -> dict[str, pathlib.Path]:
+    deps_dir = repo_root / "target" / "release" / "deps"
+    executables: dict[str, pathlib.Path] = {}
+    for target in sorted(targets):
+        prefix = "warp34_host-" if target == "lib" else f"{target}-"
+        candidates = [
+            p
+            for p in deps_dir.glob(f"{prefix}*")
+            if p.is_file() and os.access(p, os.X_OK) and "." not in p.name
+        ]
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            executables[target] = candidates[0]
+    missing = sorted(targets - set(executables))
+    if missing:
+        raise FileNotFoundError(
+            f"failed to locate prebuilt test executable(s) in {deps_dir} for: {missing}"
+        )
+    return executables
+
+
 def build_test_executables(
     repo_root: pathlib.Path, targets: set[str]
 ) -> dict[str, pathlib.Path]:
     env = os.environ.copy()
     if "/opt/cuda/bin" not in env.get("PATH", ""):
         env["PATH"] = f"/opt/cuda/bin:{env.get('PATH', '')}"
+    if env.get("WARP34_PREBUILT_TESTS") == "1" or shutil.which("cargo", path=env.get("PATH")) is None:
+        return discover_prebuilt_test_executables(repo_root, targets)
 
     cmd = [
         "cargo",
