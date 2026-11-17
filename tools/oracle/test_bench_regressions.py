@@ -164,6 +164,28 @@ class BenchRegressionsTests(unittest.TestCase):
         self.assertIn("--active-lora", cmd_lora)
         self.assertIn("cai", cmd_lora)
 
+    def test_multi_arch_baselines_cover_sm80_sm86_sm89(self) -> None:
+        cases = self.baselines["cases"]
+        multi_arch_cases = (
+            "4b_tp1_plain",
+            "4b_tp1_mtp_synth",
+            "4b_tp1_dflash2_synth",
+            "4b_tp2_plain",
+            "4b_tp2_mtp_synth",
+            "4b_tp2_dflash2_synth",
+            "27b_tp2_plain",
+            "27b_tp2_mtp_synth",
+            "27b_tp2_dflash2_synth",
+            "35b_tp2_plain",
+            "35b_tp2_mtp_synth",
+            "flash_next_tp2_mtp_synth",
+        )
+        for cid in multi_arch_cases:
+            hw = cases[cid]["hardware"]
+            for arch in ("sm_80", "sm_86", "sm_89"):
+                self.assertIn(arch, hw, f"{cid} missing {arch} baseline")
+                self.assertGreater(hw[arch]["decode_tok_per_s"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
