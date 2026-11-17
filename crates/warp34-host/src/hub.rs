@@ -80,35 +80,101 @@ pub fn resolve_lora_adapter(
         spec.resolved_dir = Some(dir.clone());
         return Ok(dir);
     }
+    resolve_lora_remote(
+        spec,
+        opts.offline,
+        HFClient::builder(),
+        !env_enabled("HF_HUB_DISABLE_PROGRESS_BARS"),
+    )
+}
+
+fn resolve_lora_remote(
+    spec: &mut crate::lora::LoraModuleSpec,
+    offline: bool,
+    builder: HFClientBuilder,
+    progress: bool,
+) -> io::Result<PathBuf> {
     let (id, subfolder) = crate::lora::split_hf_repo_and_subfolder(&spec.path)?;
-    let revision = opts.revision.as_deref().unwrap_or("main");
+    let revision = spec.revision.as_deref().unwrap_or("main");
     safe_revision(revision)?;
     let normalized_sha = is_commit(revision).then(|| revision.to_ascii_lowercase());
     let revision = normalized_sha.as_deref().unwrap_or(revision);
-    if opts.offline {
-        let offline_rev = opts.revision.as_deref().map(|_| revision);
-        let dir = crate::lora::resolve_cached_or_local_lora_dir(&spec.path, offline_rev)?;
-        validate_lora_dir(&dir)?;
-        eprintln!(
-            "Using cached LoRA adapter '{}': {}",
-            spec.name,
-            dir.display()
-        );
-        spec.resolved_dir = Some(dir.clone());
-        return Ok(dir);
-    }
-    let client = HFClient::builder().build().map_err(hub_error)?;
+    let client = builder.build().map_err(hub_error)?;
     let repo_dir = client
         .cache_dir()
         .join(format!("models--{}", id.replace('/', "--")));
     let client = HFClientSync::from_inner(client).map_err(hub_error)?;
     let (owner, name) = id.rsplit_once('/').unwrap_or(("", &id));
     let repo = client.model(owner, name);
-    let progress = !env_enabled("HF_HUB_DISABLE_PROGRESS_BARS");
-    eprintln!("Resolving Hugging Face LoRA {}@{revision}…", spec.path);
+    if offline {
+        if spec.revision.is_none()
+            && !repo_dir.join("refs/main").is_file()
+            && let Ok(dir) = crate::lora::resolve_cached_or_local_lora_dir(&spec.path, None)
+        {
+            validate_lora_dir(&dir)?;
+            eprintln!(
+                "Using cached LoRA adapter '{}': {}",
+                spec.name,
+                dir.display()
+            );
+            spec.resolved_dir = Some(dir.clone());
+            return Ok(dir);
+        }
+        let snap_dir = repo
+            .snapshot_download()
+            .revision(revision)
+            .local_files_only(true)
+            .send()
+            .map_err(hub_error)?;
+        let adapter_dir =
+            validate_cached_lora_snapshot(&repo_dir, &snap_dir, subfolder.as_deref())?;
+        eprintln!(
+            "Using cached LoRA adapter '{}': {}",
+            spec.name,
+            adapter_dir.display()
+        );
+        spec.resolved_dir = Some(adapter_dir.clone());
+        return Ok(adapter_dir);
+    }
     let lock = repo_download_lock(&repo_dir);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let info = repo.info().revision(revision).send().map_err(hub_error)?;
+    let lora_subdir_key = subfolder.as_deref().unwrap_or("");
+    if is_commit(revision) && lora_manifest_path(&repo_dir, revision, lora_subdir_key).is_file() {
+        let snap_dir = repo_dir.join("snapshots").join(revision);
+        if let Ok(adapter_dir) =
+            validate_cached_lora_snapshot(&repo_dir, &snap_dir, subfolder.as_deref())
+        {
+            eprintln!(
+                "Using cached LoRA adapter '{}': {}",
+                spec.name,
+                adapter_dir.display()
+            );
+            spec.resolved_dir = Some(adapter_dir.clone());
+            return Ok(adapter_dir);
+        }
+    }
+    eprintln!("Resolving Hugging Face LoRA {}@{revision}…", spec.path);
+    let info = match repo.info().revision(revision).send() {
+        Ok(info) => info,
+        Err(err) => {
+            let transient = is_transient_hub_failure(&err);
+            let io_err = hub_error(err);
+            if transient
+                && let Some(dir) = try_cached_lora_fallback(
+                    &repo,
+                    &repo_dir,
+                    revision,
+                    subfolder.as_deref(),
+                    &spec.name,
+                    &io_err,
+                )
+            {
+                spec.resolved_dir = Some(dir.clone());
+                return Ok(dir);
+            }
+            return Err(io_err);
+        }
+    };
     let commit = info
         .sha
         .filter(|s| is_commit(s))
@@ -159,11 +225,77 @@ pub fn resolve_lora_adapter(
             optional_files.push(opt);
         }
     }
-    let reporter = progress::Reporter::new(progress)?;
-    let snap_dir = fetch_files(&repo, &commit, &required, &reporter)?;
-    if !optional_files.is_empty() {
-        let _ = fetch_files(&repo, &commit, &optional_files, &reporter);
+    let mut selected = required.clone();
+    selected.extend(optional_files.iter().cloned());
+    let cached_snap = repo_dir.join("snapshots").join(&commit);
+    let cached_adapter_dir = match &subfolder {
+        Some(sub) => cached_snap.join(sub),
+        None => cached_snap.clone(),
+    };
+    if cached_snap.is_dir()
+        && files::validate_files(&cached_snap, &selected).is_ok()
+        && validate_lora_dir(&cached_adapter_dir).is_ok()
+    {
+        let mpath = lora_manifest_path(&repo_dir, &commit, lora_subdir_key);
+        let manifest_ok = fs::read(&mpath)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+            .is_some_and(|m| m.version == 1 && m.commit == commit && m.files == selected);
+        if !manifest_ok {
+            let manifest = Manifest {
+                version: 1,
+                commit: commit.clone(),
+                files: selected,
+            };
+            atomic_write(&mpath, &serde_json::to_vec(&manifest)?)?;
+        }
+        if !is_commit(revision) {
+            let ref_path = repo_dir.join("refs").join(revision);
+            if fs::read_to_string(&ref_path).ok().as_deref().map(str::trim) != Some(&commit) {
+                atomic_write(&ref_path, commit.as_bytes())?;
+            }
+        }
+        eprintln!(
+            "LoRA ready: {} ({}@{} -> {})",
+            spec.name,
+            id,
+            commit,
+            cached_adapter_dir.display()
+        );
+        spec.resolved_dir = Some(cached_adapter_dir.clone());
+        return Ok(cached_adapter_dir);
     }
+    let manifest = Manifest {
+        version: 1,
+        commit: commit.clone(),
+        files: selected.clone(),
+    };
+    atomic_write(
+        &lora_manifest_path(&repo_dir, &commit, lora_subdir_key),
+        &serde_json::to_vec(&manifest)?,
+    )?;
+    let reporter = progress::Reporter::new(progress)?;
+    let snap_dir = match fetch_files(&repo, &commit, &selected, &reporter) {
+        Ok(dir) => dir,
+        Err((transient, io_err)) => {
+            if transient
+                && !is_commit(revision)
+                && let Some(dir) = try_cached_lora_fallback(
+                    &repo,
+                    &repo_dir,
+                    revision,
+                    subfolder.as_deref(),
+                    &spec.name,
+                    &io_err,
+                )
+            {
+                spec.resolved_dir = Some(dir.clone());
+                return Ok(dir);
+            }
+            return Err(io_err);
+        }
+    };
+    files::validate_files(&snap_dir, &selected)?;
     let adapter_dir = match &subfolder {
         Some(sub) => snap_dir.join(sub),
         None => snap_dir,
@@ -372,7 +504,20 @@ fn download(
             return Ok(dir);
         }
     }
-    let info = repo.info().revision(revision).send().map_err(hub_error)?;
+    let info = match repo.info().revision(revision).send() {
+        Ok(info) => info,
+        Err(err) => {
+            let transient = is_transient_hub_failure(&err);
+            let io_err = hub_error(err);
+            if transient
+                && let Some(cached) =
+                    try_cached_model_fallback(repo, repo_dir, revision, role, &io_err)
+            {
+                return Ok(cached);
+            }
+            return Err(io_err);
+        }
+    };
     let commit = info
         .sha
         .filter(|s| is_commit(s))
@@ -428,7 +573,19 @@ fn download(
         }
     }
     let reporter = progress::Reporter::new(progress)?;
-    let dir = fetch_files(repo, &commit, &metadata, &reporter)?;
+    let dir = match fetch_files(repo, &commit, &metadata, &reporter) {
+        Ok(dir) => dir,
+        Err((transient, io_err)) => {
+            if transient
+                && !is_commit(revision)
+                && let Some(cached) =
+                    try_cached_model_fallback(repo, repo_dir, revision, role, &io_err)
+            {
+                return Ok(cached);
+            }
+            return Err(io_err);
+        }
+    };
     files::validate_config(&dir, role)?;
     let weights = files::weight_files(&dir, &available)?;
     let mut selected = metadata;
@@ -444,7 +601,15 @@ fn download(
         &manifest_path(repo_dir, &commit),
         &serde_json::to_vec(&manifest)?,
     )?;
-    fetch_files(repo, &commit, &weights, &reporter)?;
+    if let Err((transient, io_err)) = fetch_files(repo, &commit, &weights, &reporter) {
+        if transient
+            && !is_commit(revision)
+            && let Some(cached) = try_cached_model_fallback(repo, repo_dir, revision, role, &io_err)
+        {
+            return Ok(cached);
+        }
+        return Err(io_err);
+    }
     files::validate_files(&dir, &selected)?;
     files::validate_checkpoint(&dir, role, &available)?;
     // The client fetched by immutable SHA, so publish the caller's mutable ref
@@ -461,7 +626,7 @@ fn fetch_files(
     commit: &str,
     names: &[String],
     reporter: &progress::Reporter,
-) -> io::Result<PathBuf> {
+) -> Result<PathBuf, (bool, io::Error)> {
     let dir = repo
         .snapshot_download()
         .revision(commit)
@@ -469,11 +634,105 @@ fn fetch_files(
         .max_workers(4)
         .progress(reporter.handler())
         .send()
-        .map_err(hub_error)?;
+        .map_err(|err| (is_transient_hub_failure(&err), hub_error(err)))?;
     // hf-hub deliberately skips per-file 404s. Required checkpoint files may
     // never be silently skipped, even when the overall snapshot call succeeds.
-    files::validate_files(&dir, names)?;
+    files::validate_files(&dir, names).map_err(|e| (false, e))?;
     Ok(dir)
+}
+
+fn try_cached_model_fallback(
+    repo: &HFRepositorySync<RepoTypeModel>,
+    repo_dir: &Path,
+    revision: &str,
+    role: ModelRole,
+    cause: &io::Error,
+) -> Option<PathBuf> {
+    let dir = repo
+        .snapshot_download()
+        .revision(revision)
+        .local_files_only(true)
+        .send()
+        .ok()?;
+    let validated = validate_offline_snapshot(repo_dir, &dir, role).ok()?;
+    eprintln!(
+        "Warning: could not reach Hugging Face ({cause}); falling back to verified cached snapshot {}",
+        validated.display()
+    );
+    Some(validated)
+}
+
+fn lora_manifest_path(repo: &Path, commit: &str, subdir: &str) -> PathBuf {
+    if subdir.is_empty() {
+        repo.join(".warp34").join(format!("lora-{commit}.json"))
+    } else {
+        let slug = subdir.replace('/', "__");
+        repo.join(".warp34")
+            .join(format!("lora-{commit}-{slug}.json"))
+    }
+}
+
+fn validate_cached_lora_snapshot(
+    repo_dir: &Path,
+    snap_dir: &Path,
+    subfolder: Option<&str>,
+) -> io::Result<PathBuf> {
+    let commit = snap_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid cached LoRA snapshot path"))?;
+    if !is_commit(commit) {
+        return Err(invalid(
+            "cached Hugging Face LoRA ref does not contain a valid commit SHA",
+        ));
+    }
+    let mpath = lora_manifest_path(repo_dir, commit, subfolder.unwrap_or(""));
+    if let Ok(bytes) = fs::read(&mpath) {
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid("invalid warp34 LoRA snapshot manifest"))?;
+        if manifest.version != 1 || manifest.commit != commit {
+            return Err(invalid("LoRA snapshot manifest version/commit mismatch"));
+        }
+        files::validate_files(snap_dir, &manifest.files)?;
+    }
+    let adapter_dir = match subfolder {
+        Some(sub) => snap_dir.join(sub),
+        None => snap_dir.to_path_buf(),
+    };
+    validate_lora_dir(&adapter_dir)?;
+    Ok(adapter_dir)
+}
+
+fn try_cached_lora_fallback(
+    repo: &HFRepositorySync<RepoTypeModel>,
+    repo_dir: &Path,
+    revision: &str,
+    subfolder: Option<&str>,
+    adapter_name: &str,
+    cause: &io::Error,
+) -> Option<PathBuf> {
+    let snap_dir = repo
+        .snapshot_download()
+        .revision(revision)
+        .local_files_only(true)
+        .send()
+        .ok()?;
+    let validated = validate_cached_lora_snapshot(repo_dir, &snap_dir, subfolder).ok()?;
+    eprintln!(
+        "Warning: could not reach Hugging Face ({cause}); falling back to verified cached LoRA '{adapter_name}': {}",
+        validated.display()
+    );
+    Some(validated)
+}
+
+fn is_transient_hub_failure(error: &HFError) -> bool {
+    match error {
+        HFError::Request { .. } | HFError::RateLimited { .. } => true,
+        HFError::Http { context } => {
+            context.status.is_server_error() || context.status.as_u16() == 429
+        }
+        _ => false,
+    }
 }
 
 fn manifest_path(repo: &Path, commit: &str) -> PathBuf {
