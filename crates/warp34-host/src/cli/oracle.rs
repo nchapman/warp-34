@@ -1000,7 +1000,10 @@ pub(crate) fn run_profile_diff(options: CudaCliOptions) -> Result<ExitCode, Stri
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
-    use super::compare_tp1_vs_tp2_tensors;
+    use super::{
+        compare_tp1_vs_tp2_tensors, evaluate_golden_tensor_diff,
+        evaluate_moe_or_golden_tensor_diff, tensor_diff_metrics,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -1024,5 +1027,70 @@ mod tests {
         let summary = compare_tp1_vs_tp2_tensors(&tp1, &tp2, false, false).unwrap();
         assert_eq!(summary.max_layer_diff, 0.0);
         assert_eq!(summary.target_max_rel_l2, 0.0);
+    }
+
+    #[test]
+    fn evaluate_golden_and_moe_tensor_diff_cover_strict_mm_and_moe_branches() {
+        let (d, rel, cos) = tensor_diff_metrics(&[0.0, 0.0], &[0.0, 0.0]);
+        assert_eq!((d, rel, cos), (0.0, 0.0, 1.0));
+        let (_, _, cos_zero_vs_nonzero) = tensor_diff_metrics(&[0.0, 0.0], &[1.0, 0.0]);
+        assert_eq!(cos_zero_vs_nonzero, 0.0);
+
+        // Length & shape errors
+        assert!(evaluate_golden_tensor_diff("x", &[2], &[1.0], &[1.0, 2.0], false).is_err());
+        assert!(evaluate_golden_tensor_diff("x", &[usize::MAX, 2], &[1.0], &[1.0], false).is_err());
+        assert!(
+            evaluate_golden_tensor_diff("x", &[2, 2], &[1.0, 2.0], &[1.0, 2.0], false).is_err()
+        );
+
+        // Deep multimodal layer pass & failure paths
+        let a = vec![1.0, 0.0, 0.0, 1.0];
+        let b = vec![1.0, 0.01, 0.0, 1.0];
+        assert!(evaluate_golden_tensor_diff("layer_1_out", &[2, 2], &a, &b, true).is_ok());
+        assert!(
+            evaluate_golden_tensor_diff(
+                "layer_1_out",
+                &[2, 2],
+                &[0.0, 1.0, 0.0, 1.0],
+                &[1.0, 0.0, 0.0, 1.0],
+                true
+            )
+            .is_err()
+        );
+
+        // Deep MoE post-router sublayer & residual branches
+        assert!(
+            evaluate_moe_or_golden_tensor_diff(
+                "layer_1_mlp_out",
+                &[2, 2],
+                &[1.0, 0.0, 0.0, 1.0],
+                &[1.0, 0.05, 0.0, 1.0],
+                false,
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            evaluate_moe_or_golden_tensor_diff(
+                "final_norm",
+                &[2, 2],
+                &[1.0, 0.0, 0.0, 1.0],
+                &[1.0, 0.01, 0.0, 1.0],
+                true,
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            evaluate_moe_or_golden_tensor_diff(
+                "layer_2_hidden_after",
+                &[2, 2],
+                &[1.0, 0.0, 1.0, 0.0],
+                &[1.0, 0.0, 0.0, 1.0],
+                false,
+                true
+            )
+            .is_err()
+        );
     }
 }

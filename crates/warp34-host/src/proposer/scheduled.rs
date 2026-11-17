@@ -1132,7 +1132,8 @@ pub(crate) fn rank_batch_slot_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::rank_batch_slot_candidate;
+    use super::{rank_batch_slot_candidate, try_lookup_scheduled_suffix_drafts};
+    use crate::parser::{SamplerV1, SamplingParams};
 
     #[test]
     fn batch_slot_ranking_prefers_session_continuation_then_empty_then_shared_prefix() {
@@ -1166,5 +1167,44 @@ mod tests {
         let stale_rank = rank_batch_slot_candidate(&stale_long, &new_session, 5);
         let recent_rank = rank_batch_slot_candidate(&recent_short, &new_session, 50);
         assert!(stale_rank > recent_rank);
+    }
+
+    #[test]
+    fn scheduled_suffix_lookup_respects_budget_min_tokens_and_stop_tokens() {
+        let mut history: Vec<i32> = (0..80).collect();
+        // Repeat a 4-token pattern followed by [200, 201, 202]
+        history.extend_from_slice(&[500, 501, 502, 503, 200, 201, 202]);
+        history.extend(1000..1020);
+        history.extend_from_slice(&[500, 501, 502]);
+
+        let params = SamplingParams {
+            min_tokens: 2,
+            ..SamplingParams::default()
+        };
+        let sampler = SamplerV1::new(params, &history, None);
+
+        // With EOS=999 (not in drafts), suffix lookup succeeds
+        let drafts =
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 0, &sampler, &[999]).unwrap();
+        assert_eq!(drafts, vec![200, 201, 202]);
+
+        // EOS 201 in drafts rejects the lookup both before min_tokens (soft-banned) and after
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 0, &sampler, &[201]),
+            None
+        );
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 2, &sampler, &[201]),
+            None
+        );
+        // k_budget == 0 or short history returns None
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 0, 2, 0, &sampler, &[]),
+            None
+        );
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history[..32], 503, 3, 2, 0, &sampler, &[]),
+            None
+        );
     }
 }

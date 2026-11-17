@@ -408,3 +408,99 @@ impl ScheduledVision {
         Ok((token, slice))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vision::VisionConfig;
+
+    fn test_vision_cfg() -> VisionConfig {
+        VisionConfig {
+            depth: 1,
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_heads: 2,
+            in_channels: 3,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            out_hidden_size: 16,
+            num_position_embeddings: 64,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            image_token_id: 99,
+            vision_start_token_id: 97,
+            vision_end_token_id: 98,
+            deepstack_visual_indexes: vec![],
+        }
+    }
+
+    fn dummy_image(grid_thw: [usize; 3], cfg: &VisionConfig) -> PreprocessedImage {
+        let len = grid_thw[0] * grid_thw[1] * grid_thw[2] * cfg.patch_input_dim();
+        PreprocessedImage {
+            grid_thw,
+            patches_f32: vec![0.25; len].into(),
+            content_hash: 0x1234_5678_9abc_def0,
+        }
+    }
+
+    #[test]
+    fn from_vision_config_rejects_invalid_configs_and_layouts() {
+        let cfg = test_vision_cfg();
+        let img = dummy_image([1, 2, 2], &cfg); // 1 merged token
+        assert!(ScheduledVision::from_vision_config(None, 16, &[99], vec![img.clone()]).is_err());
+        assert!(ScheduledVision::from_vision_config(Some(&cfg), 16, &[], vec![]).is_err());
+
+        let mut bad_merge = cfg.clone();
+        bad_merge.spatial_merge_size = 0;
+        assert!(
+            ScheduledVision::from_vision_config(Some(&bad_merge), 16, &[99], vec![img.clone()])
+                .is_err()
+        );
+
+        let bad_grid = dummy_image([1, 3, 2], &cfg);
+        assert!(
+            ScheduledVision::from_vision_config(Some(&cfg), 16, &[99], vec![bad_grid]).is_err()
+        );
+
+        let mut bad_patches = img.clone();
+        bad_patches.patches_f32 = vec![0.25; img.patches_f32.len() - 1].into();
+        assert!(
+            ScheduledVision::from_vision_config(Some(&cfg), 16, &[99], vec![bad_patches]).is_err()
+        );
+
+        // Wrong image token count
+        assert!(
+            ScheduledVision::from_vision_config(Some(&cfg), 16, &[1, 99, 99], vec![img]).is_err()
+        );
+
+        // Non-contiguous image tokens for a 2-token image
+        let two_tok_img = dummy_image([1, 2, 4], &cfg);
+        assert!(
+            ScheduledVision::from_vision_config(
+                Some(&cfg),
+                16,
+                &[1, 99, 2, 99, 3],
+                vec![two_tok_img]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn from_vision_config_builds_mrope_indices_and_radix_key() {
+        let cfg = test_vision_cfg();
+        let img1 = dummy_image([1, 2, 4], &cfg); // 2 merged tokens
+        let mut img2 = dummy_image([1, 2, 2], &cfg); // 1 merged token
+        img2.content_hash = 0xfeed_face;
+        let prompt = vec![10, 99, 99, 20, 99, 30];
+        let sv =
+            ScheduledVision::from_vision_config(Some(&cfg), 16, &prompt, vec![img1, img2]).unwrap();
+        assert_eq!(sv.visual_counts, vec![2, 1]);
+        assert_eq!(
+            sv.visual_indices,
+            vec![None, Some((0, 0)), Some((0, 1)), None, Some((1, 0)), None,]
+        );
+        assert_eq!(sv.mrope_planes[0].len(), prompt.len());
+        assert_eq!(sv.radix_key.len(), prompt.len());
+    }
+}

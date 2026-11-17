@@ -83,6 +83,20 @@ impl GenerationStream {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel(capacity: usize) -> (Sender<GenerationEvent>, Self) {
+        let (tx, events) = generation_channel(capacity);
+        (
+            tx,
+            Self {
+                events,
+                cached_tokens: Arc::new(AtomicU64::new(0)),
+                hit_limit: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
 }
 impl Drop for GenerationStream {
     fn drop(&mut self) {

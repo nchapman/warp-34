@@ -92,3 +92,45 @@ impl Drop for Reporter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hf_hub::progress::{FileProgress, FileStatus};
+
+    #[test]
+    fn disabled_reporter_ignores_events_and_joins_cleanly() {
+        let reporter = Reporter::new(false).unwrap();
+        let handler = reporter.handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 2048,
+        }));
+    }
+
+    #[test]
+    fn enabled_reporter_processes_all_download_event_variants() {
+        let reporter = Reporter::new(true).unwrap();
+        let handler = reporter.handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 1,
+            total_bytes: 1_048_576,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 524_288,
+            total_bytes: 1_048_576,
+            bytes_per_sec: None,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "model.safetensors\n".into(),
+                bytes_completed: 1_048_576,
+                total_bytes: 1_048_576,
+                status: FileStatus::Complete,
+            }],
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Complete));
+        drop(handler);
+        drop(reporter);
+    }
+}

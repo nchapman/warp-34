@@ -537,3 +537,101 @@ pub(super) async fn decisions_adapter(
         &resp,
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine_worker::{DecisionTapOutput, GenerationStream, WorkerError};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn decision_err_maps_bad_request_and_internal_status() {
+        let bad_err = decision_err(crate::decision::DecisionError {
+            is_bad_request: true,
+            message: "bad".into(),
+        });
+        assert_eq!(bad_err.0, StatusCode::BAD_REQUEST);
+
+        let int_err = decision_err(crate::decision::DecisionError {
+            is_bad_request: false,
+            message: "boom".into(),
+        });
+        assert_eq!(int_err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn shared_mamba_branch_hint_aligns_lcp_to_64_and_respects_cap() {
+        let a: Vec<i32> = (0..200).collect();
+        let b: Vec<i32> = (0..150).chain(1000..1050).collect();
+        assert_eq!(shared_mamba_branch_hint(&a, std::iter::empty(), None), None);
+        assert_eq!(shared_mamba_branch_hint(&a, [&b[..]], None), Some(128));
+        assert_eq!(shared_mamba_branch_hint(&a, [&b[..]], Some(100)), Some(64));
+        assert_eq!(shared_mamba_branch_hint(&a[..64], [&b[..64]], None), None);
+        assert_eq!(shared_mamba_branch_hint(&a, [&a[..]], None), Some(192));
+        assert_eq!(shared_mamba_branch_hint(&a[..128], [&a[..128]], None), None);
+    }
+
+    #[tokio::test]
+    async fn await_candidate_and_hidden_queries_handle_success_and_errors() {
+        let (ev_tx, stream) = GenerationStream::test_channel(4);
+        let (tap_tx, tap_rx) = oneshot::channel();
+        tap_tx
+            .send(Ok(DecisionTapOutput::CandidateLogits {
+                logits: vec![1.0, 2.0],
+                cached_tokens: 16,
+            }))
+            .unwrap();
+        ev_tx
+            .send(GenerationEvent::Finished {
+                generated_tokens: 0,
+                cached_tokens: 32,
+            })
+            .await
+            .unwrap();
+        drop(ev_tx);
+        let (logits, cached) = await_candidate_query((stream, tap_rx)).await.unwrap();
+        assert_eq!(logits, vec![1.0, 2.0]);
+        assert_eq!(cached, 32);
+
+        let (ev_tx2, stream2) = GenerationStream::test_channel(4);
+        let (tap_tx2, tap_rx2) = oneshot::channel();
+        tap_tx2
+            .send(Ok(DecisionTapOutput::HiddenRows {
+                rows: vec![vec![0.5, 1.5]],
+                cached_tokens: 8,
+            }))
+            .unwrap();
+        drop(ev_tx2);
+        let (rows, cached2) = await_hidden_query((stream2, tap_rx2)).await.unwrap();
+        assert_eq!(rows, vec![vec![0.5, 1.5]]);
+        assert_eq!(cached2, 8);
+
+        let (_ev_tx3, stream3) = GenerationStream::test_channel(4);
+        let (tap_tx3, tap_rx3) = oneshot::channel();
+        drop(tap_tx3);
+        assert_eq!(
+            await_candidate_query((stream3, tap_rx3))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let (ev_tx4, stream4) = GenerationStream::test_channel(4);
+        let (tap_tx4, tap_rx4) = oneshot::channel();
+        tap_tx4
+            .send(Ok(DecisionTapOutput::HiddenRows {
+                rows: vec![],
+                cached_tokens: 0,
+            }))
+            .unwrap();
+        ev_tx4
+            .send(GenerationEvent::Error(WorkerError::Internal(
+                "aborted".into(),
+            )))
+            .await
+            .unwrap();
+        drop(ev_tx4);
+        assert!(await_candidate_query((stream4, tap_rx4)).await.is_err());
+    }
+}

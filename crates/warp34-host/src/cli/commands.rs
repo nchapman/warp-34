@@ -1133,3 +1133,63 @@ fn run_chat_repl(
     }
     Ok(ExitCode::SUCCESS)
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    #[test]
+    fn select_bench_prompt_seed_picks_custom_realistic_or_synthetic() {
+        assert_eq!(
+            select_bench_prompt_seed("my prompt", true, true),
+            ("custom", "my prompt")
+        );
+        let (kind, corpus) = select_bench_prompt_seed("ignored", false, true);
+        assert_eq!(kind, "realistic");
+        assert!(!corpus.is_empty());
+        assert_eq!(
+            select_bench_prompt_seed("ignored", false, false),
+            ("synthetic", "The quick brown fox jumps over the lazy dog. ")
+        );
+    }
+
+    #[test]
+    fn serve_state_slot_seqs_enforces_dflash2_minimum() {
+        assert_eq!(serve_state_slot_seqs(2, None), 2);
+        let mtp = SpeculativeConfig {
+            kind: SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 4,
+        };
+        assert_eq!(serve_state_slot_seqs(2, Some(&mtp)), 2);
+        let dflash = SpeculativeConfig {
+            kind: SpeculativeKind::DFlash2,
+            ..mtp
+        };
+        assert_eq!(serve_state_slot_seqs(2, Some(&dflash)), 6);
+        assert_eq!(serve_state_slot_seqs(12, Some(&dflash)), 12);
+    }
+
+    #[test]
+    fn prepare_multimodal_prompt_handles_empty_and_missing_images() {
+        let cfg = crate::loader::ModelConfig::from_json(&serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 1024,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1024,
+            "intermediate_size": 2048
+        }))
+        .unwrap();
+        let (prompt, imgs) =
+            prepare_multimodal_prompt_and_images(&cfg, "hello", &[], false).unwrap();
+        assert_eq!(prompt, "hello");
+        assert!(imgs.is_empty());
+
+        let missing = vec!["/nonexistent/warp34_test_image.png".to_string()];
+        assert!(prepare_multimodal_prompt_and_images(&cfg, "hello", &missing, false).is_err());
+    }
+}
