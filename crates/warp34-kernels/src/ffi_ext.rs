@@ -930,6 +930,7 @@ unsafe extern "C" {
         lora_b_stacked: *const c_void,
         token_lora_ids: *const i32,
         lowrank_f32_ws: *mut f32,
+        lowrank_ws_elems: usize,
         y_inout_f16: *mut c_void,
         m: i32,
         size_n: i32,
@@ -938,6 +939,8 @@ unsafe extern "C" {
         num_adapters: i32,
         default_lora_id: i32,
         adapter_mask: u64,
+        num_b_slices: i32,
+        b_slices4: *const i32,
     ) -> i32;
 
     pub fn warp34_sampler_shard_fast_greedy_f16(

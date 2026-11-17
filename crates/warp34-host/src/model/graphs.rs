@@ -13,6 +13,7 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
         const MAX_DECODE_CACHED_GRAPHS: usize = 8;
+        const MAX_LORA_M1_DECODE_CACHED_GRAPHS: usize = 16;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         let key = (long_ctx, lora_mode);
         if let Some(pos) = self.decode_graph.iter().position(|(k, _, _)| *k == key) {
@@ -23,9 +24,22 @@ impl Qwen3_5ModelRank {
             self.captured_decode_logits_ptr = self.decode_graph.last().unwrap().1;
             return Ok(());
         }
-        if self.decode_graph.len() >= MAX_DECODE_CACHED_GRAPHS {
+        let max_cached = if self.lora_runtime.is_some() {
+            MAX_LORA_M1_DECODE_CACHED_GRAPHS
+        } else {
+            MAX_DECODE_CACHED_GRAPHS
+        };
+        if self.decode_graph.len() >= max_cached {
             self.stream.synchronize()?;
-            self.decode_graph.remove(0);
+            let evict_idx = if lora_mode != GraphLoraMode::BaseOnly {
+                self.decode_graph
+                    .iter()
+                    .position(|((_, lm), _, _)| *lm != GraphLoraMode::BaseOnly)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            self.decode_graph.remove(evict_idx);
         }
         let max_seq_len = if long_ctx {
             (self.decode_io.max_blocks_per_req * 16).max(2048) as i32
@@ -151,6 +165,7 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
         const MAX_SPEC_VERIFY_CACHED_GRAPHS: usize = 4;
+        const MAX_LORA_SPEC_VERIFY_CACHED_GRAPHS: usize = 16;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         let key = (m_verify, long_ctx, sample_mode, lora_mode);
         if let Some(pos) = self
@@ -164,9 +179,22 @@ impl Qwen3_5ModelRank {
             }
             return Ok(());
         }
-        if self.spec_verify_graphs.len() >= MAX_SPEC_VERIFY_CACHED_GRAPHS {
+        let max_cached = if self.lora_runtime.is_some() {
+            MAX_LORA_SPEC_VERIFY_CACHED_GRAPHS
+        } else {
+            MAX_SPEC_VERIFY_CACHED_GRAPHS
+        };
+        if self.spec_verify_graphs.len() >= max_cached {
             self.stream.synchronize()?;
-            self.spec_verify_graphs.remove(0);
+            let evict_idx = if lora_mode != GraphLoraMode::BaseOnly {
+                self.spec_verify_graphs
+                    .iter()
+                    .position(|((_, _, _, lm), _, _)| *lm != GraphLoraMode::BaseOnly)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            self.spec_verify_graphs.remove(evict_idx);
         }
         let max_seq_len = if long_ctx {
             (self.spec_verify_io.max_blocks_per_req * 16).max(2048) as i32

@@ -1134,6 +1134,28 @@ pub struct DeviceLoraStack {
 #[cfg(feature = "cuda")]
 impl DeviceLoraStack {
     #[inline]
+    fn is_cublas_aligned(&self) -> bool {
+        if self.num_b_slices > 3
+            || !self.rank_pad.is_multiple_of(8)
+            || !self.size_k.is_multiple_of(8)
+            || !self.size_n.is_multiple_of(8)
+        {
+            return false;
+        }
+        for i in 0..usize::from(self.num_b_slices) {
+            let base = i * 4;
+            let n_off = self.b_slices4[base];
+            let sn = self.b_slices4[base + 1];
+            let r_off = self.b_slices4[base + 2];
+            let sr = self.b_slices4[base + 3];
+            if n_off % 8 != 0 || sn < 8 || sn % 8 != 0 || r_off % 8 != 0 || sr < 8 || sr % 8 != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
     pub fn is_currently_noop(&self) -> bool {
         if self.adapter_mask == 0 {
             return true;
@@ -1194,7 +1216,12 @@ impl DeviceLoraStack {
             .map_err(|_| loader_err_msg("LoRA rank_pad exceeds i32"))?;
         let num_adapters_i32 = i32::try_from(self.num_adapters)
             .map_err(|_| loader_err_msg("LoRA num_adapters exceeds i32"))?;
-        if d_ids_ptr == 0 && def_id >= 0 && cublas_handle != 0 && rows >= 8 && self.rank_pad >= 64 {
+        if d_ids_ptr == 0
+            && def_id >= 0
+            && cublas_handle != 0
+            && ((rows >= 8 && self.rank_pad >= 32) || rows >= 32)
+            && self.is_cublas_aligned()
+        {
             return check_rc(
                 // SAFETY: `cublas_handle` is bound to `ex.stream`; `x_ptr`, `y_inout_ptr`,
                 // `lora_a_ptr`, `lora_b_ptr`, and `lowrank_ws_ptr` are valid device allocations.
@@ -1221,8 +1248,8 @@ impl DeviceLoraStack {
         check_rc(
             // SAFETY: `x_ptr` holds `[rows, size_k]` FP16, `y_inout_ptr` holds `[rows, size_n]` FP16,
             // `lora_a_ptr` holds `[num_adapters, rank_pad, size_k]` FP16, `lora_b_ptr` holds
-            // `[num_adapters, size_n, rank_pad]` FP16, and `lowrank_ws_ptr` holds at least
-            // `rows * rank_pad` FP32 elements.
+            // `[num_adapters, size_n, rank_pad]` FP16, and `lowrank_ws_ptr` holds
+            // `self.state.lowrank_ws_elems >= rows * rank_pad` FP32 elements.
             unsafe {
                 ffi::warp34_lora_shrink_expand_f16(
                     ex,
@@ -1231,6 +1258,7 @@ impl DeviceLoraStack {
                     self.lora_b_ptr as *const c_void,
                     d_ids_ptr as *const i32,
                     self.state.lowrank_ws_ptr as *mut f32,
+                    self.state.lowrank_ws_elems,
                     y_inout_ptr as *mut c_void,
                     rows_i32,
                     size_n_i32,
@@ -1239,6 +1267,8 @@ impl DeviceLoraStack {
                     num_adapters_i32,
                     def_id,
                     self.adapter_mask,
+                    i32::from(self.num_b_slices),
+                    self.b_slices4.as_ptr(),
                 )
             },
             "warp34_lora_shrink_expand_f16",
@@ -1476,16 +1506,18 @@ pub fn pack_multi_slice_lora(
     let mut b_slices4 = [0i32; 12];
     if b_slices_uniform
         && let Some(ref bs) = common_b_slices
-        && (2..=3).contains(&bs.len())
+        && (1..=3).contains(&bs.len())
         && bs.iter().all(|&[n_off, sn, r_off, sr]| {
-            n_off % 8 == 0 && sn >= 8 && sn % 8 == 0 && r_off % 8 == 0 && sr >= 8 && sr % 8 == 0
+            n_off >= 0 && sn > 0 && r_off % 4 == 0 && sr >= 4 && sr % 4 == 0
         })
     {
-        // Only split B into sub-slices when they do not all share the same r_off (i.e. block-diagonal)
+        let covered_n: usize = bs.iter().map(|s| s[1] as usize).sum();
+        // Split B into non-zero sub-slices when block-diagonal (distinct r_off/sr)
+        // or when at least one fused sub-projection is unadapted (covered_n < local_n).
         let all_same_r = bs
             .windows(2)
             .all(|w| w[0][2] == w[1][2] && w[0][3] == w[1][3]);
-        if !all_same_r {
+        if !all_same_r || covered_n < local_n {
             num_b_slices = bs.len() as u8;
             for (i, s) in bs.iter().enumerate() {
                 b_slices4[i * 4..i * 4 + 4].copy_from_slice(s);

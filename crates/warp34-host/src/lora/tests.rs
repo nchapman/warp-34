@@ -694,6 +694,354 @@ fn test_cublas_multi_slice_lora_shrink_expand_parity() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn test_splitk_and_partial_slice_lora_parity() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _dev = crate::cuda::CudaDevice::set_current(0).unwrap();
+    let stream = crate::cuda::CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let cublas = crate::cuda::CublasHandle::new(&stream).unwrap();
+
+    // 1. Partial fused QKV (`q_proj` + `v_proj` adapted, middle `k_proj` None) and
+    //    single-subslice (`v_proj` only) with r=8, large K=4096 to exercise Split-K=16,
+    //    mixed token_lora_ids, and rows=32 cuBLAS fastpath.
+    let k = 4096usize;
+    let q_n = 128usize;
+    let k_n = 64usize;
+    let v_n = 64usize;
+    let total_n = q_n + k_n + v_n;
+    let r = 8usize;
+
+    let w_q = LoraSliceWeight {
+        r,
+        in_features: k,
+        out_features: q_n,
+        a_f32: (0..r * k)
+            .map(|i| (((i * 17 + 3) % 97) as f32 - 48.0) * 0.005)
+            .collect(),
+        b_f32: (0..q_n * r)
+            .map(|i| (((i * 23 + 7) % 89) as f32 - 44.0) * 0.01)
+            .collect(),
+    };
+    let w_v = LoraSliceWeight {
+        r,
+        in_features: k,
+        out_features: v_n,
+        a_f32: (0..r * k)
+            .map(|i| (((i * 31 + 11) % 83) as f32 - 41.0) * 0.005)
+            .collect(),
+        b_f32: (0..v_n * r)
+            .map(|i| (((i * 29 + 13) % 79) as f32 - 39.0) * 0.01)
+            .collect(),
+    };
+
+    // Single-subslice (`v_proj` only) must record `num_b_slices == 1` because `v_n < total_n`.
+    let v_only_packed = pack_multi_slice_lora(
+        &[vec![
+            LoraSubSlice {
+                weight: None,
+                local_n: q_n,
+            },
+            LoraSubSlice {
+                weight: None,
+                local_n: k_n,
+            },
+            LoraSubSlice {
+                weight: Some(&w_v),
+                local_n: v_n,
+            },
+        ]],
+        total_n,
+        k,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(v_only_packed.num_b_slices, 1);
+    assert_eq!(
+        &v_only_packed.b_slices4[..4],
+        &[(q_n + k_n) as i32, v_n as i32, 0, r as i32]
+    );
+
+    // Sparse 2-slice (`q_proj` and `v_proj` with `k_proj` gap in the middle).
+    let qv_packed = pack_multi_slice_lora(
+        &[vec![
+            LoraSubSlice {
+                weight: Some(&w_q),
+                local_n: q_n,
+            },
+            LoraSubSlice {
+                weight: None,
+                local_n: k_n,
+            },
+            LoraSubSlice {
+                weight: Some(&w_v),
+                local_n: v_n,
+            },
+        ]],
+        total_n,
+        k,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(qv_packed.rank_pad, 16);
+    assert_eq!(qv_packed.num_b_slices, 2);
+    assert_eq!(
+        &qv_packed.b_slices4[..8],
+        &[
+            0,
+            q_n as i32,
+            0,
+            r as i32,
+            (q_n + k_n) as i32,
+            v_n as i32,
+            r as i32,
+            r as i32,
+        ]
+    );
+
+    let mut arena = crate::cuda::DeviceArena::new(0, 8 * 1024 * 1024).unwrap();
+    for packed in [&v_only_packed, &qv_packed] {
+        let (a_f16, b_f16) = packed.to_device_f16(total_n, k, None);
+        let a_ptr = arena.upload_slice(&a_f16, &stream).unwrap();
+        let b_ptr = arena.upload_slice(&b_f16, &stream).unwrap();
+
+        let max_rows = 32usize;
+        let ws_split1_elems = max_rows * packed.rank_pad;
+        let ws_split16_elems = 6144 * packed.rank_pad;
+        let d_ws1 = DeviceBuffer::alloc(0, ws_split1_elems * 4).unwrap();
+        let d_ws16 = DeviceBuffer::alloc(0, ws_split16_elems * 4).unwrap();
+        let state1 = std::sync::Arc::new(RankLoraState::new(d_ws1.addr(), ws_split1_elems));
+        let state16 = std::sync::Arc::new(RankLoraState::new(d_ws16.addr(), ws_split16_elems));
+
+        let stack1 = DeviceLoraStack {
+            lora_a_ptr: a_ptr,
+            lora_b_ptr: b_ptr,
+            size_n: total_n,
+            size_k: k,
+            rank_pad: packed.rank_pad,
+            num_adapters: packed.num_adapters,
+            adapter_mask: packed.adapter_mask,
+            num_b_slices: packed.num_b_slices,
+            b_slices4: packed.b_slices4,
+            state: std::sync::Arc::clone(&state1),
+        };
+        let stack16 = DeviceLoraStack {
+            state: std::sync::Arc::clone(&state16),
+            ..stack1_clone_fields(&stack1)
+        };
+
+        let x_f16: Vec<u16> = (0..max_rows * k)
+            .map(|i| f32_to_f16((((i * 37 + 9) % 101) as f32 - 50.0) * 0.02))
+            .collect();
+        let y0_f16: Vec<u16> = (0..max_rows * total_n)
+            .map(|i| f32_to_f16((((i * 41 + 3) % 67) as f32 - 33.0) * 0.05))
+            .collect();
+        let d_x = DeviceBuffer::alloc(0, x_f16.len() * 2).unwrap();
+        let d_y1 = DeviceBuffer::alloc(0, y0_f16.len() * 2).unwrap();
+        let d_y16 = DeviceBuffer::alloc(0, y0_f16.len() * 2).unwrap();
+        let d_ycublas = DeviceBuffer::alloc(0, y0_f16.len() * 2).unwrap();
+        d_x.copy_from_host(&x_f16, &stream).unwrap();
+
+        for rows in [1usize, 32usize] {
+            state1.set_uniform(0);
+            state16.set_uniform(0);
+            d_y1.copy_from_host(&y0_f16, &stream).unwrap();
+            d_y16.copy_from_host(&y0_f16, &stream).unwrap();
+            d_ycublas.copy_from_host(&y0_f16, &stream).unwrap();
+
+            stack1.forward(&ex, d_x.addr(), d_y1.addr(), rows).unwrap();
+            stack16
+                .forward(&ex, d_x.addr(), d_y16.addr(), rows)
+                .unwrap();
+            stack16
+                .forward_with_cublas(&ex, cublas.handle, d_x.addr(), d_ycublas.addr(), rows)
+                .unwrap();
+
+            let mut got1 = vec![0u16; rows * total_n];
+            let mut got16 = vec![0u16; rows * total_n];
+            let mut got_cb = vec![0u16; rows * total_n];
+            d_y1.copy_to_host(&mut got1, &stream).unwrap();
+            d_y16.copy_to_host(&mut got16, &stream).unwrap();
+            d_ycublas.copy_to_host(&mut got_cb, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            for t in 0..rows {
+                // Middle `k_proj` slice must remain bit-exact untouched!
+                for c in q_n..(q_n + k_n) {
+                    let idx = t * total_n + c;
+                    assert_eq!(got1[idx], y0_f16[idx], "k_proj touched in split1 at {idx}");
+                    assert_eq!(
+                        got16[idx], y0_f16[idx],
+                        "k_proj touched in split16 at {idx}"
+                    );
+                    assert_eq!(
+                        got_cb[idx], y0_f16[idx],
+                        "k_proj touched in cublas at {idx}"
+                    );
+                }
+                for c in 0..total_n {
+                    let idx = t * total_n + c;
+                    let diff_split = (f16_to_f32(got1[idx]) - f16_to_f32(got16[idx])).abs();
+                    let diff_cb = (f16_to_f32(got1[idx]) - f16_to_f32(got_cb[idx])).abs();
+                    assert!(
+                        diff_split <= 2e-3,
+                        "Split-K mismatch at rows={rows} idx={idx}: {diff_split}"
+                    );
+                    assert!(
+                        diff_cb <= 5e-3,
+                        "cuBLAS mismatch at rows={rows} idx={idx}: {diff_cb}"
+                    );
+                }
+            }
+        }
+
+        // Mixed `token_lora_ids` batch at rows=8 with Split-K=16 enabled.
+        let mixed_ids: [i32; 8] = [0, -1, 0, 0, -1, 0, -1, 0];
+        let d_ids = arena.upload_slice(&mixed_ids, &stream).unwrap();
+        state16.set_device_ids(d_ids);
+        d_y16.copy_from_host(&y0_f16, &stream).unwrap();
+        stack16.forward(&ex, d_x.addr(), d_y16.addr(), 8).unwrap();
+        let mut got_mixed = vec![0u16; 8 * total_n];
+        d_y16.copy_to_host(&mut got_mixed, &stream).unwrap();
+
+        state1.set_uniform(0);
+        d_y1.copy_from_host(&y0_f16, &stream).unwrap();
+        stack1.forward(&ex, d_x.addr(), d_y1.addr(), 8).unwrap();
+        let mut got_uniform = vec![0u16; 8 * total_n];
+        d_y1.copy_to_host(&mut got_uniform, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        for (t, &lid) in mixed_ids.iter().enumerate() {
+            for c in 0..total_n {
+                let idx = t * total_n + c;
+                if lid < 0 {
+                    assert_eq!(
+                        got_mixed[idx], y0_f16[idx],
+                        "inactive row modified at {idx}"
+                    );
+                } else {
+                    let diff = (f16_to_f32(got_mixed[idx]) - f16_to_f32(got_uniform[idx])).abs();
+                    assert!(diff <= 2e-3, "mixed active row mismatch at {idx}: {diff}");
+                }
+            }
+        }
+    }
+
+    fn stack1_clone_fields(s: &DeviceLoraStack) -> DeviceLoraStack {
+        DeviceLoraStack {
+            lora_a_ptr: s.lora_a_ptr,
+            lora_b_ptr: s.lora_b_ptr,
+            size_n: s.size_n,
+            size_k: s.size_k,
+            rank_pad: s.rank_pad,
+            num_adapters: s.num_adapters,
+            adapter_mask: s.adapter_mask,
+            num_b_slices: s.num_b_slices,
+            b_slices4: s.b_slices4,
+            state: std::sync::Arc::clone(&s.state),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_high_rank_r128_vec8_expand_parity() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _dev = crate::cuda::CudaDevice::set_current(0).unwrap();
+    let stream = crate::cuda::CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let mut arena = crate::cuda::DeviceArena::new(0, 4 * 1024 * 1024).unwrap();
+
+    let hr_n = 512usize;
+    let hr_k = 2048usize;
+    let hr_r = 128usize;
+    let w_hr = LoraSliceWeight {
+        r: hr_r,
+        in_features: hr_k,
+        out_features: hr_n,
+        a_f32: (0..hr_r * hr_k)
+            .map(|i| (((i * 19 + 5) % 73) as f32 - 36.0) * 0.004)
+            .collect(),
+        b_f32: (0..hr_n * hr_r)
+            .map(|i| (((i * 13 + 7) % 61) as f32 - 30.0) * 0.005)
+            .collect(),
+    };
+    let hr_packed = pack_multi_slice_lora(
+        &[vec![LoraSubSlice {
+            weight: Some(&w_hr),
+            local_n: hr_n,
+        }]],
+        hr_n,
+        hr_k,
+    )
+    .unwrap()
+    .unwrap();
+    let (hr_a_f16, hr_b_f16) = hr_packed.to_device_f16(hr_n, hr_k, None);
+    let hr_a_ptr = arena.upload_slice(&hr_a_f16, &stream).unwrap();
+    let hr_b_ptr = arena.upload_slice(&hr_b_f16, &stream).unwrap();
+    let hr_ws = DeviceBuffer::alloc(0, 6144 * hr_r * 4).unwrap();
+    let hr_state = std::sync::Arc::new(RankLoraState::new(hr_ws.addr(), 6144 * hr_r));
+    hr_state.set_uniform(0);
+    let hr_stack = DeviceLoraStack {
+        lora_a_ptr: hr_a_ptr,
+        lora_b_ptr: hr_b_ptr,
+        size_n: hr_n,
+        size_k: hr_k,
+        rank_pad: hr_r,
+        num_adapters: 1,
+        adapter_mask: 1,
+        num_b_slices: 0,
+        b_slices4: [0; 12],
+        state: hr_state,
+    };
+    let hr_rows = 5usize;
+    let hr_x: Vec<u16> = (0..hr_rows * hr_k)
+        .map(|i| f32_to_f16((((i * 29 + 3) % 83) as f32 - 41.0) * 0.02))
+        .collect();
+    let hr_y0: Vec<u16> = (0..hr_rows * hr_n)
+        .map(|i| f32_to_f16((((i * 11 + 1) % 53) as f32 - 26.0) * 0.03))
+        .collect();
+    let d_hr_x = DeviceBuffer::alloc(0, hr_x.len() * 2).unwrap();
+    let d_hr_y = DeviceBuffer::alloc(0, hr_y0.len() * 2).unwrap();
+    d_hr_x.copy_from_host(&hr_x, &stream).unwrap();
+    for rows in [1usize, hr_rows] {
+        d_hr_y.copy_from_host(&hr_y0, &stream).unwrap();
+        hr_stack
+            .forward(&ex, d_hr_x.addr(), d_hr_y.addr(), rows)
+            .unwrap();
+        let mut got = vec![0u16; rows * hr_n];
+        d_hr_y.copy_to_host(&mut got, &stream).unwrap();
+        stream.synchronize().unwrap();
+        for t in 0..rows {
+            let mut u = vec![0.0f32; hr_r];
+            for (r_idx, u_val) in u.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for kk in 0..hr_k {
+                    acc +=
+                        f16_to_f32(hr_x[t * hr_k + kk]) * f16_to_f32(hr_a_f16[r_idx * hr_k + kk]);
+                }
+                *u_val = acc;
+            }
+            for c in 0..hr_n {
+                let mut acc = f16_to_f32(hr_y0[t * hr_n + c]);
+                for (r_idx, &u_val) in u.iter().enumerate() {
+                    acc += u_val * f16_to_f32(hr_b_f16[c * hr_r + r_idx]);
+                }
+                let diff = (f16_to_f32(got[t * hr_n + c]) - acc).abs();
+                assert!(
+                    diff <= 3e-3,
+                    "high-rank r=128 mismatch at rows={rows} ({t},{c}): {diff}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
     let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
         .lock()

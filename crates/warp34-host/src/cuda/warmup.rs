@@ -1502,43 +1502,76 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup warp34_rejection_stochastic"
     )?;
+    for &(size_n, rank_pad) in &[
+        (64, 4),
+        (64, 8),
+        (4096, 8),
+        (64, 16),
+        (64, 32),
+        (64, 64),
+        (64, 68),
+        (64, 128),
+        (256, 128),
+    ] {
+        warmup_ffi!(
+            ffi::warp34_lora_shrink_expand_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                reject_ids as *const i32,
+                buf_ws as *mut f32,
+                16 * 1024,
+                buf_d as *mut c_void,
+                1,
+                size_n,
+                64,
+                rank_pad,
+                1,
+                0,
+                1,
+                0,
+                core::ptr::null(),
+            ),
+            "warmup warp34_lora_shrink_expand_f16"
+        )?;
+    }
+    let lora_warmup_slices: [i32; 8] = [0, 64, 0, 8, 64, 64, 8, 8];
     warmup_ffi!(
-        ffi::warp34_lora_shrink_expand_f16(
-            &ex,
+        ffi::warp34_cublas_lora_shrink_expand_f16(
+            cublas.handle,
             buf_a as *const c_void,
+            buf_d as *mut c_void,
             buf_b as *const c_void,
             buf_c as *const c_void,
-            reject_ids as *const i32,
-            buf_ws as *mut f32,
-            buf_d as *mut c_void,
-            1,
-            64,
-            64,
-            4,
-            1,
+            buf_ws as *mut c_void,
             0,
-            1,
+            32,
+            128,
+            128,
+            16,
+            2,
+            lora_warmup_slices.as_ptr(),
         ),
-        "warmup warp34_lora_shrink_expand_f16 (fused)"
+        "warmup warp34_cublas_lora_shrink_expand_f16 (r=8 sliced)"
     )?;
     warmup_ffi!(
-        ffi::warp34_lora_shrink_expand_f16(
-            &ex,
+        ffi::warp34_cublas_lora_shrink_expand_f16(
+            cublas.handle,
             buf_a as *const c_void,
+            buf_d as *mut c_void,
             buf_b as *const c_void,
             buf_c as *const c_void,
-            reject_ids as *const i32,
-            buf_ws as *mut f32,
-            buf_d as *mut c_void,
-            1,
-            64,
-            64,
-            32,
-            1,
+            buf_ws as *mut c_void,
             0,
-            1,
+            32,
+            128,
+            128,
+            64,
+            0,
+            core::ptr::null(),
         ),
-        "warmup warp34_lora_shrink_expand_f16 (split)"
+        "warmup warp34_cublas_lora_shrink_expand_f16 (r=64)"
     )?;
     warmup_vision_moe::warmup_vision_moe_and_qwen4(
         &mut arena,

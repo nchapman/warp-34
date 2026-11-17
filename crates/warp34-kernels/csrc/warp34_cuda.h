@@ -913,8 +913,9 @@ int warp34_tp4_all_reduce_hc_combine_tap_f16(
 int warp34_lora_shrink_expand_f16(
     const warp34_exec* ex, const void* x_f16, const void* lora_a_stacked,
     const void* lora_b_stacked, const int32_t* token_lora_ids,
-    float* lowrank_f32_ws, void* y_inout_f16, int m, int size_n, int size_k,
-    int rank_pad, int num_adapters, int default_lora_id, uint64_t adapter_mask);
+    float* lowrank_f32_ws, size_t lowrank_ws_elems, void* y_inout_f16, int m,
+    int size_n, int size_k, int rank_pad, int num_adapters, int default_lora_id,
+    uint64_t adapter_mask, int num_b_slices, const int32_t* b_slices4);
 int warp34_sampler_shard_fast_greedy_f16(
     const warp34_exec* ex, const void* logits_f16, const warp34_sampler_row_cfg* row_cfgs,
     const uint32_t* bitmask_u32, const warp34_sampler_sparse_entry* sparse_entries,
