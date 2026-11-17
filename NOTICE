@@ -1,0 +1,48 @@
+warp34
+Copyright 2026 Nathan Chapman and the warp34 contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+Third-Party Attributions & Architectural Donors
+-------------------------------------------------------------------------------
+
+1. Marlin Mixed-Precision Matrix Multiplication Kernels
+   - Files: `crates/warp34-kernels/csrc/marlin/` and `crates/warp34-kernels/csrc/ops/op_marlin.cu`
+   - Copyright (C) 2024 Elias Frantar (`IST-DASLab/marlin`)
+   - Copyright 2024-2026 The vLLM team (`vllm-project/vllm`)
+   - License: Apache License, Version 2.0
+
+2. vLLM Reference Kernels, Model Spine, & Reasoning/Tool Parsers
+   - Reference donor: `vllm-project/vllm` (`0.31.0`, commit `8352b2427`)
+   - Subsystems: FP16 Qwen 3.5 / 3.6 / 3.8 model spine, Marlin W4A16/W8A16/MoE repacking & GEMMs, `GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, `Qwen3_5MTP`, GPU sampler pipeline, and `Qwen3Parser` reasoning/tool semantics.
+   - Copyright The vLLM team
+   - License: Apache License, Version 2.0
+
+3. SGLang Hybrid Prefix Cache & DFlash2 Block-Parallel Speculative Verification
+   - Reference donor: `sgl-project/sglang` (`v0.5.19`, commit `0bcd822377`)
+   - Subsystems: `MambaRadixCache` + `HybridReqToTokenPool` ping-pong GDN state checkpoint donation and `DFlashWorkerV2` block-parallel drafter verification.
+   - Copyright SGLang Contributors
+   - License: Apache License, Version 2.0
+
+4. vllm.cpp Native CUDA Gated DeltaNet (GDN) Kernels
+   - Reference donor: `vllm.cpp` (commit `50d425bec`)
+   - Subsystems: Native CUDA C++ Gated DeltaNet recurrence and chunked WY prefill kernels (`crates/warp34-kernels/csrc/ops/op_gdn*.cu`).
+
+5. XGrammar & xgrammar-rs Structured Output Engine
+   - Dependency: `xgrammar-rs` (`0.2.8`) / `mlc-ai/xgrammar`
+   - License: Apache License, Version 2.0
+
+6. JevBench Public Decision Benchmark Fixtures
+   - Files: `benchmarks/perf/fixtures/jevbench_public.json`, `benchmarks/perf/fixtures/jevbench_multiquestion.json`
+   - License: MIT License
+
+7. NVIDIA Open-SWE-Traces Benchmark Fixtures
+   - Files: `benchmarks/perf/fixtures/open_swe_intact_16k.json`
+   - Source: `nvidia/Open-SWE-Traces` (commit `4fa4c2ae9afc6b397bc50391d43450c79993c138`, filtered to permissive MIT / Apache-2.0 / BSD repository traces)
+   - License: CC-BY-4.0 / Permissive source licenses
+
+8. Geist & Geist Mono Fonts
+   - Files: `dashboard/node_modules/@fontsource/geist*` (bundled WOFF2 subsets in `dashboard/dist/assets/`)
+   - Copyright Vercel, Inc.
+   - License: SIL Open Font License 1.1 / MIT License

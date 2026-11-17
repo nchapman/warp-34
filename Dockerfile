@@ -81,6 +81,7 @@ COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 \
     /usr/local/cuda/lib64/
 RUN echo /usr/local/cuda/lib64 > /etc/ld.so.conf.d/cuda.conf && ldconfig
 COPY --from=build /warp34 /usr/local/bin/warp34
+COPY LICENSE NOTICE /usr/share/doc/warp34/
 ENV HOME=/home/warp34 \
     HF_HUB_CACHE=/home/warp34/.cache/huggingface/hub \
     NVIDIA_VISIBLE_DEVICES=all \
