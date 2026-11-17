@@ -447,3 +447,30 @@ pub fn format_decisions_adapter_response(systemone_resp: &Value) -> Value {
         "usage": systemone_resp.get("usage").cloned().unwrap_or(Value::Null),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confidence_metrics_handle_degenerate_uniform_and_peaked_distributions() {
+        assert_eq!(entropy_confidence(&[]), 1.0);
+        assert_eq!(entropy_confidence(&[1.0]), 1.0);
+        assert!((entropy_confidence(&[0.5, 0.5]) - 0.0).abs() < 1e-12);
+        assert!((entropy_confidence(&[1.0, 0.0]) - 1.0).abs() < 1e-12);
+
+        assert_eq!(margin_choice_confidence(&[1.0]), 1.0);
+        assert!((margin_choice_confidence(&[0.25, 0.25, 0.25, 0.25]) - 0.0).abs() < 1e-12);
+        assert!((margin_choice_confidence(&[1.0, 0.0, 0.0, 0.0]) - 1.0).abs() < 1e-12);
+
+        assert_eq!(mode_distance_score_confidence(&[1.0]), 1.0);
+        assert!((mode_distance_score_confidence(&[1.0, 0.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!((mode_distance_score_confidence(&[0.5, 0.0, 0.5]) - 0.5).abs() < 1e-12);
+        let spread = mode_distance_score_confidence(&[0.34, 0.33, 0.33]);
+        assert!(spread > 0.0 && spread < 1.0);
+
+        assert_eq!(top1_top2_margin_confidence(&[1.0]), 1.0);
+        assert!((top1_top2_margin_confidence(&[0.5, 0.5]) - 0.0).abs() < 1e-12);
+        assert!((top1_top2_margin_confidence(&[0.8, 0.2]) - 0.6).abs() < 1e-12);
+    }
+}

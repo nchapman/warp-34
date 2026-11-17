@@ -2683,6 +2683,58 @@ mod memory_tests {
             assert!(weight_arena_bytes(&c, &full, tp, 256).is_ok());
         }
     }
+
+    #[test]
+    fn dflash2_config_load_validates_and_parses_temp_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
+
+        let valid_cfg = serde_json::json!({
+            "architectures": ["DFlashDraftModel"],
+            "hidden_size": 2560,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 9216,
+            "vocab_size": 248320,
+            "use_sliding_window": true,
+            "sliding_window": 512,
+            "dflash_config": {
+                "block_size": 16,
+                "target_layer_ids": [1, 7, 13, 19, 25],
+                "conv_group_size": 8,
+                "conv_kernel_size": 4,
+                "selector_rank": 64,
+                "selector_top_k": 8,
+                "mask_token_id": 248070
+            }
+        });
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&valid_cfg).unwrap(),
+        )
+        .unwrap();
+        let parsed = DFlash2Config::load(dir.path()).unwrap();
+        assert_eq!(parsed.block_size, 16);
+        assert_eq!(parsed.window, 512);
+        assert_eq!(parsed.target_layers, vec![1, 7, 13, 19, 25]);
+
+        // Standalone quantize_config.json must be rejected
+        std::fs::write(dir.path().join("quantize_config.json"), b"{}").unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
+        std::fs::remove_file(dir.path().join("quantize_config.json")).unwrap();
+
+        // Invalid block_size (7) must be rejected
+        let mut bad = valid_cfg;
+        bad["dflash_config"]["block_size"] = serde_json::json!(7);
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
