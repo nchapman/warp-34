@@ -2,6 +2,8 @@
 # research/output directories out of the context. The vendored FA2/CUTLASS
 # headers under crates/warp34-kernels/vendor ARE required build inputs.
 **
+!LICENSE
+!NOTICE
 !Cargo.toml
 !Cargo.lock
 !dashboard/
