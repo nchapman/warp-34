@@ -131,6 +131,14 @@ Generation & Chat Options (warp34 chat / generate):
   --no-thinking / --thinking          Disable or enable <think> reasoning blocks (enabled by default in chat)
   --image <path|url>...               Attach image(s) for multimodal VL models (--allow-remote-images for URLs)
 
+Benchmark Options (warp34 bench):
+  --stage <decode|radix|scheduler|vision|all>  Benchmark stage (default: decode)
+  --prompt-len <tokens>               Prompt length in tokens (default: 128; supports k/M suffixes)
+  --gen-len <tokens>                  Generated output length in tokens (default: 128; supports k/M suffixes)
+  --realistic-prompt, --realistic     Use realistic coding/systems prompt instead of synthetic repetition
+  --batch-size <1..1024>              Concurrent batch size for scheduler stage (default: 4)
+  --out <path>                        Write benchmark JSON summary to file
+
 Examples:
   warp34 serve Qwen/Qwen3.5-4B -c 64k --speculative mtp
   warp34 serve nchapman/Qwen3.5-27B-W4A16-AutoRound --tp 2 -c 32k --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash
@@ -302,6 +310,7 @@ impl ServeCliConfig {
                     | "--frequency-penalty"
                     | "--prompt-len"
                     | "--gen-len"
+                    | "--realistic-prompt"
                     | "--stage"
                     | "--golden"
                     | "--out"
@@ -407,6 +416,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) max_tokens: usize,
     pub(crate) prompt_len: usize,
     pub(crate) gen_len: usize,
+    pub(crate) realistic_prompt: bool,
     pub(crate) kv_format: String,
     pub(crate) golden_path: Option<String>,
     pub(crate) out_json: Option<String>,
@@ -473,6 +483,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     };
     let mut prompt_len = 128usize;
     let mut gen_len = 128usize;
+    let mut realistic_prompt = false;
     let mut kv_format = "tq4".to_string();
     let mut golden_path: Option<String> = None;
     let mut out_json: Option<String> = None;
@@ -661,6 +672,9 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 let raw = args.get(i).ok_or("missing --gen-len")?;
                 gen_len = parse_token_count(raw, "--gen-len")?;
             }
+            "--realistic-prompt" | "--realistic" => {
+                realistic_prompt = true;
+            }
             "--kv-format" | "--kv-cache-dtype" | "--cache-type-k" => {
                 i += 1;
                 kv_format = args.get(i).cloned().ok_or("missing --kv-format")?;
@@ -669,7 +683,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 i += 1;
                 golden_path = Some(args.get(i).cloned().ok_or("missing --golden")?);
             }
-            "--out" => {
+            "--out" | "--out-json" | "-o" => {
                 i += 1;
                 out_json = Some(args.get(i).cloned().ok_or("missing --out")?);
             }
@@ -843,6 +857,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         max_tokens,
         prompt_len,
         gen_len,
+        realistic_prompt,
         kv_format,
         golden_path,
         out_json,
@@ -1035,6 +1050,12 @@ pub(crate) fn validate_cuda_options(
         }
     }
     if sub == "bench" {
+        if options.prompt_len == 0 {
+            return Err("--prompt-len must be >= 1".into());
+        }
+        if options.gen_len == 0 {
+            return Err("--gen-len must be >= 1".into());
+        }
         let total_bench_tokens =
             bench_required_stage_tokens(&options.bench_stage, options.prompt_len, options.gen_len);
         if total_bench_tokens > MAX_CLI_KV_TOKENS {

@@ -351,6 +351,8 @@ fn invalid_commands_and_options_never_resolve() {
         (&["generate", "--tp", "5"], "--tp must be 1, 2, or 4"),
         (&["greedy-diff"], "--golden"),
         (&["bench", "--batch-size", "0"], "--batch-size"),
+        (&["bench", "--prompt-len", "0"], "--prompt-len must be >= 1"),
+        (&["bench", "--gen-len", "0"], "--gen-len must be >= 1"),
         (&["generate", "--kv-format", "unknown"], "--kv-format"),
         (
             &["generate", "--revision", "--offline"],
@@ -1081,13 +1083,16 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         "vision",
         "--batch-size",
         "4",
+        "--realistic-prompt",
         "--image",
         "rgb://https://warp34.test/sample.ppm",
         "--allow-remote-images",
     ]);
+    assert!(prof_opts.realistic_prompt);
     let prof_args = super::oracle::profile_bench_args(&prof_opts, std::path::Path::new("warp34"));
     assert!(prof_args.windows(2).any(|w| w == ["--stage", "vision"]));
     assert!(prof_args.windows(2).any(|w| w == ["--batch-size", "4"]));
+    assert!(prof_args.iter().any(|a| a == "--realistic-prompt"));
     assert!(
         prof_args
             .windows(2)

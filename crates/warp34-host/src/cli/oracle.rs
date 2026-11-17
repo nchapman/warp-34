@@ -906,6 +906,13 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
     if !options.use_cuda_graph {
         args.push("--no-cuda-graph".to_string());
     }
+    if options.realistic_prompt {
+        args.push("--realistic-prompt".to_string());
+    }
+    if options.prompt_explicit {
+        args.push("--prompt".to_string());
+        args.push(options.prompt.clone());
+    }
     if options.bench_stage != "all" {
         args.push("--stage".to_string());
         args.push(options.bench_stage.clone());

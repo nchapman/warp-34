@@ -1,0 +1,466 @@
+{
+  "schema_version": 1,
+  "description": "Hardware-keyed benchmark regression baselines and competitor references for warp34 bench. Separates Plain vs Speculative (MTP-3 / DFlash2) and synthetic vs realistic prompts.",
+  "cases": {
+    "4b_tp1_plain": {
+      "label": "Qwen3.5-4B (W4A16-HGPTQ, TP=1)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 128,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": null,
+      "extra_args": [],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=1 Plain)",
+          "decode_tok_per_s": 134.8
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "1x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 146.1
+        },
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 208.4,
+          "prefill_tok_per_s": 6659.1,
+          "radix_ttft_speedup_x": 4.78,
+          "scheduler_aggregate_decode_tok_per_s": 1171.9,
+          "scheduler_total_tok_per_s": 4980.7,
+          "vision_ttft_speedup_x": 2.39
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 218.2,
+          "prefill_tok_per_s": 10917.8,
+          "radix_ttft_speedup_x": 3.56,
+          "scheduler_aggregate_decode_tok_per_s": 1336.9,
+          "scheduler_total_tok_per_s": 5682.0,
+          "vision_ttft_speedup_x": 3.33
+        }
+      }
+    },
+    "4b_tp1_mtp_synth": {
+      "label": "Qwen3.5-4B (W4A16-HGPTQ, TP=1, MTP-3 synthetic)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 128,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": "mtp",
+      "mtp_k": 3,
+      "extra_args": [],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=1 MTP-3)",
+          "decode_tok_per_s": 242.0
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "1x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 428.9,
+          "mean_accepted_drafts": 2.95
+        },
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 589.4,
+          "prefill_tok_per_s": 6610.0,
+          "mean_accepted_drafts": 2.97,
+          "radix_ttft_speedup_x": 4.81,
+          "scheduler_aggregate_decode_tok_per_s": 1350.4,
+          "scheduler_total_tok_per_s": 5739.2,
+          "vision_ttft_speedup_x": 2.40
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 615.5,
+          "mean_accepted_drafts": 2.97
+        }
+      }
+    },
+    "4b_tp1_mtp_realistic": {
+      "label": "Qwen3.5-4B (W4A16-HGPTQ, TP=1, MTP-3 realistic)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "decode",
+      "prompt_source": "realistic",
+      "prompt_len": 120,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": "mtp",
+      "mtp_k": 3,
+      "extra_args": ["--realistic-prompt"],
+      "competitors": {},
+      "hardware": {
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 394.0,
+          "prefill_tok_per_s": 5757.3,
+          "mean_accepted_drafts": 1.65
+        }
+      }
+    },
+    "4b_tp1_dflash2_synth": {
+      "label": "Qwen3.5-4B (W4A16-HGPTQ, TP=1, DFlash2 synthetic)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "decode",
+      "prompt_source": "synthetic",
+      "prompt_len": 128,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": "dflash2",
+      "draft_model": "nchapman/Qwen3.5-4B-DFlash2",
+      "extra_args": [],
+      "competitors": {
+        "sglang": {
+          "label": "SGLang v0.5.19 (TP=1 DFlash2 M=16)",
+          "decode_tok_per_s": 612.0
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "1x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 973.0,
+          "mean_accepted_drafts": 14.8
+        },
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 1577.0,
+          "prefill_tok_per_s": 6600.0,
+          "mean_accepted_drafts": 14.88
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 1697.3,
+          "mean_accepted_drafts": 14.88
+        }
+      }
+    },
+    "4b_tp1_dflash2_realistic": {
+      "label": "Qwen3.5-4B (W4A16-HGPTQ, TP=1, DFlash2 realistic)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "decode",
+      "prompt_source": "realistic",
+      "prompt_len": 120,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": "dflash2",
+      "draft_model": "nchapman/Qwen3.5-4B-DFlash2",
+      "extra_args": ["--realistic-prompt"],
+      "competitors": {},
+      "hardware": {
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 235.7,
+          "prefill_tok_per_s": 5775.6,
+          "mean_accepted_drafts": 1.35
+        }
+      }
+    },
+    "4b_tp1_lora_cai": {
+      "label": "Qwen3.5-4B + CAI-LoRA (r=8, TP=1)",
+      "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 128,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": null,
+      "extra_args": [
+        "--lora",
+        "cai=nchapman/Qwen3.5-4B-CAI-LoRA",
+        "--active-lora",
+        "cai"
+      ],
+      "competitors": {},
+      "hardware": {
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 191.1,
+          "scheduler_aggregate_decode_tok_per_s": 1032.0
+        }
+      }
+    },
+    "9b_tp1_lora_heretic": {
+      "label": "Qwen3.5-9B + Heretic-LoRA (r=3, TP=1)",
+      "model": "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
+      "tp": 1,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 128,
+      "gen_len": 128,
+      "batch_size": 8,
+      "speculative": null,
+      "extra_args": [
+        "--lora",
+        "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA",
+        "--active-lora",
+        "heretic"
+      ],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=1 Plain, no LoRA)",
+          "decode_tok_per_s": 91.2
+        }
+      },
+      "hardware": {
+        "sm_86": {
+          "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 125.5,
+          "scheduler_aggregate_decode_tok_per_s": 736.5
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 134.1
+        }
+      }
+    },
+    "27b_tp2_plain": {
+      "label": "Qwen3.8-27B (W4A16-HGPTQ, TP=2)",
+      "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": null,
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=2 Plain)",
+          "decode_tok_per_s": 54.1
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 83.1,
+          "prefill_tok_per_s": 5960.0
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 78.5,
+          "scheduler_aggregate_decode_tok_per_s": 364.0
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 87.7,
+          "radix_ttft_speedup_x": 5.20,
+          "scheduler_aggregate_decode_tok_per_s": 413.9,
+          "vision_ttft_speedup_x": 2.87
+        }
+      }
+    },
+    "27b_tp2_mtp_synth": {
+      "label": "Qwen3.8-27B (W4A16-HGPTQ, TP=2, MTP-3 synthetic)",
+      "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": "mtp",
+      "mtp_k": 3,
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=2 MTP-3 SWE)",
+          "decode_tok_per_s": 107.8
+        },
+        "sglang": {
+          "label": "SGLang v0.5.19 (TP=2 MTP-3 SWE)",
+          "decode_tok_per_s": 131.1
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 200.8,
+          "mean_accepted_drafts": 2.60
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 216.7,
+          "mean_accepted_drafts": 2.65,
+          "scheduler_aggregate_decode_tok_per_s": 420.0
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 237.6,
+          "mean_accepted_drafts": 2.73
+        }
+      }
+    },
+    "27b_tp2_dflash2_synth": {
+      "label": "Qwen3.8-27B (W4A16-HGPTQ, TP=2, DFlash2 synthetic)",
+      "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "decode",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": "dflash2",
+      "draft_model": "nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ",
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "sglang": {
+          "label": "SGLang v0.5.19 (TP=2 DFlash2 M=8)",
+          "decode_tok_per_s": 175.7
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 241.3,
+          "mean_accepted_drafts": 5.0
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 215.2,
+          "mean_accepted_drafts": 5.0
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 327.2,
+          "mean_accepted_drafts": 5.35
+        }
+      }
+    },
+    "35b_tp2_plain": {
+      "label": "Qwen3.6-35B-A3B MoE (W4A16-HGPTQ, TP=2)",
+      "model": "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": null,
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=2 Plain)",
+          "decode_tok_per_s": 146.2
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 221.7,
+          "prefill_tok_per_s": 10098.0
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 240.0,
+          "scheduler_aggregate_decode_tok_per_s": 960.0
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 275.1,
+          "radix_ttft_speedup_x": 5.10,
+          "scheduler_aggregate_decode_tok_per_s": 1181.8,
+          "vision_ttft_speedup_x": 3.11
+        }
+      }
+    },
+    "35b_tp2_mtp_synth": {
+      "label": "Qwen3.6-35B-A3B MoE (W4A16-HGPTQ, TP=2, MTP-3 synthetic)",
+      "model": "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "all",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": "mtp",
+      "mtp_k": 3,
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "vllm": {
+          "label": "vLLM 0.31.0 (TP=2 MTP-3 SWE)",
+          "decode_tok_per_s": 260.4
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 479.6,
+          "mean_accepted_drafts": 2.90
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 548.6,
+          "mean_accepted_drafts": 2.90,
+          "scheduler_aggregate_decode_tok_per_s": 1043.8
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 532.0,
+          "mean_accepted_drafts": 2.90
+        }
+      }
+    },
+    "flash_next_tp2_mtp_synth": {
+      "label": "Qwen3.8-Flash-Next (W4A16-HGPTQ, TP=2, MTP-3 synthetic)",
+      "model": "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
+      "tp": 2,
+      "kv_format": "tq4",
+      "stage": "decode",
+      "prompt_source": "synthetic",
+      "prompt_len": 64,
+      "gen_len": 64,
+      "batch_size": 8,
+      "speculative": "mtp",
+      "mtp_k": 3,
+      "extra_args": ["--kv-pages", "512"],
+      "competitors": {
+        "strata": {
+          "label": "Strata ffa80d7 (TP=2 --spec 4)",
+          "decode_tok_per_s": 40.7
+        }
+      },
+      "hardware": {
+        "sm_80": {
+          "gpu_label": "2x NVIDIA A100-SXM4-80GB",
+          "decode_tok_per_s": 165.6,
+          "mean_accepted_drafts": 2.60
+        },
+        "sm_86": {
+          "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 105.7,
+          "mean_accepted_drafts": 2.60
+        },
+        "sm_89": {
+          "gpu_label": "2x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 138.7,
+          "mean_accepted_drafts": 2.60
+        }
+      }
+    }
+  }
+}

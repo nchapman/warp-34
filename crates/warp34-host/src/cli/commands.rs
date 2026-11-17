@@ -208,6 +208,39 @@ pub(crate) fn run_generate(
 }
 
 #[cfg(feature = "cuda")]
+const REALISTIC_BENCH_PROMPT_CORPUS: &str = "\
+<|im_start|>user\n\
+Write a clean, well-commented Rust implementation of a bounded lock-free SPSC ring buffer with \
+explicit acquire/release atomic ordering, a complexity analysis, and a unit test. Keep your \
+explanation concise and avoid repeating the prompt.\n\
+```rust\n\
+use std::sync::atomic::{AtomicUsize, Ordering};\n\
+pub struct RingBuffer<T, const N: usize> {\n\
+    head: AtomicUsize,\n\
+    tail: AtomicUsize,\n\
+    slots: [std::mem::MaybeUninit<T>; N],\n\
+}\n\
+```\n\
+<|im_end|>\n\
+<|im_start|>assistant\n\
+<think>\n\n</think>\n\n";
+
+#[cfg(feature = "cuda")]
+fn select_bench_prompt_seed(
+    prompt: &str,
+    prompt_explicit: bool,
+    realistic_prompt: bool,
+) -> (&'static str, &str) {
+    if prompt_explicit {
+        ("custom", prompt)
+    } else if realistic_prompt {
+        ("realistic", REALISTIC_BENCH_PROMPT_CORPUS)
+    } else {
+        ("synthetic", "The quick brown fox jumps over the lazy dog. ")
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_bench(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
@@ -217,6 +250,9 @@ pub(crate) fn run_bench(
         model,
         resolved_model,
         tp,
+        prompt,
+        prompt_explicit,
+        realistic_prompt,
         prompt_len,
         gen_len,
         kv_format,
@@ -278,9 +314,12 @@ pub(crate) fn run_bench(
         )
         .map_err(|e| e.to_string())?
     };
-    let base_ids = engine
-        .encode("The quick brown fox jumps over the lazy dog. ")
-        .map_err(|e| e.to_string())?;
+    let (prompt_source, seed_text) =
+        select_bench_prompt_seed(prompt.as_str(), prompt_explicit, realistic_prompt);
+    let base_ids = engine.encode(seed_text).map_err(|e| e.to_string())?;
+    if base_ids.is_empty() {
+        return Err("benchmark prompt encoded to 0 tokens".into());
+    }
     let make_prompt = |len: usize| -> Vec<i32> {
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
@@ -292,10 +331,16 @@ pub(crate) fn run_bench(
         }
         out
     };
-    let synth_prompt = make_prompt(prompt_len);
+    let synth_prompt = if prompt_explicit || realistic_prompt {
+        let mut custom = base_ids.clone();
+        custom.truncate(prompt_len);
+        custom
+    } else {
+        make_prompt(prompt_len)
+    };
     // Warmup pass (captures CUDA Graph on decode step 1 and ramps GPU boost clock out of P8)
     let _ = engine
-        .generate_tokens(&synth_prompt[..16.min(prompt_len)], 32, false)
+        .generate_tokens(&synth_prompt[..16.min(synth_prompt.len())], 32, false)
         .map_err(|e| e.to_string())?;
 
     let spec_label = speculative_kind.map(|k| match k {
@@ -351,6 +396,7 @@ pub(crate) fn run_bench(
             "num_experts_per_tok": engine.cfg.num_experts_per_tok,
             "cuda_graph": engine.use_cuda_graph,
             "speculative": spec_label,
+            "prompt_source": prompt_source,
             "accepted_drafts_per_round": accepted,
             "verify_rounds": verify_rounds,
             "measured_rounds": verify_rounds.unwrap_or(metrics.gen_len.saturating_sub(1)),

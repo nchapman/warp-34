@@ -181,6 +181,16 @@ run = """
 ./target/release/warp34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ
 """
 
+[tasks."bench-gate"]
+description = "Run 4B benchmark regression gate (Plain vs MTP-3 vs DFlash2, synthetic vs realistic prompts) and render Markdown comparison table"
+depends = ["build"]
+run = "python3 tools/check_bench_regressions.py --live --suite quick"
+
+[tasks."bench-gate-full"]
+description = "Run full benchmark regression gate across 4B, 9B+LoRA, 27B, 35B-A3B MoE, and Qwen3.8-Flash-Next"
+depends = ["build"]
+run = "python3 tools/check_bench_regressions.py --live --suite full"
+
 [tasks."profile-live"]
 description = "Capture live nsys SQLite profiles and render category scoreboards vs vLLM/SGLang"
 depends = ["build"]
