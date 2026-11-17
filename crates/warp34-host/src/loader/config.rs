@@ -162,6 +162,7 @@ pub struct ModelConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub vocab_size: usize,
+    pub max_position_embeddings: Option<usize>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub rotary_dim: usize,
@@ -634,6 +635,13 @@ impl ModelConfig {
             ];
         }
 
+        let max_position_embeddings = tc
+            .get("max_position_embeddings")
+            .or_else(|| root.get("max_position_embeddings"))
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .map(|n| n as usize);
+
         let tie_word_embeddings = tc
             .get("tie_word_embeddings")
             .or_else(|| root.get("tie_word_embeddings"))
@@ -982,6 +990,7 @@ impl ModelConfig {
             num_key_value_heads,
             head_dim,
             vocab_size,
+            max_position_embeddings,
             rms_norm_eps,
             rope_theta,
             rotary_dim,

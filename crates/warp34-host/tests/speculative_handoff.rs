@@ -874,3 +874,217 @@ fn batched_mtp_stochastic_and_tp2_greedy_stay_speculative() {
         assert_eq!(got, exp, "TP=2 B=4 slot {i} must match greedy baseline");
     }
 }
+
+#[test]
+fn batched_mtp_full_window_budgets_stay_speculative_and_preserve_radix_cache() {
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "batched_mtp_full_window_budgets_stay_speculative_and_preserve_radix_cache",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // kv_pages = 512 => 8,192 total tokens, MTP batch slot_cap = (512 / 4) * 16 = 2,048 tokens.
+    // Four concurrent requests with `max_tokens = 8192 - prompt_len` (exceeding `slot_cap` and
+    // exceeding 100% of the KV pool in sum) must still admit together on tick 1 (`peak_active = 4`),
+    // run batched MTP verify rounds (`verify_rounds > 0`), and leave an earlier warm session's
+    // MambaRadixCache prefix intact via incremental KV slab allocation.
+    let worker = EngineWorker::from_loader(
+        || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(512),
+                true,
+                8,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let max_len = worker.max_model_len();
+    assert_eq!(max_len, 8192);
+
+    let tok = worker.tokenizer.as_ref().unwrap().clone();
+    let encode = |text: &str| -> Vec<i32> {
+        tok.encode(text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect()
+    };
+
+    let warm_prefix_text = "Distributed consensus invariant log: every committed raft entry carries a monotonic term and index across quorum replicas, and follower snapshots advance state machines atomically at chunk boundaries. ".repeat(6);
+    let warm_seed_prompt = encode(&format!(
+        "{warm_prefix_text}Summarize leader election safety in one phrase:"
+    ));
+    let warm_probe_prompt = encode(&format!(
+        "{warm_prefix_text}Summarize log matching safety in one phrase:"
+    ));
+    assert!(
+        warm_seed_prompt.len() >= 192,
+        "warm session prefix must span >= 3 Mamba 64-token checkpoints"
+    );
+
+    let burst_prompts: Vec<Vec<i32>> = [
+        "The capital of France is",
+        "In computer architecture, cache coherence ensures",
+        "Rust ownership rules guarantee memory safety by",
+        "Binary search finds an element in a sorted array in",
+    ]
+    .iter()
+    .map(|s| encode(s))
+    .collect();
+
+    async fn collect_first_n_then_cancel(
+        mut stream: GenerationStream,
+        target: usize,
+    ) -> Result<Vec<i32>, String> {
+        let mut out = Vec::with_capacity(target);
+        while let Some(ev) = stream.events.recv().await {
+            match ev {
+                GenerationEvent::Token { id, .. } => {
+                    out.push(id);
+                    if out.len() >= target {
+                        drop(stream);
+                        return Ok(out);
+                    }
+                }
+                GenerationEvent::Finished { .. } => return Ok(out),
+                GenerationEvent::Error(e) => return Err(e.to_string()),
+            }
+        }
+        Err("stream ended before target tokens".into())
+    }
+
+    let (rounds_delta, probe_cached) = rt.block_on(async {
+        // 1. Seed a warm 192+-token session into MambaRadixCache.
+        let mut seed_stream = worker
+            .submit(
+                warm_seed_prompt,
+                SamplingParams {
+                    max_tokens: 16,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            collect_with_cached(&mut seed_stream, 16),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // 2. Launch 4 concurrent full-window requests (`max_tokens = max_len - prompt.len()`,
+        //    each >7,900 tokens > slot_cap=2,048, sum >31,000 tokens >> 8,192 KV pool).
+        let rounds_before = worker.stats.verify_rounds.load(Ordering::Relaxed);
+        let mut streams: Vec<_> = burst_prompts
+            .iter()
+            .map(|p| {
+                let sp = SamplingParams {
+                    max_tokens: max_len - p.len(),
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                };
+                worker
+                    .submit_with_images_lora_and_budget_mode(
+                        p.clone(),
+                        Vec::new(),
+                        sp,
+                        None,
+                        warp34_host::lora::BASE_MODEL_LORA_ID,
+                        true,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let mut it = streams.drain(..);
+        let (s0, s1, s2, s3) = (
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let (r0, r1, r2, r3) = tokio::join!(
+                collect_first_n_then_cancel(s0, 32),
+                collect_first_n_then_cancel(s1, 32),
+                collect_first_n_then_cancel(s2, 32),
+                collect_first_n_then_cancel(s3, 32),
+            );
+            r0?;
+            r1?;
+            r2?;
+            r3?;
+            Ok::<_, String>(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let rounds_after = worker.stats.verify_rounds.load(Ordering::Relaxed);
+
+        // 3. Probe the earlier warm prefix: incremental KV slab allocation must have kept it
+        //    resident in MambaRadixCache rather than evicting the pool for 4 full-window budgets.
+        let mut probe_stream = worker
+            .submit(
+                warm_probe_prompt,
+                SamplingParams {
+                    max_tokens: 16,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (_, cached) = tokio::time::timeout(
+            Duration::from_secs(60),
+            collect_with_cached(&mut probe_stream, 16),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        worker.shutdown().await.unwrap();
+        (rounds_after - rounds_before, cached)
+    });
+
+    assert_eq!(
+        worker.stats.peak_active.load(Ordering::Relaxed),
+        4,
+        "4 concurrent full-window soft-budget requests must admit together instead of serializing"
+    );
+    assert!(
+        rounds_delta >= 20,
+        "4 concurrent full-window requests must execute batched MTP verify rounds, got {rounds_delta}"
+    );
+    assert!(
+        probe_cached >= 128,
+        "warm MambaRadixCache prefix must survive concurrent full-window requests via incremental KV slabs, got cached={probe_cached}"
+    );
+}

@@ -22,7 +22,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
 * **CLI Flags & Argument Validation:**
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
   * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp16 | bf16` (default: `tq4`).
-  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, or 256 pages / 4,096 tokens in single-shot CLI commands).
+  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, 1,024 pages / 16,384 tokens in `chat`, or 256 pages / 4,096 tokens in single-shot CLI commands).
   * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <positive integer>`.
   * **Model Hub & Offline Options:** `--revision <ref>`, `--draft-revision <ref>`, `--offline` (reads strictly from `HF_HUB_CACHE`).
   * **Multimodal Options:** `--image <path|url>`, `--allow-remote-images` (SSRF-protected HTTP/HTTPS retrieval).
@@ -57,7 +57,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Dedicated token count endpoint: `POST /v1/messages/count_tokens`.
 * **Health, Discovery & Prometheus Telemetry:**
   * `GET /health`: Fast probe returning `{"status":"ok"}`.
-  * `GET /v1/models`: OpenAI-compatible model catalog reporting active model ID and aliases.
+  * `GET /v1/models`: OpenAI-compatible model catalog reporting active model ID, LoRA aliases, and `max_model_len`.
   * `POST /tokenize` & `POST /detokenize`: Direct tokenization and detokenization endpoints with admission limiting.
   * `GET /metrics`: Standard Prometheus metrics export (`text/plain; version=0.0.4`) exposing TTFT, ITL, queue latencies, and cache utilization.
   * `GET /api/metrics`: Real-time JSON telemetry snapshot (`no-store`) powering operational dashboards.

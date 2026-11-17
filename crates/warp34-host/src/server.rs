@@ -55,6 +55,12 @@ impl ServeOptions {
 pub enum WorkerError {
     /// Client-fixable invalid request (`400 Bad Request`).
     InvalidRequest(String),
+    /// Request prompt + output exceeds the configured context window (`400 Bad Request`, `context_length_exceeded`).
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        output_tokens: usize,
+        limit: usize,
+    },
     /// Transient server capacity exhaustion (`429 Too Many Requests`).
     Overload(String),
     /// Graceful worker shutdown (`503 Service Unavailable`).
@@ -71,6 +77,19 @@ impl WorkerError {
     #[inline]
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self::InvalidRequest(msg.into())
+    }
+
+    #[inline]
+    pub const fn context_length_exceeded(
+        prompt_tokens: usize,
+        output_tokens: usize,
+        limit: usize,
+    ) -> Self {
+        Self::ContextLengthExceeded {
+            prompt_tokens,
+            output_tokens,
+            limit,
+        }
     }
 
     #[inline]
@@ -108,7 +127,7 @@ impl WorkerError {
     #[inline]
     pub const fn http_status(&self) -> StatusCode {
         match self {
-            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::Overload(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::WorkerStopped(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::WorkerPanicked(_) | Self::Cuda(_) | Self::Internal(_) => {
@@ -120,12 +139,20 @@ impl WorkerError {
     #[inline]
     pub const fn openai_error_type(&self) -> &'static str {
         match self {
-            Self::InvalidRequest(_) => "invalid_request_error",
+            Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => "invalid_request_error",
             Self::Overload(_) => "rate_limit_error",
             Self::WorkerStopped(_)
             | Self::WorkerPanicked(_)
             | Self::Cuda(_)
             | Self::Internal(_) => "server_error",
+        }
+    }
+
+    #[inline]
+    pub const fn openai_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::ContextLengthExceeded { .. } => Some("context_length_exceeded"),
+            _ => None,
         }
     }
 }
@@ -137,6 +164,14 @@ impl fmt::Display for WorkerError {
             | Self::Overload(m)
             | Self::WorkerStopped(m)
             | Self::Internal(m) => f.write_str(m),
+            Self::ContextLengthExceeded {
+                prompt_tokens,
+                output_tokens,
+                limit,
+            } => write!(
+                f,
+                "This model's maximum context length is {limit} tokens (serving context limit). However, prompt ({prompt_tokens}) + output budget ({output_tokens}) exceeds {limit} tokens."
+            ),
             Self::WorkerPanicked(m) => write!(f, "engine worker terminated after panic: {m}"),
             Self::Cuda(err) => fmt::Display::fmt(err, f),
         }

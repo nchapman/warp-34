@@ -23,6 +23,7 @@ fn terminal_test_request() -> (
     let (output, events) = generation_channel(2);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cached_tokens = Arc::new(AtomicU64::new(0));
+    let hit_limit = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
     let request = Request {
         lifecycle: Some(Arc::new(Telemetry::default()).request(1)),
@@ -30,7 +31,9 @@ fn terminal_test_request() -> (
         images: Vec::new(),
         vision: None,
         reserved_pages: 0,
+        soft_output_budget: false,
         cached_tokens: cached_tokens.clone(),
+        hit_limit: hit_limit.clone(),
         sampler: SamplerV1::new(SamplingParams::default(), &[1], None),
         output,
         terminal: events.terminal.clone(),
@@ -49,6 +52,7 @@ fn terminal_test_request() -> (
         GenerationStream {
             events,
             cached_tokens,
+            hit_limit,
             cancelled,
         },
         rx,
@@ -391,10 +395,12 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         has_vision_weights: false,
         hidden_size: 1024,
         kv_token_capacity: 4096,
+        max_position_embeddings: Some(2048),
         unshareable_prefill: false,
         lora_registry: crate::lora::LoraAdapterRegistry::new(),
         max_model_len: None,
     };
+    assert_eq!(worker.max_model_len(), 2048);
 
     let mut active_stream = worker
         .submit(vec![10, 20], SamplingParams::default(), None)

@@ -938,6 +938,7 @@ fn positional_model_industry_aliases_and_sampling_validation() {
     assert_eq!(parse(&["chat"]).max_tokens, 2048);
     assert_eq!(parse(&["generate"]).max_tokens, 512);
     assert_eq!(parse(&["greedy-diff", "--golden", "g.json"]).max_tokens, 64);
+    assert!(super::options::USAGE.contains("2048 chat, 512 generate, 64 greedy-diff"));
 
     // Industry-standard flag aliases (vLLM, SGLang, llama.cpp).
     let serve_opts = parse(&[

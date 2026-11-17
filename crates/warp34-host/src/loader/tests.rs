@@ -53,6 +53,46 @@ fn test_model_config_from_json_parsing() {
     assert_eq!(cfg.vocab_size, 152064);
     assert_eq!(cfg.rms_norm_eps, 1e-6);
     assert_eq!(cfg.layer_types.len(), 4);
+    assert_eq!(cfg.max_position_embeddings, None);
+
+    let with_max_pos = serde_json::json!({
+        "model_type": "qwen3_5",
+        "hidden_size": 2560,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 20,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 152064,
+        "max_position_embeddings": 262144,
+        "layer_types": ["linear_attention", "full_attention"]
+    });
+    assert_eq!(
+        ModelConfig::from_json(&with_max_pos)
+            .unwrap()
+            .max_position_embeddings,
+        Some(262_144)
+    );
+
+    let nested_vl = serde_json::json!({
+        "model_type": "qwen3_5_vl",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064,
+            "max_position_embeddings": 131072,
+            "layer_types": ["linear_attention", "full_attention"]
+        }
+    });
+    assert_eq!(
+        ModelConfig::from_json(&nested_vl)
+            .unwrap()
+            .max_position_embeddings,
+        Some(131_072)
+    );
 }
 
 #[test]

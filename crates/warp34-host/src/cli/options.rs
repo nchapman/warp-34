@@ -120,7 +120,7 @@ Generation & Chat Options (warp34 chat / generate):
   -f, --prompt-file <path>            Read prompt text from a UTF-8 file
   --system, --system-prompt <text>    System prompt prepended to the conversation
   -i, --interactive                   Force interactive multi-turn REPL mode in `warp34 chat`
-  -n, --max-tokens <tokens>           Max generated tokens (default: 512 chat, 256 generate, 64 greedy-diff)
+  -n, --max-tokens <tokens>           Max generated tokens (default: 2048 chat, 512 generate, 64 greedy-diff)
   --temp, --temperature <0..2>        Sampling temperature (0 = greedy default)
   --top-p <0..1> / --top-k <n>        Nucleus (top-p) and top-k sampling filters
   --min-p <0..1> / --seed <u64>       Min-p filter threshold and deterministic RNG seed

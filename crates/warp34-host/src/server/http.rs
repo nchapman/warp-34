@@ -163,10 +163,15 @@ pub(super) fn error(status: StatusCode, message: impl ToString) -> ApiError {
     )
 }
 pub(super) fn worker_api_err(err: WorkerError) -> ApiError {
-    (
-        err.http_status(),
-        Json(json!({"error":{"message":err.to_string(),"type":err.openai_error_type()}})),
-    )
+    let mut obj = serde_json::Map::from_iter([
+        ("message".to_owned(), json!(err.to_string())),
+        ("type".to_owned(), json!(err.openai_error_type())),
+    ]);
+    if let Some(code) = err.openai_error_code() {
+        obj.insert("code".to_owned(), json!(code));
+        obj.insert("param".to_owned(), Value::Null);
+    }
+    (err.http_status(), Json(json!({"error": obj})))
 }
 pub(super) fn bad(message: impl ToString) -> ApiError {
     error(StatusCode::BAD_REQUEST, message)
@@ -261,14 +266,21 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
     .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
+    let max_model_len = s.worker.max_model_len();
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
-    data.push(json!({"id":s.model_name,"object":"model","owned_by":"warp34"}));
+    data.push(json!({
+        "id": s.model_name,
+        "object": "model",
+        "owned_by": "warp34",
+        "max_model_len": max_model_len,
+    }));
     for entry in s.worker.lora_registry.entries() {
         data.push(json!({
             "id": entry.name,
             "object": "model",
             "owned_by": "warp34",
             "parent": s.model_name,
+            "max_model_len": max_model_len,
         }));
     }
     Json(json!({"object":"list","data":data}))
@@ -347,6 +359,13 @@ pub(super) async fn cpu<T: Send + 'static>(
     state: &OpenAiServerState,
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, ApiError> {
+    cpu_with(state, f, bad).await
+}
+async fn cpu_with<T: Send + 'static, E: Send + 'static>(
+    state: &OpenAiServerState,
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+    map_err: impl FnOnce(E) -> ApiError,
+) -> Result<T, ApiError> {
     let permit = state
         .preprocessing
         .clone()
@@ -359,7 +378,7 @@ pub(super) async fn cpu<T: Send + 'static>(
     })
     .await
     .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .map_err(bad)
+    .map_err(map_err)
 }
 async fn tokenize(
     State(s): State<Arc<OpenAiServerState>>,
@@ -434,18 +453,112 @@ async fn completion(
     generate(s, req, false).await
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrepareMode {
+    Generate,
+    CountTokens,
+}
+
+enum PrepareError {
+    BadRequest(String),
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        max_model_len: usize,
+        param: &'static str,
+    },
+}
+
+impl From<String> for PrepareError {
+    fn from(msg: String) -> Self {
+        Self::BadRequest(msg)
+    }
+}
+
+impl From<&str> for PrepareError {
+    fn from(msg: &str) -> Self {
+        Self::BadRequest(msg.to_owned())
+    }
+}
+
+fn prepare_openai_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => bad(msg),
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            param,
+        } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "This model's maximum context length is {max_model_len} tokens (serving context limit). However, your prompt contains {prompt_tokens} input tokens, leaving no room for generation. Please reduce the length of the {param}."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": param,
+                    "code": "context_length_exceeded",
+                }
+            })),
+        ),
+    }
+}
+
+fn prepare_responses_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => {
+            responses_api_err(crate::responses_api::ResponsesApiError::bad_request(msg))
+        }
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            ..
+        } => responses_api_err(
+            crate::responses_api::ResponsesApiError::context_length_exceeded(
+                prompt_tokens,
+                max_model_len,
+            ),
+        ),
+    }
+}
+
+fn prepare_anthropic_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(msg),
+        ),
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            ..
+        } => anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(format!(
+                "prompt is too long: {prompt_tokens} tokens > {} maximum",
+                max_model_len.saturating_sub(1)
+            )),
+        ),
+    }
+}
+
 struct Prepared {
     parser: Qwen3Parser,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
     params: SamplingParams,
+    soft_output_budget: bool,
     constraint: Option<crate::parser::TokenBitmaskConstraint>,
     lora_id: i32,
     served_model: String,
     stream: bool,
     include_usage: bool,
 }
-fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared, String> {
+fn prepare(
+    s: &OpenAiServerState,
+    request: Value,
+    chat: bool,
+    mode: PrepareMode,
+) -> Result<Prepared, PrepareError> {
     if !request.is_object() {
         return Err("request must be an object".into());
     }
@@ -542,28 +655,46 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     if prompt.is_empty() {
         return Err("prompt must be nonempty".into());
     }
-    params.max_tokens = match explicit_max_tokens {
-        Some(n) => n,
-        None if chat => s.worker.max_model_len().saturating_sub(prompt.len()).max(1),
-        None => s
-            .worker
-            .max_model_len()
-            .saturating_sub(prompt.len())
-            .clamp(1, super::DEFAULT_COMPLETION_MAX_TOKENS),
-    };
-    if params.min_tokens > params.max_tokens {
-        return Err("min_tokens exceeds max_tokens".into());
-    }
-    let constraint = match crate::request_constraints::RequestConstraint::parse(&request)? {
-        Some(spec) => {
-            let factory = s
-                .constraint_factory
-                .as_ref()
-                .ok_or("constraint tokenizer unavailable")?;
-            let request_factory = factory.with_stop_tokens(&params.stop_token_ids)?;
-            Some(spec.compile(&request_factory, thinking)?)
+    let mut soft_output_budget = false;
+    if mode == PrepareMode::Generate {
+        let max_len = s.worker.max_model_len();
+        if prompt.len() >= max_len {
+            return Err(PrepareError::ContextLengthExceeded {
+                prompt_tokens: prompt.len(),
+                max_model_len: max_len,
+                param: if chat { "messages" } else { "prompt" },
+            });
         }
-        None => None,
+        let remaining = max_len - prompt.len();
+        const SOFT_CEILING_THRESHOLD_TOKENS: usize = 2048;
+        let (resolved_max, soft) = match explicit_max_tokens {
+            Some(n) => (
+                n.min(remaining),
+                n > remaining || (chat && !params.ignore_eos && n > SOFT_CEILING_THRESHOLD_TOKENS),
+            ),
+            None if chat => (remaining, true),
+            None => (remaining.min(super::DEFAULT_COMPLETION_MAX_TOKENS), false),
+        };
+        params.max_tokens = resolved_max;
+        soft_output_budget = soft;
+        if params.min_tokens > params.max_tokens {
+            return Err("min_tokens exceeds max_tokens".into());
+        }
+    }
+    let constraint = if mode == PrepareMode::Generate {
+        match crate::request_constraints::RequestConstraint::parse(&request)? {
+            Some(spec) => {
+                let factory = s
+                    .constraint_factory
+                    .as_ref()
+                    .ok_or("constraint tokenizer unavailable")?;
+                let request_factory = factory.with_stop_tokens(&params.stop_token_ids)?;
+                Some(spec.compile(&request_factory, thinking)?)
+            }
+            None => None,
+        }
+    } else {
+        None
     };
     let stream = request
         .get("stream")
@@ -579,6 +710,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         prompt,
         images,
         params,
+        soft_output_budget,
         constraint,
         lora_id,
         served_model,
@@ -611,19 +743,25 @@ async fn generate(
             Ok(None)
         );
     let prepared = if inline_fast {
-        prepare(&prep_state, json, chat).map_err(bad)?
+        prepare(&prep_state, json, chat, PrepareMode::Generate).map_err(prepare_openai_err)?
     } else {
-        cpu(&s, move || prepare(&prep_state, json, chat)).await?
+        cpu_with(
+            &s,
+            move || prepare(&prep_state, json, chat, PrepareMode::Generate),
+            prepare_openai_err,
+        )
+        .await?
     };
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
         .map_err(worker_api_err)?;
     let stream = prepared.stream;
@@ -858,6 +996,7 @@ fn output_stream(
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation); // cancellation also covers stop strings and a dropped HTTP response body
         if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (overload, shutdown, or worker failure)")); return; }
         let tail = std::mem::take(&mut stops.pending);
@@ -869,7 +1008,7 @@ fn output_stream(
         let (tail,turn) = parser.finish();
         let delta = delta_value(tail,&mut tool_index);
         if chat && delta.as_object().is_some_and(|o| !o.is_empty()) { yield Output::Delta(chunk(delta,Value::Null)); }
-        let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && count >= params.max_tokens { "length" } else { "stop" };
+        let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && (count >= params.max_tokens || hit_limit) { "length" } else { "stop" };
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
@@ -887,6 +1026,28 @@ fn responses_api_err(err: crate::responses_api::ResponsesApiError) -> ApiError {
 
 fn anthropic_api_err(status: StatusCode, err: crate::anthropic_api::AnthropicApiError) -> ApiError {
     (status, Json(err.to_json()))
+}
+
+fn worker_anthropic_err(err: WorkerError) -> ApiError {
+    if let WorkerError::ContextLengthExceeded {
+        prompt_tokens,
+        output_tokens,
+        limit,
+    } = err
+    {
+        let max_input = if output_tokens == 0 {
+            limit
+        } else {
+            limit.saturating_sub(1)
+        };
+        return anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(format!(
+                "prompt is too long: {prompt_tokens} tokens > {max_input} maximum"
+            )),
+        );
+    }
+    to_anthropic_err(worker_api_err(err))
 }
 
 fn to_anthropic_err((status, Json(body)): ApiError) -> ApiError {
@@ -944,9 +1105,11 @@ async fn chat_input_tokens(
         obj.remove("min_tokens");
     }
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, body, true).map(|p| p.prompt.len())
-    })
+    let count = cpu_with(
+        &s,
+        move || prepare(&prep_state, body, true, PrepareMode::CountTokens).map(|p| p.prompt.len()),
+        prepare_openai_err,
+    )
     .await?;
     Ok(Json(json!({
         "object": "response.input_tokens",
@@ -990,9 +1153,13 @@ async fn responses_input_tokens(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
-    })
+    let count = cpu_with(
+        &s,
+        move || {
+            prepare(&prep_state, chat_req, true, PrepareMode::CountTokens).map(|p| p.prompt.len())
+        },
+        prepare_responses_err,
+    )
     .await?;
     Ok(Json(json!({
         "object": "response.input_tokens",
@@ -1018,11 +1185,14 @@ async fn anthropic_count_tokens(
         obj.remove("min_tokens");
     }
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
-    })
-    .await
-    .map_err(to_anthropic_err)?;
+    let count = cpu_with(
+        &s,
+        move || {
+            prepare(&prep_state, chat_req, true, PrepareMode::CountTokens).map(|p| p.prompt.len())
+        },
+        prepare_anthropic_err,
+    )
+    .await?;
     Ok(Json(json!({
         "input_tokens": count,
     })))
@@ -1169,18 +1339,24 @@ async fn responses_create(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
+    let prepared = cpu_with(
+        &s,
+        move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
+        prepare_responses_err,
+    )
+    .await?;
     meta.model.clone_from(&prepared.served_model);
     meta.max_output_tokens = prepared.params.max_tokens;
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
         .map_err(worker_api_err)?;
     if let Some(ref scope) = caller_scope {
@@ -1258,6 +1434,7 @@ async fn responses_create(
                 }
             }
             cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, "engine stream closed before completion");
@@ -1276,7 +1453,7 @@ async fn responses_create(
             }
             let finish = if !turn.tool_calls.is_empty() {
                 "tool_calls"
-            } else if !stopped && count >= params.max_tokens {
+            } else if !stopped && (count >= params.max_tokens || hit_limit) {
                 "length"
             } else {
                 "stop"
@@ -1357,6 +1534,7 @@ async fn responses_create(
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
             return responses_sync_failure(
@@ -1376,7 +1554,7 @@ async fn responses_create(
         let (_, turn) = parser.finish();
         let finish = if !turn.tool_calls.is_empty() {
             "tool_calls"
-        } else if !stopped && count >= prepared.params.max_tokens {
+        } else if !stopped && (count >= prepared.params.max_tokens || hit_limit) {
             "length"
         } else {
             "stop"
@@ -1417,21 +1595,25 @@ async fn anthropic_messages(
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
-    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true))
-        .await
-        .map_err(to_anthropic_err)?;
+    let prepared = cpu_with(
+        &s,
+        move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
+        prepare_anthropic_err,
+    )
+    .await?;
     meta.model.clone_from(&prepared.served_model);
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
-        .map_err(|e| to_anthropic_err(worker_api_err(e)))?;
+        .map_err(worker_anthropic_err)?;
 
     if meta.stream {
         let params = prepared.params;
@@ -1497,6 +1679,7 @@ async fn anthropic_messages(
                 }
             }
             cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(
@@ -1517,7 +1700,7 @@ async fn anthropic_messages(
             }
             let finish = if !turn.tool_calls.is_empty() {
                 "tool_calls"
-            } else if !stopped && count >= params.max_tokens {
+            } else if !stopped && (count >= params.max_tokens || hit_limit) {
                 "length"
             } else {
                 "stop"
@@ -1582,11 +1765,12 @@ async fn anthropic_messages(
                     break;
                 }
                 GenerationEvent::Error(err) => {
-                    return Err(to_anthropic_err(worker_api_err(err)));
+                    return Err(worker_anthropic_err(err));
                 }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
             return Err(anthropic_api_err(
@@ -1603,7 +1787,7 @@ async fn anthropic_messages(
         let (_, turn) = parser.finish();
         let finish = if !turn.tool_calls.is_empty() {
             "tool_calls"
-        } else if !stopped && count >= prepared.params.max_tokens {
+        } else if !stopped && (count >= prepared.params.max_tokens || hit_limit) {
             "length"
         } else {
             "stop"

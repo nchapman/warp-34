@@ -27,6 +27,8 @@ pub enum ResponsesErrorKind {
 pub struct ResponsesApiError {
     pub kind: ResponsesErrorKind,
     pub message: String,
+    pub param: Option<&'static str>,
+    pub code: Option<&'static str>,
 }
 
 impl ResponsesApiError {
@@ -34,6 +36,19 @@ impl ResponsesApiError {
         Self {
             kind: ResponsesErrorKind::InvalidRequest,
             message: msg.into(),
+            param: None,
+            code: None,
+        }
+    }
+
+    pub fn context_length_exceeded(prompt_tokens: usize, max_model_len: usize) -> Self {
+        Self {
+            kind: ResponsesErrorKind::InvalidRequest,
+            message: format!(
+                "This model's maximum context length is {max_model_len} tokens (serving context limit). However, your input contains {prompt_tokens} tokens, leaving no room for generation. Please reduce the length of the input."
+            ),
+            param: Some("input"),
+            code: Some("context_length_exceeded"),
         }
     }
 
@@ -41,6 +56,8 @@ impl ResponsesApiError {
         Self {
             kind: ResponsesErrorKind::NotFound,
             message: msg.into(),
+            param: None,
+            code: None,
         }
     }
 
@@ -53,8 +70,8 @@ impl ResponsesApiError {
             "error": {
                 "message": self.message,
                 "type": err_type,
-                "param": Value::Null,
-                "code": Value::Null,
+                "param": self.param,
+                "code": self.code,
             }
         })
     }

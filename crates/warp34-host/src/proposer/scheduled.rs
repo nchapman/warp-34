@@ -442,7 +442,7 @@ impl NativeProposer {
         }
     }
 
-    pub(crate) fn fits_mtp_batch_slot_capacity(&self, prompt_len: usize, max_new: usize) -> bool {
+    pub(crate) fn fits_mtp_batch_slot_capacity(&self, current_len: usize) -> bool {
         let slot_cap = match &self.ranks {
             Ranks::Mtp(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
             Ranks::DFlash(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
@@ -450,8 +450,7 @@ impl NativeProposer {
         if slot_cap < 32 {
             return false;
         }
-        let need = prompt_len.saturating_add(max_new.max(1));
-        need <= slot_cap
+        current_len.saturating_add(self.k + 2) <= slot_cap
     }
 
     pub(crate) fn set_mtp_batch_mode(&mut self, enable: bool) -> Result<()> {

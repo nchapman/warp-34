@@ -124,26 +124,44 @@ have to divide by 16-token pages), accepting human-friendly suffixes (`4k`, `16k
 `32k`, `64k`, `128k`, `256k`).
 
 `--max-model-len` sets the per-request **admission ceiling** (in tokens, also
-supporting `k`/`M` suffixes). When neither `--ctx-size` nor `--kv-pages` is
+supporting `k`/`M` suffixes). When omitted, `warp34` defaults `max_model_len` to
+`min(allocated_kv_tokens, max_position_embeddings)` when the checkpoint declares
+`max_position_embeddings` (logging a warning if `--max-model-len` is explicitly
+set above `max_position_embeddings`), and advertises `max_model_len` on every
+`GET /v1/models` entry. When neither `--ctx-size` nor `--kv-pages` is
 explicitly passed, `--max-model-len` automatically expands the target KV page
 request when needed (for example, `warp34 serve Qwen/Qwen3.5-4B --max-model-len 64k`
 or `warp34 serve Qwen/Qwen3.5-4B --speculative mtp --max-model-len 16k`
 automatically requests `4,096` or `1,024` KV pages). When `--ctx-size` or
 `--kv-pages` *is* explicitly passed alongside `--max-model-len`, `warp34` validates
 `max_model_len <= kv_tokens` immediately at CLI parse time before any Hub download
-or GPU initialization. Select a value within the checkpoint's supported context
-window; it does not infer or change RoPE/model context metadata, nor reserve that
-many tokens per request.
+or GPU initialization.
 
 The limit checks the fully tokenized prompt (including expanded image tokens)
-plus requested output tokens before worker enqueue. It applies to all generative
-APIs, streaming and non-streaming, and to decision-model prefills (zero output
-budget). Over-limit requests fail with HTTP 400; there is no silent truncation.
-Token-count/tokenization endpoints are utilities and do not consume this budget.
-When `max_completion_tokens` / `max_tokens` / `max_output_tokens` is omitted on
-`/v1/chat/completions` or `/v1/responses`, it defaults to the remaining context
-budget (`max_model_len - prompt_tokens`); legacy `/v1/completions` defaults omitted
-`max_tokens` to `min(256, max_model_len - prompt_tokens)`.
+before worker enqueue across all generative APIs (streaming and non-streaming)
+and decision-model prefills (zero output budget):
+- Prompts with `prompt_tokens >= max_model_len` (or `prompt_tokens > max_model_len`
+  for zero-output decision prefills) fail immediately with HTTP 400 (`code:
+  "context_length_exceeded"` on OpenAI Chat/Completions and Responses; `"prompt is
+  too long: X tokens > Y maximum"` on Anthropic `/v1/messages`) with no silent
+  prompt truncation.
+- Token-count/tokenization utilities (`/v1/messages/count_tokens`,
+  `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`, `/tokenize`)
+  are exempt so coding agents can count oversized histories before compacting.
+- When `prompt_tokens < max_model_len`, an explicit `max_completion_tokens` /
+  `max_tokens` / `max_output_tokens` above the remaining window (`max_model_len -
+  prompt_tokens`) is clamped to `max_model_len - prompt_tokens` rather than
+  rejecting static client output budgets (such as Claude Code `32000` or OpenCode
+  `8192`) mid-session.
+- When `max_completion_tokens` / `max_tokens` / `max_output_tokens` is omitted on
+  `/v1/chat/completions` or `/v1/responses`, it defaults to the remaining context
+  budget (`max_model_len - prompt_tokens`); legacy `/v1/completions` defaults omitted
+  `max_tokens` to `min(256, max_model_len - prompt_tokens)`.
+- Physical KV pages are allocated incrementally (`128`-token / `8`-page decode
+  slabs) rather than pre-allocating a request's entire `max_tokens` ceiling up front,
+  preserving warm `MambaRadixCache` prefixes and gracefully finishing with `"length"`
+  (`"max_tokens"` on Anthropic, `"incomplete"` on Responses) if the shared KV pool
+  exhausts mid-decode.
 
 ## Readiness, shutdown, and bounded recovery
 

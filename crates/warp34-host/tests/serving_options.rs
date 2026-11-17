@@ -105,6 +105,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
                 .await
                 .unwrap();
             assert_eq!(models["data"][0]["id"], "coding-model");
+            assert_eq!(models["data"][0]["max_model_len"], 256);
             assert_eq!(state.metrics.snapshot().model, "coding-model");
             check_context_limit(&client, &base).await;
             assert_eq!(state.metrics.snapshot().requests.submitted, 0);
@@ -315,25 +316,63 @@ async fn check_route_auth(client: &reqwest::Client, base: &str, webui: bool) {
 }
 
 async fn check_context_limit(client: &reqwest::Client, base: &str) {
+    let over_prompt = "hello ".repeat(300);
+    // Token-count utilities must NOT fail on oversized prompts so coding agents can count
+    // full conversation histories before compacting them.
+    for (path, body) in [
+        (
+            "/v1/chat/completions/input_tokens",
+            json!({"model":"coding-model", "messages":[{"role":"user","content":&over_prompt}]}),
+        ),
+        (
+            "/v1/responses/input_tokens",
+            json!({"model":"coding-model", "input":&over_prompt}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model":"coding-model", "messages":[{"role":"user","content":&over_prompt}]}),
+        ),
+    ] {
+        let resp = client
+            .post(format!("{base}{path}"))
+            .bearer_auth("deployment-test-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        let payload: Value = resp.json().await.unwrap();
+        assert!(
+            payload["input_tokens"].as_u64().unwrap_or(0) >= 256,
+            "{path}: {payload}"
+        );
+    }
+
+    // Generative endpoints must reject prompt_tokens >= max_model_len (256) with HTTP 400
+    // and structured coding-agent context-overflow codes/messages.
     for stream in [false, true] {
-        for (path, body) in [
+        for (path, body, expected_param) in [
             (
                 "/v1/completions",
-                json!({"prompt":"Hi", "max_tokens":257, "stream":stream}),
+                json!({"prompt":&over_prompt, "max_tokens":16, "stream":stream}),
+                Some("prompt"),
             ),
             (
                 "/v1/chat/completions",
-                json!({"messages":[{"role":"user","content":"Hi"}],
-                "max_tokens":257, "stream":stream}),
+                json!({"messages":[{"role":"user","content":&over_prompt}],
+                "max_tokens":16, "stream":stream}),
+                Some("messages"),
             ),
             (
                 "/v1/responses",
-                json!({"input":"Hi", "max_output_tokens":257, "stream":stream}),
+                json!({"input":&over_prompt, "max_output_tokens":16, "stream":stream}),
+                Some("input"),
             ),
             (
                 "/v1/messages",
-                json!({"model":"coding-model", "messages":[{"role":"user","content":"Hi"}],
-                "max_tokens":257, "stream":stream}),
+                json!({"model":"coding-model", "messages":[{"role":"user","content":&over_prompt}],
+                "max_tokens":16, "stream":stream}),
+                None,
             ),
         ] {
             let response = client
@@ -344,12 +383,45 @@ async fn check_context_limit(client: &reqwest::Client, base: &str) {
                 .await
                 .unwrap();
             assert_eq!(response.status(), 400, "{path} stream={stream}");
-            assert!(response.text().await.unwrap().contains("context limit"));
+            let err_json: Value = response.json().await.unwrap();
+            if let Some(param) = expected_param {
+                assert_eq!(
+                    err_json["error"]["code"], "context_length_exceeded",
+                    "{path}: {err_json}"
+                );
+                assert_eq!(err_json["error"]["param"], param, "{path}: {err_json}");
+                assert_eq!(
+                    err_json["error"]["type"], "invalid_request_error",
+                    "{path}: {err_json}"
+                );
+            } else {
+                assert_eq!(err_json["type"], "error", "{path}: {err_json}");
+                assert_eq!(
+                    err_json["error"]["type"], "invalid_request_error",
+                    "{path}: {err_json}"
+                );
+                let msg = err_json["error"]["message"].as_str().unwrap_or("");
+                assert!(
+                    msg.starts_with("prompt is too long:") && msg.contains("> 255 maximum"),
+                    "{path}: {msg}"
+                );
+            }
         }
     }
 }
 
 async fn check_large_and_omitted_output_budgets(client: &reqwest::Client, base: &str) {
+    let models: Value = client
+        .get(format!("{base}/v1/models"))
+        .bearer_auth("deployment-test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(models["data"][0]["max_model_len"], 8192);
+
     // 1. Explicit max_tokens > 4096 within the 8192-token context limit succeeds on /v1/chat/completions.
     let chat_resp = client
         .post(format!("{base}/v1/chat/completions"))
@@ -405,18 +477,65 @@ async fn check_large_and_omitted_output_budgets(client: &reqwest::Client, base: 
         .unwrap();
     assert_eq!(anth_resp.status(), 200);
 
-    // 4. Requesting prompt + max_tokens > 8192 is rejected with HTTP 400 context limit.
-    let over_resp = client
+    // 4. Static coding-agent max_tokens > remaining window (e.g. Claude Code 32000) clamps
+    //    cleanly to (8192 - prompt_tokens) instead of failing with HTTP 400 when prompt < 8192.
+    let clamped_resp = client
+        .post(format!("{base}/v1/responses"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "input": "Reply with OK.",
+            "max_output_tokens": 32000,
+            "temperature": 0,
+            "stop": ["\n", "."],
+            "reasoning": {"effort": "none"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clamped_resp.status(), 200);
+    let clamped_body: Value = clamped_resp.json().await.unwrap();
+    let clamped_in = clamped_body["usage"]["input_tokens"].as_u64().unwrap();
+    assert_eq!(
+        clamped_body["max_output_tokens"].as_u64(),
+        Some(8192 - clamped_in)
+    );
+
+    let clamped_anth = client
+        .post(format!("{base}/v1/messages"))
+        .bearer_auth("deployment-test-key")
+        .json(&json!({
+            "model": "private-engine",
+            "max_tokens": 32000,
+            "temperature": 0,
+            "stop_sequences": ["\n", "."],
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "Reply with OK."}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(clamped_anth.status(), 200);
+
+    // 5. min_tokens exceeding the clamped remaining context budget still fails with HTTP 400.
+    let min_over_resp = client
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth("deployment-test-key")
         .json(&json!({
             "model": "private-engine",
             "messages": [{"role": "user", "content": "Reply with OK."}],
-            "max_tokens": 8192
+            "min_tokens": 8190,
+            "max_tokens": 32000
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(over_resp.status(), 400);
-    assert!(over_resp.text().await.unwrap().contains("context limit"));
+    assert_eq!(min_over_resp.status(), 400);
+    assert!(
+        min_over_resp
+            .text()
+            .await
+            .unwrap()
+            .contains("min_tokens exceeds max_tokens")
+    );
 }
