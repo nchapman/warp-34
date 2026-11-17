@@ -23,7 +23,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
   * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp16 | bf16` (default: `tq4`).
   * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (defaults to 2,048 target pages / 32,768 tokens in `serve`, 1,024 pages / 16,384 tokens in `chat`, or 256 pages / 4,096 tokens in single-shot CLI commands).
-  * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <positive integer>`.
+  * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <tokens>` (supports `k`/`M` suffixes).
   * **Model Hub & Offline Options:** `--revision <ref>`, `--draft-revision <ref>`, `--offline` (reads strictly from `HF_HUB_CACHE`).
   * **Multimodal Options:** `--image <path|url>`, `--allow-remote-images` (SSRF-protected HTTP/HTTPS retrieval).
 
@@ -59,7 +59,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * `GET /health`: Fast probe returning `{"status":"ok"}`.
   * `GET /v1/models`: OpenAI-compatible model catalog reporting active model ID, LoRA aliases, and `max_model_len`.
   * `POST /tokenize` & `POST /detokenize`: Direct tokenization and detokenization endpoints with admission limiting.
-  * `GET /metrics`: Standard Prometheus metrics export (`text/plain; version=0.0.4`) exposing TTFT, ITL, queue latencies, and cache utilization.
+  * `GET /metrics`: Standard Prometheus metrics export (`text/plain; version=0.0.4`) exposing TTFT, per-request time-per-output-token, queue latencies, and cache utilization.
   * `GET /api/metrics`: Real-time JSON telemetry snapshot (`no-store`) powering operational dashboards.
 
 ---
@@ -87,9 +87,9 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Constant-time comparison (`subtle::ConstantTimeEq`) guards against timing side-channels.
   * Accepts both RFC 6750 `Authorization: Bearer <token>` and `x-api-key` headers.
 * **Embedded Self-Contained Web Dashboard:**
-  * Self-contained read-only React dashboard compiled and embedded directly into the binary via `include_dir!`.
+  * Self-contained React dashboard and interactive API Playground compiled and embedded directly into the binary via `include_dir!`.
   * Strict Content Security Policy (`CSP: default-src 'none'; script-src 'self'; style-src 'self' ...`), anti-sniff headers, and path traversal guards (`.` and `..` rejection).
-  * Serves `GET /` (`index.html`), `GET /favicon.svg`, and immutable cached static assets (`/assets/*`).
+  * Serves `GET /`, `GET /playground`, `GET /playground/{*path}`, `GET /connect` (`index.html`), `GET /favicon.svg`, and immutable cached static assets (`/assets/*`).
 
 ---
 

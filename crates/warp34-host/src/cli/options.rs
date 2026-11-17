@@ -87,12 +87,13 @@ Model & Hub Options:
   --revision <rev>                    Hub branch, tag, or full 40-char commit SHA
   --draft-revision <rev>              Hub revision for --draft-model (requires --draft-model)
   --offline                           Use local Hugging Face cache only (also respects HF_HUB_OFFLINE=1)
-  --lora-modules <name=path|path>...  Preload up to 8 hot-swappable LoRA adapters (supports @rev)
+  --lora-modules <name=path|path>...  Preload up to 62 hot-swappable LoRA adapters (supports @rev)
   --lora, --active-lora <name|spec>   Activate a LoRA adapter for single-sequence CLI commands
 
 Context & KV Cache Options:
-  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (supports k/M suffixes:
-                                      4k, 16k, 32k, 64k, 128k, 256k; aliases: --context-length, --kv-tokens)
+  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (default: auto up to 32k serve,
+                                      16k chat, 4k generate; supports k/M suffixes: 4k, 16k, 32k, 64k, 128k, 256k;
+                                      aliases: --context-length, --kv-tokens)
   --kv-format <policy>                tq4 (default, 3.07x), tq4_all (3.88x), fp8, q8_0, fp16, bf16, auto
                                       (aliases: --kv-cache-dtype, --cache-type-k)
   --kv-pages <n>                      Target KV pool in 16-token pages (low-level alternative to --ctx-size)
@@ -984,6 +985,26 @@ pub(crate) fn validate_cuda_options(
     if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) && draft_model.is_none()
     {
         return Err("--speculative dflash2 requires --draft-model".into());
+    }
+    if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) {
+        let max_dflash_tokens = crate::dflash::DFLASH2_MAX_KV_CAPACITY;
+        let max_dflash_pages = max_dflash_tokens / 16;
+        if let Some(pages) = *kv_pages
+            && pages > max_dflash_pages
+        {
+            return Err(format!(
+                "--speculative dflash2 supports at most {max_dflash_tokens} tokens ({max_dflash_pages} KV pages); got {} tokens ({pages} pages)",
+                pages.saturating_mul(16)
+            ));
+        }
+        if sub == "serve"
+            && let Some(max_len) = options.serve.options.max_model_len
+            && max_len > max_dflash_tokens
+        {
+            return Err(format!(
+                "--max-model-len ({max_len} tokens) exceeds --speculative dflash2 maximum capacity ({max_dflash_tokens} tokens / {max_dflash_pages} pages)"
+            ));
+        }
     }
     if *verify_lossless && speculative_kind.is_none() {
         return Err("--verify-lossless requires --speculative".into());

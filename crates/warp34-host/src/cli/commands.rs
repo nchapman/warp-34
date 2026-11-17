@@ -750,7 +750,7 @@ pub(crate) fn run_chat(
         active_lora,
         ..
     } = options;
-    let chat_kv_pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 1024));
+    let chat_kv_pages = kv_pages.or(Some(1024));
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,

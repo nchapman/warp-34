@@ -998,7 +998,7 @@ fn output_stream(
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
         let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation); // cancellation also covers stop strings and a dropped HTTP response body
-        if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (overload, shutdown, or worker failure)")); return; }
+        if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (client backpressure, overload, shutdown, or worker failure)")); return; }
         let tail = std::mem::take(&mut stops.pending);
         text.push_str(&tail);
         if !tail.is_empty() {

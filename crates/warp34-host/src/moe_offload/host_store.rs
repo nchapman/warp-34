@@ -15,7 +15,17 @@ pub(super) fn require(valid: bool, message: impl Into<String>) -> Result<()> {
 /// EP partitions expert IDs, never the intermediate dimension. Retain this
 /// store until every stream reading its mapped address or DMA source completes.
 static TOTAL_PINNED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WARNED_HEAP_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const MAX_PROCESS_PINNED_BYTES: usize = 80 * 1024 * 1024 * 1024;
+
+fn warn_pinned_heap_fallback_once() {
+    if !WARNED_HEAP_FALLBACK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "warning: pinned host MoE allocation fell back to pageable heap (check memlock / ulimit -l or 80 GiB pinned limit); H2D expert streaming may be slower"
+        );
+    }
+}
 
 pub(super) struct SharedPinnedSlab(MappedHostBuffer);
 
@@ -84,6 +94,7 @@ impl PinnedSlabPool {
             }
             try_layers /= 2;
         }
+        warn_pinned_heap_fallback_once();
         Ok(HostPackStorage::Heap(vec![0u8; layer_bytes]))
     }
 }
@@ -118,6 +129,9 @@ impl HostPackStorage {
         {
             TOTAL_PINNED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             return Ok(Self::Mapped(m));
+        }
+        if prefer_mapped && bytes > 0 {
+            warn_pinned_heap_fallback_once();
         }
         Ok(Self::Heap(vec![0u8; bytes]))
     }

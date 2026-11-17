@@ -109,9 +109,9 @@ the advertised alias rather than relying on permissive request-name handling.
 | Option | Default | Meaning |
 |---|---|---|
 | `--max-num-seqs N` (aliases: `--max-running-requests`, `--parallel`, `-np`) | 16 | Active sequences, **1–16**; used for both GDN state-pool planning and worker scheduling |
-| `-c N`, `--ctx-size N` (aliases: `--context-length`, `--kv-tokens`) | Automatic (up to `32k` tokens; `4k` with `--speculative`) | Shared target KV pool in **tokens** (supports `k`/`M` suffixes like `8k`, `32k`, `64k`, `128k`; rounds up to 16-token pages) |
-| `--max-model-len N` | Allocated KV token capacity | Per-request total prompt + requested output admission ceiling (supports `k`/`M` suffixes; auto-expands target KV pool when `-c`/`--kv-pages` is omitted) |
-| `--kv-pages N` (alias: `--num-gpu-blocks-override`) | Automatic; speculation defaults to 256 | Low-level alternative to `--ctx-size`: shared target KV pool in 16-token pages (mutually exclusive with `--ctx-size`) |
+| `-c N`, `--ctx-size N` (aliases: `--context-length`, `--kv-tokens`) | Automatic (up to `32k` tokens on `serve`) | Shared target KV pool in **tokens** (supports `k`/`M` suffixes like `8k`, `32k`, `64k`, `128k`; rounds up to 16-token pages) |
+| `--max-model-len N` | `min(allocated_kv_tokens, max_position_embeddings)` | Per-request total prompt + requested output admission ceiling (supports `k`/`M` suffixes; auto-expands target KV pool when `-c`/`--kv-pages` is omitted) |
+| `--kv-pages N` (alias: `--num-gpu-blocks-override`) | Automatic (up to `2,048` pages on `serve`, including `--speculative`) | Low-level alternative to `--ctx-size`: shared target KV pool in 16-token pages (mutually exclusive with `--ctx-size`) |
 
 `--max-num-seqs` is an upper bound, not a promise that N arbitrary contexts fit at
 once. GPU memory may reduce state capacity, and KV availability can serialize or

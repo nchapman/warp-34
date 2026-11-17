@@ -809,6 +809,8 @@ fn reserve_request_capacity(
     const KV_DECODE_SLAB_TOKENS: usize = 128;
     let step_tokens = engine.speculative.as_ref().map_or(1, |p| p.k + 1);
     let mut failed = Vec::new();
+    // Pass 1: reserve the strict minimum physical pages required for the next step across
+    // all active sequences first so no sequence's 128-token lookahead slab can starve a peer.
     for idx in 0..sched.active.len() {
         if sched.active[idx].finished {
             continue;
@@ -823,32 +825,17 @@ fn reserve_request_capacity(
         let total_cap_pages = (prompt_len + max_new.max(1)).div_ceil(16);
         let is_prefill_done = sched.active[idx].is_prefill_complete();
         let generated_len = sched.active[idx].generated_tokens.len();
-        let (min_pages, slab_pages) = if is_prefill_done {
+        let min_pages = if is_prefill_done {
             let cur_tokens = prompt_len + generated_len;
-            (
-                (cur_tokens + step_tokens).div_ceil(16).min(total_cap_pages),
-                (cur_tokens + step_tokens.max(KV_DECODE_SLAB_TOKENS))
-                    .div_ceil(16)
-                    .min(total_cap_pages),
-            )
+            (cur_tokens + step_tokens).div_ceil(16).min(total_cap_pages)
         } else {
-            (
-                (prompt_len + 1).div_ceil(16).min(total_cap_pages),
-                (prompt_len + KV_DECODE_SLAB_TOKENS)
-                    .div_ceil(16)
-                    .min(total_cap_pages),
-            )
+            (prompt_len + 1).div_ceil(16).min(total_cap_pages)
         };
-        let ok = engine.reserve_kv_pages_from(
-            &mut sched.radix,
-            &mut sched.active[idx].radix_state.kv_pages,
-            slab_pages,
-        ) || engine.reserve_kv_pages_from(
+        if engine.reserve_kv_pages_from(
             &mut sched.radix,
             &mut sched.active[idx].radix_state.kv_pages,
             min_pages,
-        );
-        if ok {
+        ) {
             let resident = sched.active[idx].radix_state.kv_pages.len();
             let req = requests.get_mut(&id).unwrap();
             req.reserved_pages = req.reserved_pages.max(resident);
@@ -872,6 +859,41 @@ fn reserve_request_capacity(
             release(engine, sched.finish_request_early(id));
         } else {
             failed.push((id, WorkerError::overload("KV pool exhausted")));
+        }
+    }
+    // Pass 2: opportunistically pre-allocate 128-token (8-page) decode slabs for remaining
+    // active sequences without failing if free + evictable pages only covered `min_pages`.
+    for idx in 0..sched.active.len() {
+        if sched.active[idx].finished {
+            continue;
+        }
+        let id = sched.active[idx].req_id;
+        if failed.iter().any(|(fid, _)| *fid == id) {
+            continue;
+        }
+        let prompt_len = sched.active[idx].prompt_tokens.len();
+        let max_new = sched.active[idx].max_new_tokens;
+        let total_cap_pages = (prompt_len + max_new.max(1)).div_ceil(16);
+        let is_prefill_done = sched.active[idx].is_prefill_complete();
+        let generated_len = sched.active[idx].generated_tokens.len();
+        let slab_pages = if is_prefill_done {
+            let cur_tokens = prompt_len + generated_len;
+            (cur_tokens + step_tokens.max(KV_DECODE_SLAB_TOKENS))
+                .div_ceil(16)
+                .min(total_cap_pages)
+        } else {
+            (prompt_len + KV_DECODE_SLAB_TOKENS)
+                .div_ceil(16)
+                .min(total_cap_pages)
+        };
+        if engine.reserve_kv_pages_from(
+            &mut sched.radix,
+            &mut sched.active[idx].radix_state.kv_pages,
+            slab_pages,
+        ) {
+            let resident = sched.active[idx].radix_state.kv_pages.len();
+            let req = requests.get_mut(&id).unwrap();
+            req.reserved_pages = req.reserved_pages.max(resident);
         }
     }
     for (id, error) in failed {
@@ -1267,15 +1289,22 @@ fn complete_tick(
         Ordering::Relaxed,
     );
     for seq in sched.take_finished() {
-        stats.completed.fetch_add(1, Ordering::Relaxed);
-        stats
-            .cached_tokens
-            .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
         if let Some(r) = requests.remove(&seq.req_id) {
-            r.set_terminal(GenerationEvent::Finished {
-                cached_tokens: seq.cached_prefix_tokens,
-                generated_tokens: seq.generated_tokens.len(),
-            });
+            if r.cancelled.load(Ordering::Acquire) {
+                // If output backpressure or disconnect cancelled the request on its final
+                // step, do not publish `Finished` (which would disguise a dropped token as
+                // a normal completion).
+                stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.completed.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .cached_tokens
+                    .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
+                r.set_terminal(GenerationEvent::Finished {
+                    cached_tokens: seq.cached_prefix_tokens,
+                    generated_tokens: seq.generated_tokens.len(),
+                });
+            }
         }
     }
 }

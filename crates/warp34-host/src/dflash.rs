@@ -473,7 +473,9 @@ fn weight_arena_bytes(
         || !c.num_key_value_heads.is_multiple_of(tp)
         || !c.intermediate_size.is_multiple_of(tp)
     {
-        return Err(loader_err("DFlash target/rank/capacity mismatch"));
+        return Err(loader_err(
+            "DFlash target/rank/capacity mismatch (max capacity 262144 tokens / 16384 pages)",
+        ));
     }
     let (h, d) = (c.hidden_size, c.head_dim);
     let q = product(&[c.num_attention_heads, d])?;
@@ -774,7 +776,9 @@ impl DFlash2Rank {
             || max_rows > DFLASH2_MAX_BATCH_ROWS
             || capacity < max_rows
         {
-            return Err(loader_err("DFlash target/rank/capacity mismatch"));
+            return Err(loader_err(
+                "DFlash target/rank/capacity mismatch (max capacity 262144 tokens / 16384 pages)",
+            ));
         }
         t.device.make_current()?;
         let archive = SafetensorsArchive::open(dir)

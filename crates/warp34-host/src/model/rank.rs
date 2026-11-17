@@ -935,7 +935,7 @@ impl Qwen3_5ModelRank {
         if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
         {
             return Err(loader_err_msg(format!(
-                "unsupported KV format {kv_policy:?} for head_dim={} (TQ4 and Q8_0 require head_dim=256; use --kv fp16)",
+                "unsupported KV format {kv_policy:?} for head_dim={} (TQ4 and Q8_0 require head_dim=256; use --kv-format fp16)",
                 cfg.head_dim
             )));
         }
@@ -1776,6 +1776,15 @@ impl PrePoolModelRank {
                 "insufficient memory for DFlash2: requires at least {} target state slots plus draft resident reserve; reduce KV capacity",
                 capacity.dflash_min_state_slots,
             )));
+        }
+        if rank == 0 && capacity.state_slots.is_some() && total_state_slots < requested_state_slots
+        {
+            eprintln!(
+                "warning: serving GDN state pool clamped from {} to {} slots (~{} concurrent active sequences) due to VRAM budget",
+                requested_state_slots,
+                total_state_slots,
+                (total_state_slots / 3).max(1),
+            );
         }
         let conv_dim = 2 * gdn_k_local + gdn_v_local;
         let mut state_pool = StateBundlePool::new(

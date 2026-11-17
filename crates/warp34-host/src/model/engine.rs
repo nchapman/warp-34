@@ -591,6 +591,20 @@ impl Qwen3_5Engine {
                         if config.prefix_bidir || config.noncausal_full_attention
                 )
             })
+            || self
+                .ranks
+                .first()
+                .and_then(|r| r.lora_runtime.as_ref())
+                .is_some_and(|rt| {
+                    rt.adapter_noncausal
+                        .iter()
+                        .copied()
+                        .any(std::convert::identity)
+                        || rt
+                            .adapter_midloops
+                            .iter()
+                            .any(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+                })
     }
 
     /// Sets the active `lora_id` (`-1` for base model, `0..num_adapters-1` for a loaded adapter)

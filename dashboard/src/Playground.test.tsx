@@ -801,5 +801,15 @@ describe("Playground UI integration", () => {
 
     fireEvent.change(maxTokensInput, { target: { value: "65536" } });
     expect(maxTokensInput.value).toBe("32768");
+
+    // Clearing MAX_TOKENS omits max_tokens ("auto") instead of pinning 256
+    fireEvent.change(maxTokensInput, { target: { value: "" } });
+    expect(maxTokensInput.value).toBe("");
+    expect(maxTokensInput.placeholder).toBe("auto");
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    expect(JSON.parse(rawEditor.value).max_tokens).toBeUndefined();
   });
 });

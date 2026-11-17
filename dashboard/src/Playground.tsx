@@ -52,6 +52,9 @@ const DEFAULT_MODEL = "default";
 const MAX_SSE_INSPECTOR_FRAMES = 512;
 const MAX_SSE_BUFFER_CHARS = 1_048_576;
 const REQUEST_IDLE_TIMEOUT_MS = 120_000;
+const NON_STREAM_TIMEOUT_MS = 600_000;
+const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_DATA_URL_CHARS = 28 * 1024 * 1024;
 const MAX_IMAGES_PER_REQUEST = 4;
 const MAX_IMAGE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_CANVAS_DIM = 2048;
@@ -326,6 +329,18 @@ export function Playground({
       const dataUrls = await Promise.all(toRead.map(readFileAsEngineDataUrl));
       // A request started while decoding: do not mutate its editor snapshot.
       if (abortRef.current !== requestAtStart) return;
+      const existingChars = messages.reduce(
+        (sum, m) =>
+          sum + (m.images?.reduce((acc, u) => acc + u.length, 0) ?? 0),
+        0,
+      );
+      const addedChars = dataUrls.reduce((acc, u) => acc + u.length, 0);
+      if (existingChars + addedChars > MAX_TOTAL_IMAGE_DATA_URL_CHARS) {
+        setRequestError(
+          "Attached images exceed the 32 MiB request body limit.",
+        );
+        return;
+      }
       setRequestError(null);
       updateBodyObject((curr) => {
         const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) =>
@@ -395,6 +410,15 @@ export function Playground({
     const payloadText = overrideJson ?? rawJson;
     let reqObj: Record<string, unknown> | null = null;
     if (endpoint.method !== "GET") {
+      if (
+        new TextEncoder().encode(payloadText).byteLength >
+        MAX_REQUEST_BODY_BYTES
+      ) {
+        setRequestError(
+          "Request body exceeds 32 MiB server limit (reduce attached image size or count).",
+        );
+        return;
+      }
       try {
         reqObj = JSON.parse(payloadText) as Record<string, unknown>;
       } catch (err) {
@@ -408,12 +432,16 @@ export function Playground({
     abortRef.current = controller;
     let timedOut = false;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    const resetIdleTimer = () => {
+    const initialTimeoutMs =
+      endpoint.method !== "GET" && reqObj?.stream !== true
+        ? NON_STREAM_TIMEOUT_MS
+        : REQUEST_IDLE_TIMEOUT_MS;
+    const resetIdleTimer = (ms: number = REQUEST_IDLE_TIMEOUT_MS) => {
       if (idleTimer !== null) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         timedOut = true;
         controller.abort();
-      }, REQUEST_IDLE_TIMEOUT_MS);
+      }, ms);
     };
     const clearIdleTimer = () => {
       if (idleTimer !== null) {
@@ -456,7 +484,7 @@ export function Playground({
     let firstByteMs: number | null = null;
 
     try {
-      resetIdleTimer();
+      resetIdleTimer(initialTimeoutMs);
       const response = await fetch(endpoint.path, {
         method: endpoint.method,
         headers,
@@ -1417,10 +1445,10 @@ function ParameterBar({
 }) {
   const maxTokensKey =
     endpoint.kind === "openai-responses" ? "max_output_tokens" : "max_tokens";
-  const maxTokens =
+  const maxTokensValue =
     typeof body[maxTokensKey] === "number"
-      ? (body[maxTokensKey] as number)
-      : 256;
+      ? String(body[maxTokensKey] as number)
+      : "";
   const temperature =
     typeof body.temperature === "number" ? body.temperature : 0;
   const stream = Boolean(body.stream);
@@ -1451,11 +1479,21 @@ function ParameterBar({
           type="number"
           min={minMaxTokens}
           max={maxTokensLimit}
-          value={maxTokens}
+          placeholder="auto"
+          value={maxTokensValue}
           onChange={(e) => {
+            const raw = e.target.value.trim();
+            if (raw === "" && endpoint.kind !== "anthropic-messages") {
+              onUpdate((curr) => {
+                const next = { ...curr };
+                delete next[maxTokensKey];
+                return next;
+              });
+              return;
+            }
             const val = Math.min(
               maxTokensLimit,
-              Math.max(minMaxTokens, Number(e.target.value) || minMaxTokens),
+              Math.max(minMaxTokens, Number(raw) || minMaxTokens),
             );
             onUpdate((curr) => ({ ...curr, [maxTokensKey]: val }));
           }}
