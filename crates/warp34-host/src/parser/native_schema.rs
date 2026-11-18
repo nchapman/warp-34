@@ -4,7 +4,38 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use xgrammar::{Grammar, functor::grammar_optimizer, parser::EarleyParser};
 
-pub(super) type ValueGrammar = Arc<Grammar>;
+#[derive(Clone, Debug)]
+pub(super) enum ValueGrammar {
+    /// Unconstrained `{"type": "string"}` schema: accepts any `Value::String(_)` in O(1).
+    AnyString,
+    /// Full compiled XGrammar Earley recognizer for constrained or non-string schemas.
+    Compiled(Arc<Grammar>),
+}
+
+/// Returns true when `schema` is a pure `"type": "string"` schema with only annotation
+/// keywords (no `enum`, `const`, `pattern`, `minLength`, `maxLength`, `format`, `anyOf`, etc.).
+pub(super) fn is_unconstrained_string_schema(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    if obj.get("type").and_then(Value::as_str) != Some("string") {
+        return false;
+    }
+    obj.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "type"
+                | "description"
+                | "title"
+                | "default"
+                | "examples"
+                | "$comment"
+                | "deprecated"
+                | "readOnly"
+                | "writeOnly"
+        )
+    })
+}
 
 /// Keep references relative to the original tool schema, including recursive
 /// nested objects. Traverse schema positions only, never const/enum data.
@@ -73,6 +104,9 @@ fn relocate_refs(schema: &Value) -> Value {
 }
 
 pub(super) fn compile(source: &Value, value: &Value) -> Result<ValueGrammar, String> {
+    if is_unconstrained_string_schema(value) {
+        return Ok(ValueGrammar::AnyString);
+    }
     let schema = json!({"$ref":"#/$defs/value", "$defs":{
         "source":relocate_refs(source), "value":relocate_refs(value)
     }});
@@ -80,17 +114,22 @@ pub(super) fn compile(source: &Value, value: &Value) -> Result<ValueGrammar, Str
     // Keep native object requirements rather than using relaxed any-order rules.
     let grammar = Grammar::from_json_schema(&schema.to_string(), true, None, None, true, None)
         .map_err(|e| e.to_string())?;
-    Ok(Arc::new(
+    Ok(ValueGrammar::Compiled(Arc::new(
         grammar_optimizer(&grammar).map_err(|e| e.to_string())?,
-    ))
+    )))
 }
 
 pub(super) fn accepts(value: &Value, grammar: Option<&ValueGrammar>) -> bool {
     let Some(grammar) = grammar else {
         return true;
     };
-    let mut parser = EarleyParser::new(Arc::clone(grammar), None);
-    value.to_string().bytes().all(|byte| parser.advance(byte)) && parser.is_completed()
+    match grammar {
+        ValueGrammar::AnyString => value.is_string(),
+        ValueGrammar::Compiled(grammar) => {
+            let mut parser = EarleyParser::new(Arc::clone(grammar), None);
+            value.to_string().bytes().all(|byte| parser.advance(byte)) && parser.is_completed()
+        }
+    }
 }
 
 #[cfg(test)]

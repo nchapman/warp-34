@@ -652,11 +652,50 @@ pub struct ParsedAssistantTurn {
     pub tool_calls: Vec<ParsedToolCall>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamToolCallDelta {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments_delta: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamParseDelta {
     pub reasoning_delta: Option<String>,
     pub content_delta: Option<String>,
+    pub tool_call_deltas: Vec<StreamToolCallDelta>,
     pub completed_tool_calls: Vec<ParsedToolCall>,
+}
+
+#[derive(Clone, Debug)]
+enum ActiveParamStream {
+    StreamString {
+        value_start: usize,
+        value_scan_pos: usize,
+        skipped_leading_nl: bool,
+    },
+    Buffered {
+        name: String,
+        value_start: usize,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolStreamState {
+    aborted: bool,
+    func_name: Option<String>,
+    header_emitted: bool,
+    cursor: usize,
+    seen_params: Vec<String>,
+    streamed_args: String,
+    active_param: Option<ActiveParamStream>,
+}
+
+enum NativeToolStep {
+    InProgress,
+    Completed(usize),
+    Aborted,
 }
 
 /// Unified Qwen 3.5 / 3.6 / 3.8 reasoning and tool parser (`vllm/parser/qwen3.py` parity).
@@ -679,6 +718,7 @@ pub struct Qwen3Parser {
     next_tool_idx: usize,
     tools: Option<Vec<serde_json::Value>>,
     value_grammars: ToolGrammars,
+    tool_stream: ToolStreamState,
 }
 
 impl Qwen3Parser {
@@ -700,6 +740,7 @@ impl Qwen3Parser {
             next_tool_idx: 0,
             tools: None,
             value_grammars: ToolGrammars::new(),
+            tool_stream: ToolStreamState::default(),
         }
     }
 
@@ -1226,6 +1267,565 @@ impl Qwen3Parser {
         max_keep
     }
 
+    fn escape_json_string_inner(s: &str) -> String {
+        if s.is_empty() {
+            return String::new();
+        }
+        let quoted = serde_json::to_string(s).expect("valid str serializes to JSON");
+        quoted[1..quoted.len() - 1].to_owned()
+    }
+
+    fn push_tool_header_delta(
+        index: usize,
+        id: String,
+        name: String,
+        out: &mut Vec<StreamToolCallDelta>,
+    ) {
+        if let Some(last) = out.last_mut().filter(|d| d.index == index) {
+            if last.id.is_none() {
+                last.id = Some(id);
+            }
+            if last.name.is_none() {
+                last.name = Some(name);
+            }
+        } else {
+            out.push(StreamToolCallDelta {
+                index,
+                id: Some(id),
+                name: Some(name),
+                arguments_delta: None,
+            });
+        }
+    }
+
+    fn push_tool_arg_delta(index: usize, arg_chunk: &str, out: &mut Vec<StreamToolCallDelta>) {
+        if arg_chunk.is_empty() {
+            return;
+        }
+        if let Some(last) = out.last_mut().filter(|d| d.index == index) {
+            last.arguments_delta
+                .get_or_insert_with(String::new)
+                .push_str(arg_chunk);
+        } else {
+            out.push(StreamToolCallDelta {
+                index,
+                id: None,
+                name: None,
+                arguments_delta: Some(arg_chunk.to_owned()),
+            });
+        }
+    }
+
+    fn ensure_tool_header_emitted(&mut self, out: &mut Vec<StreamToolCallDelta>) {
+        if !self.tool_stream.header_emitted
+            && let Some(name) = self.tool_stream.func_name.clone()
+        {
+            self.tool_stream.header_emitted = true;
+            Self::push_tool_header_delta(
+                self.next_tool_idx,
+                format!("call_warp34_{}", self.next_tool_idx),
+                name,
+                out,
+            );
+        }
+    }
+
+    fn emit_streamed_arg_chunk(&mut self, chunk: &str, out: &mut Vec<StreamToolCallDelta>) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.ensure_tool_header_emitted(out);
+        self.tool_stream.streamed_args.push_str(chunk);
+        Self::push_tool_arg_delta(self.next_tool_idx, chunk, out);
+    }
+
+    fn is_unconstrained_string_param(&self, func_name: &str, param_name: &str) -> bool {
+        let Some(tools) = self.tools.as_deref() else {
+            return false;
+        };
+        let Some(schema) = tools
+            .iter()
+            .find(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some(func_name))
+            .and_then(|t| t.pointer("/function/parameters/properties"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|props| props.get(param_name))
+        else {
+            return false;
+        };
+        native_schema::is_unconstrained_string_schema(schema)
+    }
+
+    fn advance_native_tool_stream(
+        &mut self,
+        out_deltas: &mut Vec<StreamToolCallDelta>,
+    ) -> NativeToolStep {
+        if self.tool_stream.aborted {
+            return NativeToolStep::Aborted;
+        }
+        let Some(tools) = self.tools.as_deref() else {
+            return NativeToolStep::Aborted;
+        };
+        if tools.is_empty() {
+            self.tool_stream.aborted = true;
+            return NativeToolStep::Aborted;
+        }
+
+        if self.tool_stream.func_name.is_none() {
+            const PREFIX: &str = "\n<function=";
+            if !self.buffer.starts_with(PREFIX) {
+                if PREFIX.starts_with(&self.buffer) && !self.finishing {
+                    return NativeToolStep::InProgress;
+                }
+                self.tool_stream.aborted = true;
+                return NativeToolStep::Aborted;
+            }
+            let after_prefix = &self.buffer[PREFIX.len()..];
+            let Some(gt_pos) = after_prefix.find('>') else {
+                if after_prefix.contains('\n') || self.finishing {
+                    self.tool_stream.aborted = true;
+                    return NativeToolStep::Aborted;
+                }
+                return NativeToolStep::InProgress;
+            };
+            if gt_pos + 1 >= after_prefix.len() {
+                if self.finishing {
+                    self.tool_stream.aborted = true;
+                    return NativeToolStep::Aborted;
+                }
+                return NativeToolStep::InProgress;
+            }
+            if after_prefix.as_bytes()[gt_pos + 1] != b'\n' {
+                self.tool_stream.aborted = true;
+                return NativeToolStep::Aborted;
+            }
+            let name = &after_prefix[..gt_pos];
+            let is_known = tools.iter().any(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(name)
+            });
+            if !is_known {
+                self.tool_stream.aborted = true;
+                return NativeToolStep::Aborted;
+            }
+            self.tool_stream.func_name = Some(name.to_owned());
+            self.tool_stream.cursor = PREFIX.len() + gt_pos + 2;
+        }
+
+        let func_name = self.tool_stream.func_name.clone().unwrap_or_default();
+
+        loop {
+            if let Some(active) = self.tool_stream.active_param.clone() {
+                match active {
+                    ActiveParamStream::StreamString {
+                        value_start,
+                        mut value_scan_pos,
+                        mut skipped_leading_nl,
+                    } => {
+                        if !skipped_leading_nl {
+                            if self.buffer.len() <= value_start {
+                                if self.finishing {
+                                    self.tool_stream.aborted = true;
+                                    return NativeToolStep::Aborted;
+                                }
+                                return NativeToolStep::InProgress;
+                            }
+                            if self.buffer.as_bytes()[value_start] == b'\n' {
+                                value_scan_pos = value_start + 1;
+                            } else {
+                                value_scan_pos = value_start;
+                            }
+                            skipped_leading_nl = true;
+                        }
+                        let avail = &self.buffer[value_scan_pos..];
+                        if let Some(end_rel) = avail.find("</parameter>") {
+                            let rem_val = &avail[..end_rel];
+                            let to_emit = rem_val.strip_suffix('\n').unwrap_or(rem_val);
+                            let mut chunk = Self::escape_json_string_inner(to_emit);
+                            chunk.push('"');
+                            let next_cursor = value_scan_pos + end_rel + "</parameter>".len();
+                            self.emit_streamed_arg_chunk(&chunk, out_deltas);
+                            self.tool_stream.cursor = next_cursor;
+                            self.tool_stream.active_param = None;
+                            continue;
+                        }
+                        if self.finishing {
+                            self.tool_stream.aborted = true;
+                            return NativeToolStep::Aborted;
+                        }
+                        let keep = Self::longest_tag_prefix_suffix(
+                            avail,
+                            &["\n</parameter>", "</parameter>"],
+                        );
+                        let emit_len = avail.len() - keep;
+                        if emit_len > 0 {
+                            let escaped = Self::escape_json_string_inner(&avail[..emit_len]);
+                            self.emit_streamed_arg_chunk(&escaped, out_deltas);
+                            value_scan_pos += emit_len;
+                        }
+                        self.tool_stream.active_param = Some(ActiveParamStream::StreamString {
+                            value_start,
+                            value_scan_pos,
+                            skipped_leading_nl,
+                        });
+                        return NativeToolStep::InProgress;
+                    }
+                    ActiveParamStream::Buffered { name, value_start } => {
+                        let properties = self
+                            .tools
+                            .as_deref()
+                            .and_then(|t| Self::properties(&self.buffer, t));
+                        let schema = properties.and_then(|p| p.get(&name));
+                        let grammar = self
+                            .value_grammars
+                            .get(&func_name)
+                            .and_then(|g| g.get(&name));
+                        let end_opt = Self::native_parameter_end(
+                            &self.buffer[value_start..],
+                            schema,
+                            grammar,
+                            self.finishing,
+                        );
+                        if let Some(end_rel) = end_opt {
+                            let raw_val = &self.buffer[value_start..value_start + end_rel];
+                            let converted = Self::convert_arg(raw_val, schema, grammar);
+                            if !native_schema::accepts(&converted, grammar) {
+                                self.tool_stream.aborted = true;
+                                return NativeToolStep::Aborted;
+                            }
+                            let val_json =
+                                serde_json::to_string(&converted).unwrap_or_else(|_| "null".into());
+                            let next_cursor = value_start + end_rel + "</parameter>".len();
+                            self.emit_streamed_arg_chunk(&val_json, out_deltas);
+                            self.tool_stream.cursor = next_cursor;
+                            self.tool_stream.active_param = None;
+                            continue;
+                        }
+                        if self.finishing {
+                            self.tool_stream.aborted = true;
+                            return NativeToolStep::Aborted;
+                        }
+                        return NativeToolStep::InProgress;
+                    }
+                }
+            }
+
+            let tail = &self.buffer[self.tool_stream.cursor..];
+            let trimmed_after_ws = tail.trim_start_matches([' ', '\n', '\r', '\t']);
+            let ws_len = tail.len() - trimmed_after_ws.len();
+
+            if trimmed_after_ws.is_empty() {
+                if self.finishing {
+                    self.tool_stream.aborted = true;
+                    return NativeToolStep::Aborted;
+                }
+                return NativeToolStep::InProgress;
+            }
+
+            if let Some(header) = trimmed_after_ws.strip_prefix("<parameter=") {
+                let Some(angle) = header.find('>') else {
+                    if self.finishing
+                        || header
+                            .bytes()
+                            .any(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+                    {
+                        self.tool_stream.aborted = true;
+                        return NativeToolStep::Aborted;
+                    }
+                    return NativeToolStep::InProgress;
+                };
+                let param_name = &header[..angle];
+                if param_name.is_empty()
+                    || param_name.trim() != param_name
+                    || self.tool_stream.seen_params.iter().any(|p| p == param_name)
+                {
+                    self.tool_stream.aborted = true;
+                    return NativeToolStep::Aborted;
+                }
+                let param_name_owned = param_name.to_owned();
+                let val_start = self.tool_stream.cursor + ws_len + "<parameter=".len() + angle + 1;
+                let is_first = self.tool_stream.seen_params.is_empty();
+                self.tool_stream.seen_params.push(param_name_owned.clone());
+                self.tool_stream.cursor = val_start;
+
+                let is_stream_str =
+                    self.is_unconstrained_string_param(&func_name, &param_name_owned);
+                let key_json =
+                    serde_json::to_string(&param_name_owned).expect("param name serializes");
+                let prefix = if is_stream_str {
+                    format!("{}{key_json}:\"", if is_first { "{" } else { "," })
+                } else {
+                    format!("{}{key_json}:", if is_first { "{" } else { "," })
+                };
+                self.emit_streamed_arg_chunk(&prefix, out_deltas);
+                self.tool_stream.active_param = Some(if is_stream_str {
+                    ActiveParamStream::StreamString {
+                        value_start: val_start,
+                        value_scan_pos: val_start,
+                        skipped_leading_nl: false,
+                    }
+                } else {
+                    ActiveParamStream::Buffered {
+                        name: param_name_owned,
+                        value_start: val_start,
+                    }
+                });
+                continue;
+            }
+
+            if "<parameter=".starts_with(trimmed_after_ws) {
+                if self.finishing {
+                    self.tool_stream.aborted = true;
+                    return NativeToolStep::Aborted;
+                }
+                return NativeToolStep::InProgress;
+            }
+
+            const CLOSE_SEQ: &str = "</function>\n</tool_call>";
+            if tail[..ws_len].ends_with('\n') {
+                if trimmed_after_ws.starts_with(CLOSE_SEQ) {
+                    let drain_end = self.tool_stream.cursor + ws_len + CLOSE_SEQ.len();
+                    let closing = if self.tool_stream.seen_params.is_empty() {
+                        "{}"
+                    } else {
+                        "}"
+                    };
+                    self.emit_streamed_arg_chunk(closing, out_deltas);
+                    return NativeToolStep::Completed(drain_end);
+                }
+                if CLOSE_SEQ.starts_with(trimmed_after_ws) {
+                    if self.finishing {
+                        self.tool_stream.aborted = true;
+                        return NativeToolStep::Aborted;
+                    }
+                    return NativeToolStep::InProgress;
+                }
+            }
+
+            self.tool_stream.aborted = true;
+            return NativeToolStep::Aborted;
+        }
+    }
+
+    fn advance_legacy_tool_stream(&mut self, out_deltas: &mut Vec<StreamToolCallDelta>) {
+        if self.tool_stream.aborted || self.tools.is_some() {
+            return;
+        }
+        if self.tool_stream.func_name.is_none() {
+            let trimmed = self.buffer.trim_start_matches([' ', '\n', '\r', '\t']);
+            if trimmed.is_empty() {
+                return;
+            }
+            if !trimmed.starts_with('<') {
+                self.tool_stream.aborted = true;
+                return;
+            }
+            let after_lt = trimmed[1..].trim_start_matches([' ', '\n', '\r', '\t']);
+            if after_lt.is_empty() {
+                return;
+            }
+            let Some(after_func) = after_lt.strip_prefix("function") else {
+                if !"function".starts_with(after_lt) {
+                    self.tool_stream.aborted = true;
+                }
+                return;
+            };
+            let after_func_ws = after_func.trim_start_matches([' ', '\n', '\r', '\t']);
+            if after_func_ws.is_empty() {
+                return;
+            }
+            if !after_func_ws.starts_with('=') {
+                self.tool_stream.aborted = true;
+                return;
+            }
+            let after_eq = &after_func_ws[1..];
+            let Some(close_angle) = after_eq.find('>') else {
+                return;
+            };
+            let fn_name = after_eq[..close_angle].trim().to_string();
+            if fn_name.is_empty() {
+                self.tool_stream.aborted = true;
+                return;
+            }
+            let eq_offset = self.buffer.len() - after_eq.len();
+            self.tool_stream.cursor = eq_offset + close_angle + 1;
+            self.tool_stream.func_name = Some(fn_name);
+            self.ensure_tool_header_emitted(out_deltas);
+        }
+
+        loop {
+            if let Some(active) = self.tool_stream.active_param.clone() {
+                match active {
+                    ActiveParamStream::StreamString {
+                        value_start,
+                        mut value_scan_pos,
+                        mut skipped_leading_nl,
+                    } => {
+                        if !skipped_leading_nl {
+                            if self.buffer.len() <= value_start {
+                                return;
+                            }
+                            if self.buffer.as_bytes()[value_start] == b'\n' {
+                                value_scan_pos = value_start + 1;
+                            } else {
+                                value_scan_pos = value_start;
+                            }
+                            skipped_leading_nl = true;
+                        }
+                        let avail = &self.buffer[value_scan_pos..];
+                        let close_param = Self::find_tool_delimiter(avail, "</parameter>");
+                        let next_param = Self::find_tool_delimiter(avail, "<parameter=");
+                        let close_fn = Self::find_tool_delimiter(avail, "</function>");
+                        let close_tc = Self::find_tool_delimiter(avail, Self::TOOL_END);
+                        let earliest_delim = [
+                            close_param.map(|p| (p, true)),
+                            next_param.map(|p| (p, false)),
+                            close_fn.map(|p| (p, false)),
+                            close_tc.map(|p| (p, false)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|&(pos, _)| pos);
+
+                        if let Some((end_rel, is_close_param)) = earliest_delim {
+                            let tag_advance = if is_close_param {
+                                let Some(gt_rel) = avail[end_rel..].find('>') else {
+                                    return;
+                                };
+                                end_rel + gt_rel + 1
+                            } else {
+                                end_rel
+                            };
+                            let rem_val = &avail[..end_rel];
+                            let to_emit = rem_val.strip_suffix('\n').unwrap_or(rem_val);
+                            let mut chunk = Self::escape_json_string_inner(to_emit);
+                            chunk.push('"');
+                            let next_cursor = value_scan_pos + tag_advance;
+                            self.emit_streamed_arg_chunk(&chunk, out_deltas);
+                            self.tool_stream.cursor = next_cursor;
+                            self.tool_stream.active_param = None;
+                            if is_close_param {
+                                continue;
+                            }
+                            return;
+                        }
+
+                        let unclosed_lt = avail.rfind('<').filter(|&lt| !avail[lt..].contains('>'));
+                        let hold_from = match unclosed_lt {
+                            Some(lt) if lt > 0 && avail.as_bytes()[lt - 1] == b'\n' => lt - 1,
+                            Some(lt) => lt,
+                            None if avail.ends_with('\n') => avail.len() - 1,
+                            None => avail.len(),
+                        };
+                        if hold_from > 0 {
+                            let escaped = Self::escape_json_string_inner(&avail[..hold_from]);
+                            self.emit_streamed_arg_chunk(&escaped, out_deltas);
+                            value_scan_pos += hold_from;
+                        }
+                        self.tool_stream.active_param = Some(ActiveParamStream::StreamString {
+                            value_start,
+                            value_scan_pos,
+                            skipped_leading_nl,
+                        });
+                        return;
+                    }
+                    ActiveParamStream::Buffered {
+                        name: _,
+                        value_start,
+                    } => {
+                        let avail = &self.buffer[value_start..];
+                        if let Some(end_rel) = Self::find_tool_delimiter(avail, "</parameter>")
+                            && let Some(gt_rel) = avail[end_rel..].find('>')
+                        {
+                            let raw_val = &avail[..end_rel];
+                            let trimmed = Self::trim_wrapping_newlines(raw_val);
+                            let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
+                                .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+                            let val_json =
+                                serde_json::to_string(&json_val).unwrap_or_else(|_| "null".into());
+                            let next_cursor = value_start + end_rel + gt_rel + 1;
+                            self.emit_streamed_arg_chunk(&val_json, out_deltas);
+                            self.tool_stream.cursor = next_cursor;
+                            self.tool_stream.active_param = None;
+                            continue;
+                        }
+                        return;
+                    }
+                }
+            }
+
+            let tail = &self.buffer[self.tool_stream.cursor..];
+            let Some(p_rel) = Self::find_tool_delimiter(tail, "<parameter=") else {
+                return;
+            };
+            let close_fn = Self::find_tool_delimiter(tail, "</function>");
+            let close_tc = Self::find_tool_delimiter(tail, Self::TOOL_END);
+            if close_fn.is_some_and(|fn_pos| fn_pos < p_rel)
+                || close_tc.is_some_and(|tc_pos| tc_pos < p_rel)
+            {
+                return;
+            }
+            let after_p = &tail[p_rel..];
+            let Some(eq_pos) = after_p.find('=') else {
+                return;
+            };
+            let Some(gt_pos) = after_p[eq_pos + 1..].find('>') else {
+                return;
+            };
+            let param_name = after_p[eq_pos + 1..eq_pos + 1 + gt_pos].trim().to_string();
+            if param_name.is_empty()
+                || self
+                    .tool_stream
+                    .seen_params
+                    .iter()
+                    .any(|p| p == &param_name)
+            {
+                self.tool_stream.aborted = true;
+                return;
+            }
+            let val_start = self.tool_stream.cursor + p_rel + eq_pos + 1 + gt_pos + 1;
+            if self.buffer.len() <= val_start {
+                return;
+            }
+            let first_idx = if self.buffer.as_bytes()[val_start] == b'\n' {
+                if self.buffer.len() <= val_start + 1 {
+                    return;
+                }
+                val_start + 1
+            } else {
+                val_start
+            };
+            let first_b = self.buffer.as_bytes()[first_idx];
+            let is_stream_str = !matches!(
+                first_b,
+                b'"' | b'{' | b'[' | b'0'
+                    ..=b'9' | b'-' | b't' | b'f' | b'n' | b' ' | b'\t' | b'\r' | b'\n' | b'<'
+            );
+            let is_first = self.tool_stream.seen_params.is_empty();
+            self.tool_stream.seen_params.push(param_name.clone());
+            self.tool_stream.cursor = val_start;
+            let key_json = serde_json::to_string(&param_name).expect("param name serializes");
+            let prefix = if is_stream_str {
+                format!("{}{key_json}:\"", if is_first { "{" } else { "," })
+            } else {
+                format!("{}{key_json}:", if is_first { "{" } else { "," })
+            };
+            self.emit_streamed_arg_chunk(&prefix, out_deltas);
+            self.tool_stream.active_param = Some(if is_stream_str {
+                ActiveParamStream::StreamString {
+                    value_start: val_start,
+                    value_scan_pos: val_start,
+                    skipped_leading_nl: false,
+                }
+            } else {
+                ActiveParamStream::Buffered {
+                    name: param_name,
+                    value_start: val_start,
+                }
+            });
+        }
+    }
+
     fn push_content_slice(&mut self, raw: &str, c_out: &mut String) {
         let text = if self.content_accum.is_empty() {
             raw.trim_start_matches('\n')
@@ -1250,6 +1850,32 @@ impl Qwen3Parser {
 
         loop {
             if self.in_tool_call {
+                if self.tools.is_some() {
+                    match self.advance_native_tool_stream(&mut delta.tool_call_deltas) {
+                        NativeToolStep::InProgress => break,
+                        NativeToolStep::Completed(drain_end) => {
+                            let tc = ParsedToolCall {
+                                id: format!("call_warp34_{}", self.next_tool_idx),
+                                call_type: "function".to_string(),
+                                function: ParsedFunctionCall {
+                                    name: self.tool_stream.func_name.take().unwrap_or_default(),
+                                    arguments: std::mem::take(&mut self.tool_stream.streamed_args),
+                                },
+                            };
+                            self.next_tool_idx += 1;
+                            self.tool_calls.push(tc.clone());
+                            delta.completed_tool_calls.push(tc);
+                            self.buffer.drain(..drain_end);
+                            self.in_tool_call = false;
+                            self.tool_stream = ToolStreamState::default();
+                            continue;
+                        }
+                        NativeToolStep::Aborted => {}
+                    }
+                } else {
+                    self.advance_legacy_tool_stream(&mut delta.tool_call_deltas);
+                }
+
                 let properties = self
                     .tools
                     .as_deref()
@@ -1280,17 +1906,43 @@ impl Qwen3Parser {
                         &self.value_grammars,
                         self.finishing,
                     ) {
+                        if !self.tool_stream.header_emitted {
+                            Self::push_tool_header_delta(
+                                self.next_tool_idx,
+                                tc.id.clone(),
+                                tc.function.name.clone(),
+                                &mut delta.tool_call_deltas,
+                            );
+                            Self::push_tool_arg_delta(
+                                self.next_tool_idx,
+                                &tc.function.arguments,
+                                &mut delta.tool_call_deltas,
+                            );
+                        } else if let Some(rem) = tc
+                            .function
+                            .arguments
+                            .strip_prefix(&self.tool_stream.streamed_args)
+                        {
+                            Self::push_tool_arg_delta(
+                                self.next_tool_idx,
+                                rem,
+                                &mut delta.tool_call_deltas,
+                            );
+                        }
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
                         delta.completed_tool_calls.push(tc);
                     } else {
                         // Unrecognized envelopes remain text rather than being dispatched or lost.
                         let content = format!("{}{}", Self::TOOL_START, &self.buffer[..drain_end]);
-                        c_out.push_str(&content);
+                        if !self.tool_stream.header_emitted {
+                            c_out.push_str(&content);
+                        }
                         self.content_accum.push_str(&content);
                     }
                     self.buffer.drain(..drain_end);
                     self.in_tool_call = false;
+                    self.tool_stream = ToolStreamState::default();
                     continue;
                 }
                 break;
@@ -1316,6 +1968,7 @@ impl Qwen3Parser {
                         self.buffer.drain(..ts + Self::TOOL_START.len());
                         self.in_reasoning = false;
                         self.in_tool_call = true;
+                        self.tool_stream = ToolStreamState::default();
                     }
                     (Some(te), _) => {
                         let text = &self.buffer[..te];
@@ -1331,6 +1984,7 @@ impl Qwen3Parser {
                         self.buffer.drain(..ts + Self::TOOL_START.len());
                         self.in_reasoning = false;
                         self.in_tool_call = true;
+                        self.tool_stream = ToolStreamState::default();
                     }
                     (None, None) => {
                         let keep = Self::longest_tag_prefix_suffix(
@@ -1384,6 +2038,7 @@ impl Qwen3Parser {
                     _ => {
                         self.buffer.drain(..pos + Self::TOOL_START.len());
                         self.in_tool_call = true;
+                        self.tool_stream = ToolStreamState::default();
                     }
                 }
                 continue;
@@ -1422,11 +2077,14 @@ impl Qwen3Parser {
                 // delimiter inside an unfinished JSON string is not a close tag.
                 let fallback = format!("{}{rem}", Self::TOOL_START);
                 self.content_accum.push_str(&fallback);
-                delta
-                    .content_delta
-                    .get_or_insert_default()
-                    .push_str(&fallback);
+                if !self.tool_stream.header_emitted {
+                    delta
+                        .content_delta
+                        .get_or_insert_default()
+                        .push_str(&fallback);
+                }
                 self.in_tool_call = false;
+                self.tool_stream = ToolStreamState::default();
             } else if self.in_reasoning {
                 self.reasoning_accum.push_str(&rem);
                 delta.reasoning_delta.get_or_insert_default().push_str(&rem);
@@ -1907,6 +2565,205 @@ mod tests {
                         ),
                         text
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_tool_call_deltas_stream_token_by_token_and_match_completed_turn() {
+        use serde_json::json;
+        let tools = vec![
+            json!({"function":{"name":"write","parameters":{
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string","description":"target path"},
+                    "content":{"type":"string","description":"file contents"}
+                }
+            }}}),
+            json!({"function":{"name":"read","parameters":{
+                "type":"object",
+                "properties":{
+                    "path":{"type":"string"},
+                    "offset":{"type":"integer"},
+                    "raw":{"type":"boolean"},
+                    "meta":{"type":"object","properties":{"tag":{"type":"string"}}},
+                    "note":{"type":"string"}
+                }
+            }}}),
+            json!({"function":{"name":"ping","parameters":{
+                "type":"object","properties":{}
+            }}}),
+        ];
+
+        let stream = concat!(
+            "<think>Planning scene update...</think>\n\n",
+            "<tool_call>\n<function=write>\n",
+            "<parameter=path>\nsrc/scene.js\n</parameter>\n",
+            "<parameter=content>\n",
+            "const msg = \"hello \\\\ 🦀 </function> </tool_call> \\n </param still string\";\n",
+            "export default msg;\n",
+            "</parameter>\n",
+            "</function>\n</tool_call>\n",
+            "<tool_call>\n<function=read>\n",
+            "<parameter=path>src/scene.js</parameter>\n",
+            "<parameter=offset>\n10\n</parameter>\n",
+            "<parameter=raw>true</parameter>\n",
+            "<parameter=meta>{\"tag\":\"v1\"}</parameter>\n",
+            "<parameter=note>\n</parameter>\n",
+            "</function>\n</tool_call>\n",
+            "<tool_call>\n<function=ping>\n\n</function>\n</tool_call>"
+        );
+
+        for chunk_chars in [1usize, 2, 3, 5, 13, stream.len()] {
+            let mut parser = Qwen3Parser::with_tools(true, &tools).unwrap();
+            let mut deltas = Vec::new();
+            let mut streamed_so_far = String::new();
+            let mut saw_mid_content_stream = false;
+            let chars: Vec<char> = stream.chars().collect();
+            for piece in chars.chunks(chunk_chars) {
+                let s: String = piece.iter().collect();
+                let d = parser.push_str(&s);
+                for tc in &d.tool_call_deltas {
+                    if tc.index == 0
+                        && let Some(a) = tc.arguments_delta.as_deref()
+                    {
+                        streamed_so_far.push_str(a);
+                    }
+                }
+                if d.completed_tool_calls.is_empty()
+                    && streamed_so_far.contains("export default msg;")
+                {
+                    saw_mid_content_stream = true;
+                }
+                deltas.extend(d.tool_call_deltas);
+            }
+            let (final_d, turn) = parser.finish();
+            deltas.extend(final_d.tool_call_deltas);
+
+            if chunk_chars <= 5 {
+                assert!(
+                    saw_mid_content_stream,
+                    "expected content parameter to stream before </tool_call> for chunk_chars={chunk_chars}"
+                );
+            }
+            assert_eq!(turn.tool_calls.len(), 3);
+            for (idx, completed) in turn.tool_calls.iter().enumerate() {
+                let for_idx: Vec<&StreamToolCallDelta> =
+                    deltas.iter().filter(|d| d.index == idx).collect();
+                assert!(!for_idx.is_empty(), "missing deltas for tool {idx}");
+                assert_eq!(for_idx[0].id.as_deref(), Some(completed.id.as_str()));
+                assert_eq!(
+                    for_idx[0].name.as_deref(),
+                    Some(completed.function.name.as_str())
+                );
+                for later in &for_idx[1..] {
+                    assert_eq!(later.id, None);
+                    assert_eq!(later.name, None);
+                }
+                let joined_args: String = for_idx
+                    .iter()
+                    .filter_map(|d| d.arguments_delta.as_deref())
+                    .collect();
+                assert_eq!(
+                    joined_args, completed.function.arguments,
+                    "chunk_chars={chunk_chars} tool={idx}"
+                );
+            }
+        }
+
+        // Verify legacy tool-less Qwen3Parser::new also streams string parameters incrementally.
+        let legacy_stream = concat!(
+            "<tool_call>\n<function=write>\n",
+            "<parameter=path>\nsrc/scene.js\n</parameter>\n",
+            "<parameter=count>\n42\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let mut legacy_parser = Qwen3Parser::new(false);
+        let mut legacy_deltas = Vec::new();
+        let mut legacy_so_far = String::new();
+        let mut saw_mid_legacy_path = false;
+        for ch in legacy_stream.chars() {
+            let d = legacy_parser.push_str(&ch.to_string());
+            for tc in &d.tool_call_deltas {
+                if let Some(a) = tc.arguments_delta.as_deref() {
+                    legacy_so_far.push_str(a);
+                }
+            }
+            if d.completed_tool_calls.is_empty() && legacy_so_far.contains("src/scene.js") {
+                saw_mid_legacy_path = true;
+            }
+            legacy_deltas.extend(d.tool_call_deltas);
+        }
+        let (final_d, legacy_turn) = legacy_parser.finish();
+        legacy_deltas.extend(final_d.tool_call_deltas);
+        assert!(saw_mid_legacy_path);
+        assert_eq!(legacy_turn.tool_calls.len(), 1);
+        let joined_legacy: String = legacy_deltas
+            .iter()
+            .filter_map(|d| d.arguments_delta.as_deref())
+            .collect();
+        assert_eq!(joined_legacy, legacy_turn.tool_calls[0].function.arguments);
+        assert_eq!(joined_legacy, r#"{"path":"src/scene.js","count":42}"#);
+    }
+
+    #[test]
+    fn incremental_tool_call_deltas_newline_and_delimiter_holdback_matrix() {
+        use serde_json::json;
+        let tools = vec![json!({"function":{"name":"echo","parameters":{
+            "type":"object",
+            "properties":{
+                "v":{"type":"string"},
+                "c":{"const":"before</parameter>after"}
+            }
+        }}})];
+        for (raw_body, expected_json) in [
+            ("<parameter=v></parameter>", r#"{"v":""}"#),
+            ("<parameter=v>\n</parameter>", r#"{"v":""}"#),
+            ("<parameter=v>\n\n</parameter>", r#"{"v":""}"#),
+            ("<parameter=v>\n\n\n</parameter>", r#"{"v":"\n"}"#),
+            (
+                "<parameter=v>\n\nParis\n\n</parameter>",
+                r#"{"v":"\nParis\n"}"#,
+            ),
+            (
+                "<parameter=v>hello\n</param\nworld\n</parameter>",
+                r#"{"v":"hello\n</param\nworld"}"#,
+            ),
+            (
+                "<parameter=v>before</tool_call></function>after</parameter>",
+                r#"{"v":"before</tool_call></function>after"}"#,
+            ),
+            (
+                "<parameter=c>before</parameter>after</parameter>",
+                r#"{"c":"before</parameter>after"}"#,
+            ),
+        ] {
+            let text =
+                format!("<tool_call>\n<function=echo>\n{raw_body}\n</function>\n</tool_call>");
+            for s1 in 0..=text.len() {
+                for s2 in s1..=text.len() {
+                    let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+                    let d1 = parser.push_str(&text[..s1]);
+                    let d2 = parser.push_str(&text[s1..s2]);
+                    let d3 = parser.push_str(&text[s2..]);
+                    let (df, turn) = parser.finish();
+                    assert_eq!(turn.tool_calls.len(), 1, "{text:?} ({s1}, {s2})");
+                    assert_eq!(turn.tool_calls[0].function.arguments, expected_json);
+                    let all_deltas: Vec<StreamToolCallDelta> = d1
+                        .tool_call_deltas
+                        .into_iter()
+                        .chain(d2.tool_call_deltas)
+                        .chain(d3.tool_call_deltas)
+                        .chain(df.tool_call_deltas)
+                        .collect();
+                    assert_eq!(all_deltas[0].id.as_deref(), Some("call_warp34_0"));
+                    assert_eq!(all_deltas[0].name.as_deref(), Some("echo"));
+                    let joined: String = all_deltas
+                        .iter()
+                        .filter_map(|d| d.arguments_delta.as_deref())
+                        .collect();
+                    assert_eq!(joined, expected_json, "{text:?} ({s1}, {s2})");
                 }
             }
         }

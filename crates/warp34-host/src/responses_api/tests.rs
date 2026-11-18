@@ -225,6 +225,76 @@ fn sse_formatter_emits_monotonic_zero_indexed_sequence_numbers() {
 }
 
 #[test]
+fn responses_sse_streams_incremental_function_call_deltas_without_duplication() {
+    let store = ResponseStore::default();
+    let req = json!({"input": "Write src/scene.js"});
+    let (_, meta) = translate_responses_to_chat(&req, "qwen-test", &store, None, 8).unwrap();
+    let tools = vec![json!({"function":{"name":"write","parameters":{
+        "type":"object",
+        "properties":{
+            "path":{"type":"string"},
+            "content":{"type":"string"}
+        }
+    }}})];
+    let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let mut frames = sse.start();
+
+    let f1 =
+        sse.push_delta(parser.push_str("<tool_call>\n<function=write>\n<parameter=path>\nsrc/"));
+    assert!(
+        f1.iter().any(|(n, v)| n == "response.output_item.added"
+            && v["item"]["type"] == "function_call"
+            && v["item"]["name"] == "write"),
+        "expected function_call output_item.added before tool_call closes: {f1:?}"
+    );
+    assert!(
+        f1.iter()
+            .any(|(n, _)| n == "response.function_call_arguments.delta"),
+        "expected function_call_arguments.delta on first chunk: {f1:?}"
+    );
+    assert!(
+        !f1.iter()
+            .any(|(n, _)| n == "response.function_call_arguments.done"),
+        "function_call must remain open while streaming arguments"
+    );
+    frames.extend(f1);
+
+    for chunk in [
+        "scene.js\n</parameter>\n<parameter=content>\nconst a = 1;",
+        "\nconst b = 2;\n</parameter>\n</function>\n</tool_call>",
+    ] {
+        frames.extend(sse.push_delta(parser.push_str(chunk)));
+    }
+    let (tail, turn) = parser.finish();
+    frames.extend(sse.push_delta(tail));
+    let (end_frames, final_resp, _) = sse.finish(&turn, "tool_calls", 20, 10, 15, 0);
+    assert!(
+        !end_frames
+            .iter()
+            .any(|(n, _)| n == "response.output_item.added"),
+        "finish() emitted duplicate output_item.added: {end_frames:?}"
+    );
+    frames.extend(end_frames);
+
+    let fc_added = frames
+        .iter()
+        .filter(|(n, v)| n == "response.output_item.added" && v["item"]["type"] == "function_call")
+        .count();
+    assert_eq!(fc_added, 1);
+
+    let joined_deltas: String = frames
+        .iter()
+        .filter(|(n, _)| n == "response.function_call_arguments.delta")
+        .filter_map(|(_, v)| v["delta"].as_str())
+        .collect();
+    let expected = r#"{"path":"src/scene.js","content":"const a = 1;\nconst b = 2;"}"#;
+    assert_eq!(joined_deltas, expected);
+    assert_eq!(final_resp["output"].as_array().unwrap().len(), 1);
+    assert_eq!(final_resp["output"][0]["arguments"], expected);
+}
+
+#[test]
 fn response_store_cancellation_deletion_and_lru_limits() {
     let store = ResponseStore::with_capacity(3);
     let flag = Arc::new(AtomicBool::new(false));

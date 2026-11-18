@@ -913,7 +913,33 @@ fn delta_value(d: StreamParseDelta, tool_index: &mut usize) -> Value {
     if let Some(text) = d.content_delta {
         value["content"] = json!(text);
     }
-    if !d.completed_tool_calls.is_empty() {
+    if !d.tool_call_deltas.is_empty() {
+        value["tool_calls"] = json!(
+            d.tool_call_deltas
+                .into_iter()
+                .map(|tc| {
+                    *tool_index = (*tool_index).max(tc.index + 1);
+                    let mut fn_obj = serde_json::Map::new();
+                    if let Some(name) = tc.name {
+                        fn_obj.insert("name".into(), json!(name));
+                    }
+                    if let Some(args) = tc.arguments_delta {
+                        fn_obj.insert("arguments".into(), json!(args));
+                    } else if fn_obj.contains_key("name") {
+                        fn_obj.insert("arguments".into(), json!(""));
+                    }
+                    let mut item = serde_json::Map::new();
+                    item.insert("index".into(), json!(tc.index));
+                    if let Some(id) = tc.id {
+                        item.insert("id".into(), json!(id));
+                        item.insert("type".into(), json!("function"));
+                    }
+                    item.insert("function".into(), Value::Object(fn_obj));
+                    Value::Object(item)
+                })
+                .collect::<Vec<_>>()
+        );
+    } else if !d.completed_tool_calls.is_empty() {
         value["tool_calls"] = json!(
             d.completed_tool_calls
                 .into_iter()
@@ -1989,7 +2015,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
 
 #[cfg(test)]
 mod tests {
-    use super::{StopBuffer, admission_error, to_anthropic_err, worker_api_err};
+    use super::{Qwen3Parser, StopBuffer, admission_error, json, to_anthropic_err, worker_api_err};
     use crate::engine_worker::WorkerError;
     use axum::http::StatusCode;
 
@@ -2164,5 +2190,55 @@ mod tests {
         let (ast, abody) = to_anthropic_err((st, body));
         assert_eq!(ast, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(abody.0["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn chat_completions_delta_value_streams_incremental_tool_call_chunks() {
+        let tools = vec![json!({"function":{"name":"write","parameters":{
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "content":{"type":"string"}
+            }
+        }}})];
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut tool_index = 0usize;
+        let mut chunks = Vec::new();
+        for piece in [
+            "<tool_call>\n<function=write>\n<parameter=path>\nsrc/",
+            "scene.js\n</parameter>\n<parameter=content>\nhello",
+            " world\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            let v = super::delta_value(parser.push_str(piece), &mut tool_index);
+            if v != json!({}) {
+                chunks.push(v);
+            }
+        }
+        let (final_d, turn) = parser.finish();
+        let vf = super::delta_value(final_d, &mut tool_index);
+        if vf != json!({}) {
+            chunks.push(vf);
+        }
+        assert_eq!(tool_index, 1);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunks[0]["tool_calls"][0]["id"], "call_warp34_0");
+        assert_eq!(chunks[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(chunks[0]["tool_calls"][0]["function"]["name"], "write");
+        for later in &chunks[1..] {
+            assert_eq!(later["tool_calls"][0]["index"], 0);
+            assert!(later["tool_calls"][0].get("id").is_none());
+            assert!(later["tool_calls"][0].get("type").is_none());
+            assert!(later["tool_calls"][0]["function"].get("name").is_none());
+        }
+        let joined_args: String = chunks
+            .iter()
+            .filter_map(|c| c["tool_calls"][0]["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(joined_args, turn.tool_calls[0].function.arguments);
+        assert_eq!(
+            joined_args,
+            r#"{"path":"src/scene.js","content":"hello world"}"#
+        );
     }
 }

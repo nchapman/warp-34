@@ -777,12 +777,16 @@ pub fn translate_anthropic_to_chat(
     Ok((Value::Object(chat_req), meta))
 }
 
-fn tool_id_for(message_id: &str, tc: &ParsedToolCall, idx: usize) -> String {
-    if let Some(rest) = tc.id.strip_prefix("toolu_") {
+fn tool_id_for_raw(message_id: &str, raw_id: &str, idx: usize) -> String {
+    if let Some(rest) = raw_id.strip_prefix("toolu_") {
         return format!("toolu_{rest}");
     }
     let suffix = message_id.strip_prefix("msg_").unwrap_or(message_id);
     format!("toolu_{suffix}_{idx}")
+}
+
+fn tool_id_for(message_id: &str, tc: &ParsedToolCall, idx: usize) -> String {
+    tool_id_for_raw(message_id, &tc.id, idx)
 }
 
 fn parse_tool_input_object(arguments: &str) -> Value {
@@ -872,8 +876,17 @@ pub fn build_anthropic_message(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveBlock {
     None,
-    Thinking { index: usize },
-    Text { index: usize },
+    Thinking {
+        index: usize,
+    },
+    Text {
+        index: usize,
+    },
+    ToolUse {
+        index: usize,
+        tool_index: usize,
+        emitted_delta: bool,
+    },
 }
 
 /// Deterministic SSE state machine for `POST /v1/messages` (`stream: true`).
@@ -946,6 +959,33 @@ impl AnthropicSseFormatter {
                 self.active = ActiveBlock::None;
             }
             ActiveBlock::Text { index } => {
+                out.push((
+                    "content_block_stop".into(),
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index,
+                    }),
+                ));
+                self.active = ActiveBlock::None;
+            }
+            ActiveBlock::ToolUse {
+                index,
+                emitted_delta,
+                ..
+            } => {
+                if !emitted_delta {
+                    out.push((
+                        "content_block_delta".into(),
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": "{}",
+                            }
+                        }),
+                    ));
+                }
                 out.push((
                     "content_block_stop".into(),
                     json!({
@@ -1080,8 +1120,74 @@ impl AnthropicSseFormatter {
             ));
         }
 
-        for tc in &delta.completed_tool_calls {
-            self.emit_tool_block(tc, &mut out);
+        if !delta.tool_call_deltas.is_empty() {
+            for tc_delta in &delta.tool_call_deltas {
+                let index = match self.active {
+                    ActiveBlock::ToolUse {
+                        index, tool_index, ..
+                    } if tool_index == tc_delta.index => index,
+                    _ => {
+                        self.close_active(&mut out);
+                        let index = self.next_block_index;
+                        self.next_block_index += 1;
+                        let tool_idx = self.next_tool_index;
+                        self.next_tool_index += 1;
+                        let id = tool_id_for_raw(
+                            &self.meta.message_id,
+                            tc_delta.id.as_deref().unwrap_or(""),
+                            tool_idx,
+                        );
+                        out.push((
+                            "content_block_start".into(),
+                            json!({
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": id,
+                                    "name": tc_delta.name.clone().unwrap_or_default(),
+                                    "input": {},
+                                }
+                            }),
+                        ));
+                        self.active = ActiveBlock::ToolUse {
+                            index,
+                            tool_index: tc_delta.index,
+                            emitted_delta: false,
+                        };
+                        index
+                    }
+                };
+                if let Some(arg_chunk) = tc_delta
+                    .arguments_delta
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    if let ActiveBlock::ToolUse { emitted_delta, .. } = &mut self.active {
+                        *emitted_delta = true;
+                    }
+                    out.push((
+                        "content_block_delta".into(),
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": arg_chunk,
+                            }
+                        }),
+                    ));
+                }
+            }
+            if !delta.completed_tool_calls.is_empty()
+                && matches!(self.active, ActiveBlock::ToolUse { .. })
+            {
+                self.close_active(&mut out);
+            }
+        } else {
+            for tc in &delta.completed_tool_calls {
+                self.emit_tool_block(tc, &mut out);
+            }
         }
 
         out
@@ -1283,6 +1389,82 @@ mod tests {
         assert_eq!(sync_msg["content"][1]["type"], "text");
         assert_eq!(sync_msg["content"][2]["type"], "tool_use");
         assert_eq!(sync_msg["content"][2]["input"]["host"], "127.0.0.1");
+    }
+
+    #[test]
+    fn anthropic_sse_streams_incremental_tool_use_deltas_without_duplication() {
+        let tools = vec![json!({"function":{"name":"write","parameters":{
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "content":{"type":"string"}
+            }
+        }}})];
+        let req = json!({
+            "model": "qwen",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "Write file"}]
+        });
+        let (_, meta) = translate_anthropic_to_chat(&req, "qwen", 10, true).unwrap();
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut sse = AnthropicSseFormatter::new(meta, 50);
+
+        // Chunk 1 opens tool_call and streams start of `path` before `</parameter>`
+        let ev1 = sse.push_delta(
+            parser.push_str("<tool_call>\n<function=write>\n<parameter=path>\nsrc/"),
+            10,
+        );
+        assert!(
+            ev1.iter().any(|(n, v)| n == "content_block_start"
+                && v["content_block"]["type"] == "tool_use"
+                && v["content_block"]["name"] == "write"),
+            "expected tool_use content_block_start before tool_call completes: {ev1:?}"
+        );
+        assert!(
+            ev1.iter().any(
+                |(n, v)| n == "content_block_delta" && v["delta"]["type"] == "input_json_delta"
+            ),
+            "expected input_json_delta on first chunk: {ev1:?}"
+        );
+        assert!(
+            !ev1.iter().any(|(n, _)| n == "content_block_stop"),
+            "tool_use block must stay open while streaming arguments"
+        );
+
+        let mut all_events = ev1;
+        for chunk in [
+            "scene.js\n</parameter>\n<parameter=content>\nconst x = 1;",
+            "\nexport default x;\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            all_events.extend(sse.push_delta(parser.push_str(chunk), 10));
+        }
+        let (tail, turn) = parser.finish();
+        all_events.extend(sse.push_delta(tail, 10));
+        let finish_events = sse.finish(&turn, "tool_calls", None, 10, 30);
+        // finish() must not emit a duplicate tool_use block.
+        assert!(
+            !finish_events
+                .iter()
+                .any(|(n, _)| n == "content_block_start"),
+            "finish() emitted duplicate content_block_start: {finish_events:?}"
+        );
+        all_events.extend(finish_events);
+
+        let tool_starts = all_events
+            .iter()
+            .filter(|(n, v)| n == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .count();
+        assert_eq!(tool_starts, 1);
+
+        let joined_json: String = all_events
+            .iter()
+            .filter(|(n, v)| n == "content_block_delta" && v["delta"]["type"] == "input_json_delta")
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(
+            joined_json,
+            r#"{"path":"src/scene.js","content":"const x = 1;\nexport default x;"}"#
+        );
     }
 
     #[test]
