@@ -8,6 +8,8 @@ mod decision_http;
 #[cfg(feature = "cuda")]
 mod http;
 #[cfg(feature = "cuda")]
+mod request_log;
+#[cfg(feature = "cuda")]
 pub use http::*;
 
 /// Deployment controls shared by the CLI, HTTP server, and engine ingress.

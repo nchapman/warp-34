@@ -142,8 +142,19 @@ pub struct WaitingReq {
     pub lora_id: i32,
 }
 
+/// Snapshot of the initial radix probe and the prefix actually used at admission.
+#[derive(serde::Serialize, Debug, Default, Clone, Copy)]
+pub struct CacheLookup {
+    pub lookup_tokens: usize,
+    pub kv_matched_tokens: usize,
+    pub checkpoint_tokens: usize,
+    pub restored_tokens: usize,
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug)]
 pub struct SeqEntry {
+    pub cache_lookup: CacheLookup,
     pub req_id: u64,
     pub prompt_tokens: Vec<i32>,
     pub radix_key_tokens: Vec<i32>,
@@ -410,7 +421,7 @@ impl SchedulerV1 {
         self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
-            let (lookup_len, mut match_res, pinned_hit, unshareable) = {
+            let (mut cache_lookup, mut match_res, pinned_hit, unshareable) = {
                 let Some(w) = self.waiting.front() else {
                     break;
                 };
@@ -426,6 +437,31 @@ impl SchedulerV1 {
                     .max_prefix_lookup_len
                     .map_or(default_lookup, |cap| cap.min(default_lookup));
                 let mut hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
+                let page_size = self.radix.page_size;
+                let aligned_lookup = lookup_len - lookup_len % page_size;
+                let reached_cap =
+                    lookup_len < default_lookup && hit.matched_tokens == aligned_lookup;
+                let mut cache_lookup = CacheLookup {
+                    lookup_tokens: lookup_len,
+                    kv_matched_tokens: hit.kv_matched_tokens,
+                    checkpoint_tokens: hit.matched_tokens,
+                    restored_tokens: 0,
+                    reason: if self.radix.disable {
+                        "cache_disabled"
+                    } else if reached_cap {
+                        "capped_lookup"
+                    } else if lookup_len == 0 {
+                        "empty_lookup"
+                    } else if hit.kv_matched_tokens == 0 {
+                        "no_page_match"
+                    } else if hit.matched_tokens == 0 {
+                        "no_checkpoint"
+                    } else if hit.matched_tokens < hit.kv_matched_tokens {
+                        "checkpoint_boundary"
+                    } else {
+                        "hit"
+                    },
+                };
                 // Each step trims below `hit.matched_tokens` (a 64-token Mamba checkpoint
                 // boundary), jumping directly to the next ancestor checkpoint. Cap the walk
                 // at 32 ancestor hops so admission work remains strictly O(1) bounded.
@@ -434,6 +470,7 @@ impl SchedulerV1 {
                 while hit.matched_tokens > 0
                     && !allow_prefix_hit(w.req_id, &w.radix_key_tokens, hit.matched_tokens)
                 {
+                    cache_lookup.reason = "admission_filter";
                     if steps >= MAX_ANCESTOR_FALLBACK_STEPS {
                         let branch = hit.mamba_branching_seqlen;
                         hit = self.radix.match_prefix(&[]);
@@ -449,9 +486,8 @@ impl SchedulerV1 {
                     hit = shorter;
                 }
                 let pinned_hit = hit.matched_tokens > 0 && hit.mamba_slot.is_some();
-                (lookup_len, hit, pinned_hit, unshareable)
+                (cache_lookup, hit, pinned_hit, unshareable)
             };
-            let _ = lookup_len;
             if pinned_hit {
                 self.radix.inc_lock_ref(match_res.last_node);
             }
@@ -466,6 +502,7 @@ impl SchedulerV1 {
                         break;
                     };
                     match_res = self.radix.match_prefix(&[]);
+                    cache_lookup.reason = "state_slot_pressure";
                     fallback_slots
                 }
                 None => break,
@@ -480,7 +517,9 @@ impl SchedulerV1 {
             );
             radix_state.restore_prefix_hit(&mut self.radix, &w.radix_key_tokens, &match_res);
 
+            cache_lookup.restored_tokens = match_res.matched_tokens;
             self.active.push(SeqEntry {
+                cache_lookup,
                 req_id: w.req_id,
                 prompt_tokens: w.prompt_tokens,
                 radix_key_tokens: w.radix_key_tokens,
@@ -805,6 +844,7 @@ mod tests {
     #[test]
     fn test_seq_entry_stop_token_logic() {
         let mut entry = SeqEntry {
+            cache_lookup: CacheLookup::default(),
             req_id: 1,
             prompt_tokens: vec![1, 2, 3],
             radix_key_tokens: vec![1, 2, 3],
@@ -1175,6 +1215,9 @@ mod tests {
         assert_eq!(sched.active[0].req_id, req_id);
         assert_eq!(sched.active[0].cached_prefix_tokens, 0);
         assert_eq!(sched.active[0].prefilled_tokens, 0);
+        let lookup = sched.active[0].cache_lookup;
+        assert_eq!((lookup.checkpoint_tokens, lookup.restored_tokens), (64, 0));
+        assert_eq!(lookup.reason, "state_slot_pressure");
         assert!(free_pool.is_empty());
     }
 
@@ -1403,6 +1446,39 @@ mod tests {
     }
 
     #[test]
+    fn admission_reports_initial_lookup_depths() {
+        for (prompt_len, cap, lookup, kv, checkpoint, reason) in [
+            (1, None, 0, 0, 0, "empty_lookup"),
+            (129, Some(0), 0, 0, 0, "capped_lookup"),
+            (129, Some(64), 64, 64, 64, "capped_lookup"),
+            (8, None, 7, 0, 0, "no_page_match"),
+            (49, None, 48, 48, 0, "no_checkpoint"),
+            (97, None, 96, 96, 64, "checkpoint_boundary"),
+            (129, None, 128, 128, 128, "hit"),
+        ] {
+            let mut sched = SchedulerV1::new(SchedulerConfig::default());
+            let prompt: Vec<i32> = (0..129).collect();
+            sched.radix.insert(&prompt[..64], &[1, 2, 3, 4], &[], 10, 0);
+            sched
+                .radix
+                .insert(&prompt[..128], &[1, 2, 3, 4, 5, 6, 7, 8], &[], 11, 4);
+            sched.submit_request(prompt[..prompt_len].to_vec(), 1, Vec::new());
+            sched.waiting.front_mut().unwrap().max_prefix_lookup_len = cap;
+            sched.admit_waiting(|_| Some((1, [2, 3])));
+            let result = sched.active[0].cache_lookup;
+            assert_eq!(
+                (result.lookup_tokens, result.kv_matched_tokens),
+                (lookup, kv)
+            );
+            assert_eq!(
+                (result.checkpoint_tokens, result.restored_tokens),
+                (checkpoint, checkpoint)
+            );
+            assert_eq!(result.reason, reason);
+        }
+    }
+
+    #[test]
     fn test_admit_waiting_with_filter_steps_down_to_ancestor_checkpoint() {
         let mut sched = SchedulerV1::new(SchedulerConfig::default());
         let prompt: Vec<i32> = (0..192).collect();
@@ -1414,6 +1490,13 @@ mod tests {
         sched.admit_waiting_with_filter(|_| Some((1, [2, 3])), |_, _, matched| matched <= 64);
         assert_eq!(sched.active.len(), 1);
         assert_eq!(sched.active[0].cached_prefix_tokens, 64);
+        let lookup = sched.active[0].cache_lookup;
+        assert_eq!((lookup.lookup_tokens, lookup.kv_matched_tokens), (191, 128));
+        assert_eq!(
+            (lookup.checkpoint_tokens, lookup.restored_tokens),
+            (128, 64)
+        );
+        assert_eq!(lookup.reason, "admission_filter");
         assert_eq!(sched.active[0].radix_state.cow_src_state_slot, Some(10));
     }
 }

@@ -14,7 +14,7 @@ pub use crate::server::WorkerError;
 use crate::{
     model::{EngineBatchSlice, PipelinedDecodeOutput, Qwen3_5Engine},
     parser::{SamplerV1, SamplingParams, StepLogprobs, TokenBitmaskConstraint},
-    scheduler::{ScheduledReqSlice, SchedulerConfig, SchedulerV1},
+    scheduler::{CacheLookup, ScheduledReqSlice, SchedulerConfig, SchedulerV1},
     telemetry::{Config as TelemetryConfig, Lifecycle, Outcome, Pool, Pools, Telemetry},
 };
 
@@ -76,6 +76,7 @@ fn generation_channel(capacity: usize) -> (Sender<GenerationEvent>, GenerationEv
 pub struct GenerationStream {
     pub events: GenerationEvents,
     pub cached_tokens: Arc<AtomicU64>,
+    pub cache_lookup: Arc<OnceLock<CacheLookup>>,
     pub hit_limit: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
 }
@@ -92,6 +93,7 @@ impl GenerationStream {
             Self {
                 events,
                 cached_tokens: Arc::new(AtomicU64::new(0)),
+                cache_lookup: Arc::default(),
                 hit_limit: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
             },
@@ -152,6 +154,7 @@ struct Request {
     reserved_pages: usize,
     soft_output_budget: bool,
     cached_tokens: Arc<AtomicU64>,
+    cache_lookup: Arc<OnceLock<CacheLookup>>,
     hit_limit: Arc<AtomicBool>,
     sampler: SamplerV1,
     output: Sender<GenerationEvent>,
@@ -597,6 +600,7 @@ impl EngineWorker {
             ));
         }
         let (output, events) = generation_channel(64);
+        let cache_lookup = Arc::new(OnceLock::new());
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -608,6 +612,7 @@ impl EngineWorker {
             vision: None,
             reserved_pages: 0,
             soft_output_budget,
+            cache_lookup: cache_lookup.clone(),
             cached_tokens: cached_tokens.clone(),
             hit_limit: hit_limit.clone(),
             sampler,
@@ -623,6 +628,7 @@ impl EngineWorker {
         Ok(GenerationStream {
             events,
             cancelled,
+            cache_lookup,
             cached_tokens,
             hit_limit,
         })
@@ -798,6 +804,7 @@ impl EngineWorker {
             ));
         }
         let (output, events) = generation_channel(8);
+        let cache_lookup = Arc::new(OnceLock::new());
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -817,6 +824,7 @@ impl EngineWorker {
             vision: None,
             reserved_pages: 0,
             soft_output_budget: false,
+            cache_lookup: cache_lookup.clone(),
             cached_tokens: cached_tokens.clone(),
             hit_limit: hit_limit.clone(),
             sampler,
@@ -832,6 +840,7 @@ impl EngineWorker {
         Ok(GenerationStream {
             events,
             cancelled,
+            cache_lookup,
             cached_tokens,
             hit_limit,
         })
@@ -923,6 +932,7 @@ pub fn run_batch_in_place(
                     vision: None,
                     reserved_pages: 0,
                     soft_output_budget: false,
+                    cache_lookup: Arc::default(),
                     cached_tokens: cached_tokens.clone(),
                     hit_limit,
                     sampler,

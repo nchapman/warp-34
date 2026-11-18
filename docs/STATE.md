@@ -1,5 +1,9 @@
 # warp34 — Session Orientation & Current State
 
+## Generation request diagnostics
+
+`warp34 serve` now emits structured per-turn summaries on stderr for generation APIs, including requested vs effective output budgets, stop reasons, cache usage and response timing. See [per-turn Docker logs](METRICS.md#per-turn-docker-logs) for a truncation query and field semantics. This is a source change, not part of the `0.1.0` image.
+
 ## Multi-Architecture Hardware Verification (`sm_80` 2× A100-SXM4-40GB, `sm_86` 2× RTX 3090 / 3090 Ti, `sm_89` 2× RTX 4090)
 
 - **Live Multi-Arch Verification Suite (`tools/check_cuda_sanitizer.py`, `crates/warp34-host/src/model/weights.rs`, `crates/warp34-host/src/cli/oracle.rs`, `tools/oracle/goldens/4B/`):**

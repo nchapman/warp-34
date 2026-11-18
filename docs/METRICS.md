@@ -7,6 +7,26 @@ No external collector, CDN, Node runtime, or frontend files are needed at runtim
 Vite's production assets are embedded in the Rust executable. Prometheus remains
 optional; use it for durable history, alerting, and fleet-wide aggregation.
 
+## Per-turn Docker logs
+
+`warp34 serve` writes one JSON object to stderr when a prepared generation ends (Chat Completions, Completions, Responses, and Messages, including streaming). To diagnose a truncated turn without recording its content:
+
+```sh
+docker logs --since 1h qwen3.8-27b-warp34 2>&1 | jq -Rc 'fromjson? | select(.event == "inference.turn_end" and .length_limit != null) | {request_id, length_limit, prompt_tokens, cached_prompt_tokens, output_tokens, requested_max_output_tokens, effective_max_output_tokens, context_window}'
+```
+
+`length_limit` distinguishes a requested output budget, the server default, the remaining context window (including a tie with the requested budget), and runtime KV capacity. Output counts include reasoning and hidden stop tokens. `ttft_ms` and `duration_ms` start after request preparation, before worker submission; `output_tokens_per_s` measures tokens observed by the handler *after* the first token, not prompt throughput or network delivery. Missing observations are `null`. A dropped unfinished response is `cancelled`; a stream error is `error` even if SSE headers already returned HTTP 200. Non-success HTTP responses to inference POSTs, including pre-generation rejections, also emit `inference.http_error` with the route and status.
+
+For slow follow-ups, compare three counts at admission instead of relying on a lifetime cache-hit percentage:
+
+```sh
+docker logs --since 1h qwen3.8-27b-warp34 2>&1 | jq -Rc 'fromjson? | select(.event == "inference.turn_end") | {request_id, prompt_tokens, cache_lookup, cached_prompt_tokens, ttft_ms}'
+```
+
+`cache_lookup` distinguishes the page-aligned KV prefix the radix tree matched, the prefix with a usable recurrent checkpoint, and the prefix actually restored after scheduling. A large KV match but short checkpoint points to recurrent-state reuse rather than tokenization; a short KV match means the matching prefix was not in the tree at lookup. That alone does **not** distinguish eviction from a client changing the serialized history or tool schema. Missing admission evidence is `null`, not a zero-token miss.
+
+Filter on `event`: startup diagnostics still share stderr. No prompts, completions, reasoning text, tool arguments, headers or raw error strings are included in these events. Model names and server-generated response IDs are operational metadata. Configure retention in the container's logging driver if you need history after `docker run --rm` containers exit.
+
 ## Interfaces
 
 | Route | Contract |

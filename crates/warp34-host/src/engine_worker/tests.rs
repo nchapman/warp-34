@@ -22,6 +22,7 @@ fn terminal_test_request() -> (
 ) {
     let (output, events) = generation_channel(2);
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let cache_lookup = Arc::new(std::sync::OnceLock::new());
     let cached_tokens = Arc::new(AtomicU64::new(0));
     let hit_limit = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -32,6 +33,7 @@ fn terminal_test_request() -> (
         vision: None,
         reserved_pages: 0,
         soft_output_budget: false,
+        cache_lookup: cache_lookup.clone(),
         cached_tokens: cached_tokens.clone(),
         hit_limit: hit_limit.clone(),
         sampler: SamplerV1::new(SamplingParams::default(), &[1], None),
@@ -51,6 +53,7 @@ fn terminal_test_request() -> (
         request,
         GenerationStream {
             events,
+            cache_lookup,
             cached_tokens,
             hit_limit,
             cancelled,

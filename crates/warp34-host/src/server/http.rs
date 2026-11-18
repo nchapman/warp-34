@@ -1,4 +1,5 @@
 //! Axum owns transport; only EngineWorker's OS thread owns CUDA objects.
+use super::request_log::TurnLog;
 use crate::{
     engine_worker::{EngineWorker, GenerationEvent, GenerationStream, WorkerError},
     model::Qwen3_5Engine,
@@ -319,10 +320,15 @@ async fn count_inference_responses(
     request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let count = is_inference_endpoint(request.method(), request.uri().path());
+    let endpoint = is_inference_endpoint(request.method(), request.uri().path())
+        .then(|| request.uri().path().to_owned());
     let response = next.run(request).await;
-    if count {
-        s.metrics.http_response(response.status().as_u16());
+    if let Some(endpoint) = endpoint {
+        let status = response.status();
+        s.metrics.http_response(status.as_u16());
+        if status.is_client_error() || status.is_server_error() {
+            super::request_log::http_error(&endpoint, status.as_u16());
+        }
     }
     response
 }
@@ -542,6 +548,7 @@ fn prepare_anthropic_err(err: PrepareError) -> ApiError {
 }
 
 struct Prepared {
+    explicit_max_tokens: Option<usize>,
     parser: Qwen3Parser,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
@@ -553,6 +560,21 @@ struct Prepared {
     stream: bool,
     include_usage: bool,
 }
+impl Prepared {
+    fn turn_log(&self, id: String, api: &'static str, context: usize) -> TurnLog {
+        TurnLog::new(
+            id,
+            api,
+            self.served_model.clone(),
+            self.stream,
+            self.prompt.len(),
+            self.explicit_max_tokens,
+            self.params.max_tokens,
+            context,
+        )
+    }
+}
+
 fn prepare(
     s: &OpenAiServerState,
     request: Value,
@@ -703,6 +725,7 @@ fn prepare(
         .pointer("/stream_options/include_usage")
         .map_or(Ok(false), |v| v.as_bool().ok_or("invalid include_usage"))?;
     Ok(Prepared {
+        explicit_max_tokens,
         parser: Qwen3Parser::with_tools(
             thinking,
             &crate::request_constraints::parser_tools(&request)?,
@@ -752,6 +775,13 @@ async fn generate(
         )
         .await?
     };
+    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let id = format!("{}-{request_id}", if chat { "chatcmpl" } else { "cmpl" });
+    let mut log = prepared.turn_log(
+        id.clone(),
+        if chat { "chat" } else { "completions" },
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
@@ -763,10 +793,14 @@ async fn generate(
             prepared.lora_id,
             prepared.soft_output_budget,
         )
+        .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
     let stream = prepared.stream;
     let include_usage = prepared.include_usage;
-    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let output = output_stream(
         s,
         generation,
@@ -775,7 +809,8 @@ async fn generate(
         prepared.served_model,
         chat,
         prompt_len,
-        request_id,
+        id,
+        log,
         admission,
     );
     if stream {
@@ -925,7 +960,8 @@ fn output_stream(
     served_model: String,
     chat: bool,
     prompt_len: usize,
-    request_id: u64,
+    id: String,
+    mut log: TurnLog,
     admission: OwnedSemaphorePermit,
 ) -> impl Stream<Item = Output> + Send {
     async_stream::stream! {
@@ -943,7 +979,6 @@ fn output_stream(
         let mut legacy_offset = 0;
         let mut decoded_offset = 0;
         let mut tool_index = 0;
-        let id = format!("{}-{request_id}",if chat { "chatcmpl" } else { "cmpl" });
         let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let chunk = |delta: Value, lp: Value| {
             let choice = if chat { json!({"index":0,"delta":delta,"finish_reason":null,"logprobs":lp}) }
@@ -954,6 +989,7 @@ fn output_stream(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, logprobs } => {
+                    log.token();
                     count += 1;
                     let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp, tokenizer, &s.decoded_vocab));
                     if chat && let Some(lp) = &lp { logs.push(lp.clone()); }
@@ -971,7 +1007,7 @@ fn output_stream(
                     }
                     let decoded = match decoder.step(id as u32) {
                         Ok(Some(text)) => text, Ok(None) if chat => continue, Ok(None) => String::new(),
-                        Err(e) => { yield Output::Error(WorkerError::internal(e.to_string())); return; }
+                        Err(e) => { log.finish("error", false); yield Output::Error(WorkerError::internal(e.to_string())); return; }
                     };
                     if !chat {
                         if let Some(lp) = &mut lp {
@@ -992,13 +1028,13 @@ fn output_stream(
                     if matched { stopped = true; done = true; break; }
                 }
                 GenerationEvent::Finished { cached_tokens, .. } => { cached = cached_tokens; done = true; break; }
-                GenerationEvent::Error(err) => { yield Output::Error(err); return; }
+                GenerationEvent::Error(err) => { log.finish("error", false); yield Output::Error(err); return; }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
         let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation); // cancellation also covers stop strings and a dropped HTTP response body
-        if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (client backpressure, overload, shutdown, or worker failure)")); return; }
+        if !done { log.finish("error", false); yield Output::Error(WorkerError::internal("engine stream closed before completion (client backpressure, overload, shutdown, or worker failure)")); return; }
         let tail = std::mem::take(&mut stops.pending);
         text.push_str(&tail);
         if !tail.is_empty() {
@@ -1012,6 +1048,7 @@ fn output_stream(
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
+        log.finish(finish, hit_limit);
         yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":served_model,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
     }
 }
@@ -1346,6 +1383,11 @@ async fn responses_create(
     .await?;
     meta.model.clone_from(&prepared.served_model);
     meta.max_output_tokens = prepared.params.max_tokens;
+    let mut log = prepared.turn_log(
+        meta.response_id.clone(),
+        "responses",
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
@@ -1357,7 +1399,12 @@ async fn responses_create(
             prepared.lora_id,
             prepared.soft_output_budget,
         )
+        .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
     if let Some(ref scope) = caller_scope {
         s.response_store.register_active(
             meta.response_id.clone(),
@@ -1394,6 +1441,7 @@ async fn responses_create(
             while let Some(event) = generation.events.recv().await {
                 match event {
                     GenerationEvent::Token { id, .. } => {
+                        log.token();
                         count += 1;
                         if count >= params.min_tokens && params.is_stop_or_eos(id, &s.worker.eos_token_ids) {
                             stopped = true;
@@ -1403,6 +1451,7 @@ async fn responses_create(
                             Ok(Some(t)) => t,
                             Ok(None) => continue,
                             Err(e) => {
+                                log.finish("error", false);
                                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &e.to_string());
                                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                                 return;
@@ -1425,6 +1474,7 @@ async fn responses_create(
                         break;
                     }
                     GenerationEvent::Error(err) => {
+                        log.finish("error", false);
                         let msg = err.to_string();
                         let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &msg);
                         yield Ok(Event::default().event(ev_name).data(payload.to_string()));
@@ -1436,6 +1486,7 @@ async fn responses_create(
             let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
+                log.finish("error", false);
                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, "engine stream closed before completion");
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                 return;
@@ -1458,13 +1509,15 @@ async fn responses_create(
                 "stop"
             };
             let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
-            let (mut end_frames, final_resp, history) =
+            let (end_frames, final_resp, history) =
                 sse.finish_output(&turn, finish, prompt_len, cached, count, reasoning_tokens);
             let final_resp = finalize_response(&s.response_store, &meta, caller_scope.as_deref(), final_resp, history);
-            end_frames.push(sse.terminal_response(final_resp));
             for (ev_name, payload) in end_frames {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
+            let (ev_name, payload) = sse.terminal_response(final_resp);
+            log.finish(finish, hit_limit);
+            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
         };
         Ok(Sse::new(events)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1485,6 +1538,7 @@ async fn responses_create(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
+                    log.token();
                     count += 1;
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
@@ -1496,6 +1550,7 @@ async fn responses_create(
                         Ok(Some(t)) => t,
                         Ok(None) => continue,
                         Err(e) => {
+                            log.finish("error", false);
                             return responses_sync_failure(
                                 &s.response_store,
                                 &meta,
@@ -1523,6 +1578,7 @@ async fn responses_create(
                     break;
                 }
                 GenerationEvent::Error(err) => {
+                    log.finish("error", false);
                     return responses_sync_failure(
                         &s.response_store,
                         &meta,
@@ -1536,6 +1592,7 @@ async fn responses_create(
         let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
+            log.finish("error", false);
             return responses_sync_failure(
                 &s.response_store,
                 &meta,
@@ -1575,6 +1632,7 @@ async fn responses_create(
             resp,
             history,
         );
+        log.finish(finish, hit_limit);
         Ok(Json(resp).into_response())
     }
 }
@@ -1601,6 +1659,11 @@ async fn anthropic_messages(
     )
     .await?;
     meta.model.clone_from(&prepared.served_model);
+    let mut log = prepared.turn_log(
+        meta.message_id.clone(),
+        "anthropic",
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
@@ -1612,7 +1675,12 @@ async fn anthropic_messages(
             prepared.lora_id,
             prepared.soft_output_budget,
         )
+        .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
 
     if meta.stream {
         let params = prepared.params;
@@ -1634,6 +1702,7 @@ async fn anthropic_messages(
             while let Some(event) = generation.events.recv().await {
                 match event {
                     GenerationEvent::Token { id, .. } => {
+                        log.token();
                         count += 1;
                         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
                         for (ev_name, payload) in sse.ensure_started(cached) {
@@ -1647,6 +1716,7 @@ async fn anthropic_messages(
                             Ok(Some(t)) => t,
                             Ok(None) => continue,
                             Err(e) => {
+                                log.finish("error", false);
                                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&e.to_string());
                                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                                 return;
@@ -1670,6 +1740,7 @@ async fn anthropic_messages(
                         break;
                     }
                     GenerationEvent::Error(err) => {
+                        log.finish("error", false);
                         let msg = err.to_string();
                         let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&msg);
                         yield Ok(Event::default().event(ev_name).data(payload.to_string()));
@@ -1681,6 +1752,7 @@ async fn anthropic_messages(
             let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
+                log.finish("error", false);
                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(
                     "engine stream closed before completion",
                 );
@@ -1705,6 +1777,10 @@ async fn anthropic_messages(
                 "stop"
             };
             for (ev_name, payload) in sse.finish(&turn, finish, matched_stop.as_deref(), cached, count) {
+                if ev_name == "message_delta" {
+                    let (reason, _) = crate::anthropic_api::resolve_stop_reason(&turn, finish, matched_stop.as_deref());
+                    log.finish(reason, hit_limit);
+                }
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
         };
@@ -1727,6 +1803,7 @@ async fn anthropic_messages(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
+                    log.token();
                     count += 1;
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
@@ -1738,6 +1815,7 @@ async fn anthropic_messages(
                         Ok(Some(t)) => t,
                         Ok(None) => continue,
                         Err(e) => {
+                            log.finish("error", false);
                             return Err(anthropic_api_err(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 crate::anthropic_api::AnthropicApiError::api_error(e.to_string()),
@@ -1764,6 +1842,7 @@ async fn anthropic_messages(
                     break;
                 }
                 GenerationEvent::Error(err) => {
+                    log.finish("error", false);
                     return Err(worker_anthropic_err(err));
                 }
             }
@@ -1772,6 +1851,7 @@ async fn anthropic_messages(
         let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
+            log.finish("error", false);
             return Err(anthropic_api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 crate::anthropic_api::AnthropicApiError::api_error(
@@ -1800,6 +1880,9 @@ async fn anthropic_messages(
             cached,
             count,
         );
+        let (reason, _) =
+            crate::anthropic_api::resolve_stop_reason(&turn, finish, matched_stop.as_deref());
+        log.finish(reason, hit_limit);
         Ok(Json(msg).into_response())
     }
 }

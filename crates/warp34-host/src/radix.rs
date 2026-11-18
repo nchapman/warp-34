@@ -48,6 +48,8 @@ pub struct RadixNode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RadixMatchResult {
+    /// Raw page-aligned prefix before restricting the match to a usable checkpoint.
+    pub kv_matched_tokens: usize,
     /// Number of matched tokens up to `last_node` (always a multiple of `page_size`).
     pub matched_tokens: usize,
     /// Matched logical KV `page_id`s (`kv_pages.len() == matched_tokens / page_size`).
@@ -385,6 +387,7 @@ impl MambaRadixCache {
         let aligned_len = (token_ids.len() / self.page_size) * self.page_size;
         if self.disable || aligned_len == 0 {
             return RadixMatchResult {
+                kv_matched_tokens: 0,
                 matched_tokens: 0,
                 kv_pages: Vec::new(),
                 draft_pages: Vec::new(),
@@ -476,6 +479,7 @@ impl MambaRadixCache {
         }
 
         RadixMatchResult {
+            kv_matched_tokens: total_kv_matched_tokens,
             matched_tokens,
             kv_pages,
             draft_pages,
@@ -1347,6 +1351,7 @@ mod tests {
         // Prefix of 48 tokens splits the 64-token node into a 48-token prefix (tombstone) and 16-token leaf.
         // Since the 48-token node has no Mamba checkpoint (checkpoint was at token 64), match returns 0 tokens
         // with mamba_branching_seqlen recording the KV branch.
+        assert_eq!(m_shorter.kv_matched_tokens, 48);
         assert_eq!(m_shorter.matched_tokens, 0);
         assert_eq!(m_shorter.mamba_slot, None);
     }

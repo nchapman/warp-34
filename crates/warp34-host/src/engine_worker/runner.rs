@@ -774,7 +774,9 @@ fn admit_requests(
 
 fn record_admissions(sched: &SchedulerV1, requests: &HashMap<u64, Request>) {
     for seq in &sched.active {
-        if let Some(life) = &requests[&seq.req_id].lifecycle {
+        let request = &requests[&seq.req_id];
+        request.cache_lookup.get_or_init(|| seq.cache_lookup);
+        if let Some(life) = &request.lifecycle {
             life.scheduled(seq.cached_prefix_tokens);
         }
     }
