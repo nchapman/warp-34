@@ -755,6 +755,43 @@ pub(crate) struct ServeBootSummary {
     pub(crate) auth_enabled: bool,
     pub(crate) webui_enabled: bool,
     pub(crate) use_cuda_graph: bool,
+    pub(crate) default_sampling_params: crate::parser::SamplingParams,
+    pub(crate) sampling_from_generation_config: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn format_sampling_banner_line(
+    p: &crate::parser::SamplingParams,
+    from_generation_config: bool,
+) -> String {
+    let tag = if from_generation_config {
+        "[generation_config.json]"
+    } else {
+        "[default]"
+    };
+    if p.temperature == 0.0 {
+        return format!("temp=0.0 (greedy) {tag}");
+    }
+    let mut parts = vec![format!("temp={}", p.temperature)];
+    if p.top_p < 1.0 {
+        parts.push(format!("top_p={}", p.top_p));
+    }
+    if p.top_k > 0 {
+        parts.push(format!("top_k={}", p.top_k));
+    }
+    if p.min_p > 0.0 {
+        parts.push(format!("min_p={}", p.min_p));
+    }
+    if (p.repetition_penalty - 1.0).abs() > f32::EPSILON {
+        parts.push(format!("rep_pen={}", p.repetition_penalty));
+    }
+    if p.presence_penalty.abs() > f32::EPSILON {
+        parts.push(format!("pres_pen={}", p.presence_penalty));
+    }
+    if p.frequency_penalty.abs() > f32::EPSILON {
+        parts.push(format!("freq_pen={}", p.frequency_penalty));
+    }
+    format!("{} {tag}", parts.join(", "))
 }
 
 #[cfg(feature = "cuda")]
@@ -813,6 +850,10 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
     } else {
         format!("{} ({})", s.served_model, s.checkpoint_label)
     };
+    let sampling_line = format_sampling_banner_line(
+        &s.default_sampling_params,
+        s.sampling_from_generation_config,
+    );
     format!(
         concat!(
             "\n",
@@ -826,6 +867,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "  Model        : {}\n",
             "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
             "  Speculative  : {}\n",
+            "  Sampling     : {}\n",
             "  KV Cache     : {} {}\n",
             "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
             "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}){} [auto-sized]\n",
@@ -841,6 +883,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.total_vram_bytes as f64 / gib,
         s.tp_size,
         s.speculative_label,
+        sampling_line,
         kv_desc,
         kv_mode_tag,
         s.context_limit,
@@ -973,58 +1016,68 @@ pub(crate) fn run_serve(
                     || engine.cfg.max_position_embeddings.unwrap_or(262_144),
                     |f| f.max_model_context_tokens,
                 );
-                let _ = boot_info_loader.set(ServeBootSummary {
-                    served_model: model_loader,
-                    checkpoint_label: checkpoint_label_loader,
-                    gpu_name: props
-                        .as_ref()
-                        .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
-                    gpu_sm_tag: props
-                        .as_ref()
-                        .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
-                    gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
-                    tp_size: tp,
-                    total_vram_bytes: total_vram,
-                    post_load_free_vram_bytes: post_free,
-                    kv_policy: selected_kv_policy,
-                    kv_policy_explicit: explicit_kv_format,
-                    kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
-                    kv_pages: r0.kv_pool.num_pages,
-                    context_limit: max_model_len
-                        .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
-                    max_model_context_tokens: max_model_ctx,
-                    context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
-                    kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
-                    state_slots: r0.state_pool.total_slots,
-                    state_pool_bytes_per_rank: state_bytes
-                        .saturating_mul(r0.state_pool.total_slots),
-                    ckpt_vram_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.vram_slots),
-                    ckpt_host_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.host_slots),
-                    ckpt_bytes_per_slot: r0
-                        .checkpoint_pool
-                        .as_ref()
-                        .map_or(0, |c| c.layout.bundle_bytes),
-                    weight_bytes_per_rank: r0.weight_arena.used(),
-                    scratch_bytes_per_rank: r0.scratch_arena.capacity(),
-                    host_embed_offload: r0.host_embed_tokens.is_some(),
-                    embed_saved_bytes: engine
-                        .cfg
-                        .vocab_size
-                        .saturating_mul(engine.cfg.hidden_size)
-                        .saturating_mul(2),
-                    speculative_label: spec_label_loader,
-                    max_num_seqs,
-                    bind_addr: bind_addr_loader,
-                    auth_enabled,
-                    webui_enabled,
-                    use_cuda_graph,
-                });
+                let _ =
+                    boot_info_loader.set(ServeBootSummary {
+                        served_model: model_loader,
+                        checkpoint_label: checkpoint_label_loader,
+                        gpu_name: props
+                            .as_ref()
+                            .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
+                        gpu_sm_tag: props
+                            .as_ref()
+                            .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
+                        gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
+                        tp_size: tp,
+                        total_vram_bytes: total_vram,
+                        post_load_free_vram_bytes: post_free,
+                        kv_policy: selected_kv_policy,
+                        kv_policy_explicit: explicit_kv_format,
+                        kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
+                        kv_pages: r0.kv_pool.num_pages,
+                        context_limit: max_model_len
+                            .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
+                        max_model_context_tokens: max_model_ctx,
+                        context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
+                        kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
+                        state_slots: r0.state_pool.total_slots,
+                        state_pool_bytes_per_rank: state_bytes
+                            .saturating_mul(r0.state_pool.total_slots),
+                        ckpt_vram_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.vram_slots),
+                        ckpt_host_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.host_slots),
+                        ckpt_bytes_per_slot: r0
+                            .checkpoint_pool
+                            .as_ref()
+                            .map_or(0, |c| c.layout.bundle_bytes),
+                        weight_bytes_per_rank: r0.weight_arena.used(),
+                        scratch_bytes_per_rank: r0.scratch_arena.capacity(),
+                        host_embed_offload: r0.host_embed_tokens.is_some(),
+                        embed_saved_bytes: engine
+                            .cfg
+                            .vocab_size
+                            .saturating_mul(engine.cfg.hidden_size)
+                            .saturating_mul(2),
+                        speculative_label: spec_label_loader,
+                        max_num_seqs,
+                        bind_addr: bind_addr_loader,
+                        auth_enabled,
+                        webui_enabled,
+                        use_cuda_graph,
+                        default_sampling_params:
+                            crate::parser::SamplingParams::from_generation_config_dir(
+                                &engine.model_dir,
+                            ),
+                        sampling_from_generation_config: engine
+                            .model_dir
+                            .join("generation_config.json")
+                            .is_file(),
+                    });
             }
             Ok(engine)
         },
     )?;
     if let Some(mut summary) = boot_info.get().cloned() {
         summary.context_limit = state.worker.max_model_len();
+        summary.default_sampling_params = state.worker.default_sampling_params.clone();
         print!("{}", format_serve_boot_banner(&summary));
     }
     println!(
