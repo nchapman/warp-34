@@ -120,12 +120,23 @@ fn resolve_lora_remote(
             spec.resolved_dir = Some(dir.clone());
             return Ok(dir);
         }
-        let snap_dir = repo
+        let snap_dir = match repo
             .snapshot_download()
             .revision(revision)
             .local_files_only(true)
             .send()
-            .map_err(hub_error)?;
+        {
+            Ok(dir) => dir,
+            Err(HFError::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                resolve_readonly_cached_snapshot(&repo_dir, revision)?
+            }
+            Err(err) => return Err(hub_error(err)),
+        };
         let adapter_dir =
             validate_cached_lora_snapshot(&repo_dir, &snap_dir, subfolder.as_deref())?;
         eprintln!(
@@ -460,12 +471,23 @@ fn resolve_remote(
     let (owner, name) = id.rsplit_once('/').unwrap_or(("", &id));
     let repo = client.model(owner, name);
     if options.offline {
-        let dir = repo
+        let dir = match repo
             .snapshot_download()
             .revision(revision)
             .local_files_only(true)
             .send()
-            .map_err(hub_error)?;
+        {
+            Ok(dir) => dir,
+            Err(HFError::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                resolve_readonly_cached_snapshot(&repo_dir, revision)?
+            }
+            Err(err) => return Err(hub_error(err)),
+        };
         return validate_offline_snapshot(&repo_dir, &dir, role);
     }
     eprintln!("Resolving Hugging Face {id}@{revision}…");
@@ -736,6 +758,24 @@ fn is_transient_hub_failure(error: &HFError) -> bool {
 
 fn manifest_path(repo: &Path, commit: &str) -> PathBuf {
     repo.join(".warp34").join(format!("{commit}.json"))
+}
+
+fn resolve_readonly_cached_snapshot(repo_dir: &Path, revision: &str) -> io::Result<PathBuf> {
+    let commit = if is_commit(revision) {
+        revision.to_owned()
+    } else {
+        let ref_path = repo_dir.join("refs").join(revision);
+        fs::read_to_string(&ref_path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    "requested revision is not cached; offline mode forbids downloads",
+                )
+            })?
+            .trim()
+            .to_owned()
+    };
+    Ok(repo_dir.join("snapshots").join(commit))
 }
 
 fn validate_offline_snapshot(repo_dir: &Path, dir: &Path, role: ModelRole) -> io::Result<PathBuf> {
