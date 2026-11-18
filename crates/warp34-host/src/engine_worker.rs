@@ -1049,8 +1049,6 @@ fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonat
         && let Err(e) = engine.apply_radix_donation(&d)
     {
         eprintln!("warning: failed to pack GDN checkpoint during radix donation: {e}");
-        engine.free_kv_pages(&d.freed_kv_pages);
-        engine.free_state_slots(&d.freed_mamba_slots);
     }
 }
 

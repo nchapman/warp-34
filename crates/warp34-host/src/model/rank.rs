@@ -2177,16 +2177,20 @@ impl PrePoolModelRank {
         {
             return Ok(None);
         }
+        let explicit_pool =
+            capacity.checkpoint_vram_slots.is_some() || capacity.checkpoint_host_slots.is_some();
         let ckpt_layout = crate::cache::GdnCheckpointLayout::from_state_pool(state_pool);
         let vram_slots = match capacity.checkpoint_vram_slots {
             Some(v) => v,
-            None => {
-                let live_free_after_kv = device.mem_info()?.0;
-                let safety_floor = required_headroom.saturating_add(256 * 1024 * 1024);
-                let spare_vram = live_free_after_kv.saturating_sub(safety_floor);
-                (spare_vram / ckpt_layout.bundle_bytes.max(1))
-                    .min(crate::cache::MAX_AUTO_VRAM_CHECKPOINT_SLOTS)
-            }
+            None => match device.mem_info() {
+                Ok((live_free_after_kv, _)) => {
+                    let safety_floor = required_headroom.saturating_add(256 * 1024 * 1024);
+                    let spare_vram = live_free_after_kv.saturating_sub(safety_floor);
+                    (spare_vram / ckpt_layout.bundle_bytes.max(1))
+                        .min(crate::cache::MAX_AUTO_VRAM_CHECKPOINT_SLOTS)
+                }
+                Err(_) => 0,
+            },
         };
         let host_slots = match capacity.checkpoint_host_slots {
             Some(h) => h,
@@ -2199,8 +2203,13 @@ impl PrePoolModelRank {
         if vram_slots + host_slots == 0 {
             return Ok(None);
         }
-        Ok(Some(crate::cache::GdnCheckpointPool::new(
-            state_pool, vram_slots, host_slots, stream,
-        )?))
+        match crate::cache::GdnCheckpointPool::new(state_pool, vram_slots, host_slots, stream) {
+            Ok(pool) => Ok(Some(pool)),
+            Err(e) if explicit_pool => Err(e),
+            Err(_) if vram_slots > 0 && host_slots > 0 => {
+                Ok(crate::cache::GdnCheckpointPool::new(state_pool, 0, host_slots, stream).ok())
+            }
+            Err(_) => Ok(None),
+        }
     }
 }

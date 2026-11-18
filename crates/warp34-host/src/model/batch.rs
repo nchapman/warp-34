@@ -117,34 +117,50 @@ impl Qwen3_5Engine {
             .is_some_and(|p| p.total_slots > 0)
     }
 
+    fn try_alloc_lockstep_checkpoint_slot(&mut self) -> Option<i32> {
+        let c0 = self
+            .ranks
+            .first_mut()?
+            .checkpoint_pool
+            .as_mut()?
+            .alloc_slot()?;
+        let mut peer_slots = Vec::with_capacity(self.ranks.len().saturating_sub(1));
+        for r in &mut self.ranks[1..] {
+            match r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot()) {
+                Some(cp) if cp == c0 => peer_slots.push(cp),
+                other => {
+                    if let Some(cp) = other
+                        && let Some(ckpt) = &mut r.checkpoint_pool
+                    {
+                        ckpt.free_slot(cp);
+                    }
+                    if let Some(ckpt0) = &mut self.ranks[0].checkpoint_pool {
+                        ckpt0.free_slot(c0);
+                    }
+                    for (idx, cp) in peer_slots.into_iter().enumerate() {
+                        if let Some(ckpt) = &mut self.ranks[idx + 1].checkpoint_pool {
+                            ckpt.free_slot(cp);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(c0)
+    }
+
     pub fn alloc_checkpoint_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if !self.has_checkpoint_pool() {
             return None;
         }
-        if let Some(c0) = self.ranks[0]
-            .checkpoint_pool
-            .as_mut()
-            .and_then(|c| c.alloc_slot())
-        {
-            for r in &mut self.ranks[1..] {
-                let c_peer = r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot());
-                debug_assert_eq!(Some(c0), c_peer);
-            }
+        if let Some(c0) = self.try_alloc_lockstep_checkpoint_slot() {
             return Some(c0);
         }
         let ev = radix.evict_mamba(1);
         if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
             self.free_kv_pages(&ev.freed_kv_pages);
             self.free_state_slots(&ev.freed_mamba_slots);
-            if let Some(c0) = self.ranks[0]
-                .checkpoint_pool
-                .as_mut()
-                .and_then(|c| c.alloc_slot())
-            {
-                for r in &mut self.ranks[1..] {
-                    let c_peer = r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot());
-                    debug_assert_eq!(Some(c0), c_peer);
-                }
+            if let Some(c0) = self.try_alloc_lockstep_checkpoint_slot() {
                 return Some(c0);
             }
         }
@@ -257,12 +273,34 @@ impl Qwen3_5Engine {
         &mut self,
         donation: &crate::radix::RadixDonationOutcome,
     ) -> Result<()> {
-        if let Some((src_active, dst_ckpt)) = donation.pending_checkpoint_pack {
-            self.pack_checkpoint_from_active(src_active, dst_ckpt)?;
-        }
+        let pack_res = if let Some((src_active, dst_ckpt)) = donation.pending_checkpoint_pack {
+            let res = self.pack_checkpoint_from_active(src_active, dst_ckpt);
+            if res.is_err() {
+                self.free_state_slots(&[dst_ckpt]);
+            }
+            res
+        } else {
+            Ok(())
+        };
         self.free_kv_pages(&donation.freed_kv_pages);
         self.free_state_slots(&donation.freed_mamba_slots);
-        Ok(())
+        pack_res
+    }
+
+    pub fn apply_radix_donation_with_radix(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        donation: &crate::radix::RadixDonationOutcome,
+    ) -> Result<()> {
+        let res = self.apply_radix_donation(donation);
+        if res.is_err()
+            && let Some((_, dst_ckpt)) = donation.pending_checkpoint_pack
+        {
+            let inv = radix.invalidate_mamba_slot(dst_ckpt);
+            self.free_kv_pages(&inv.freed_kv_pages);
+            self.free_state_slots(&inv.freed_mamba_slots);
+        }
+        res
     }
 
     pub fn donate_req_checkpoint(
@@ -272,21 +310,26 @@ impl Qwen3_5Engine {
         finish_req: bool,
     ) -> Result<crate::radix::RadixDonationOutcome> {
         if self.has_checkpoint_pool() {
+            let can_recycle_ckpt =
+                radix.can_recycle_locked_checkpoint_mamba(req_state.last_locked_node);
             let ckpt = if req_state.has_donatable_checkpoint() {
                 self.alloc_checkpoint_slot_from(radix)
             } else {
                 None
             };
-            let outcome = if ckpt.is_none() && req_state.has_donatable_checkpoint() {
-                if finish_req {
-                    req_state.abort_and_release(radix)
+            let outcome =
+                if ckpt.is_none() && !can_recycle_ckpt && req_state.has_donatable_checkpoint() {
+                    if finish_req {
+                        // All checkpoint-pool slots are locked by other requests; release active
+                        // FP32 state back to `state_pool` rather than leaking it into `radix`.
+                        req_state.abort_and_release(radix)
+                    } else {
+                        crate::radix::RadixDonationOutcome::default()
+                    }
                 } else {
-                    crate::radix::RadixDonationOutcome::default()
-                }
-            } else {
-                req_state.donate_committed_checkpoint(radix, ckpt, finish_req)
-            };
-            self.apply_radix_donation(&outcome)?;
+                    req_state.donate_committed_checkpoint(radix, ckpt, finish_req)
+                };
+            self.apply_radix_donation_with_radix(radix, &outcome)?;
             Ok(outcome)
         } else {
             let can_recycle = radix.can_recycle_locked_mamba(req_state.last_locked_node);
@@ -304,7 +347,7 @@ impl Qwen3_5Engine {
             } else {
                 crate::radix::RadixDonationOutcome::default()
             };
-            self.apply_radix_donation(&outcome)?;
+            self.apply_radix_donation_with_radix(radix, &outcome)?;
             Ok(outcome)
         }
     }

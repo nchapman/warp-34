@@ -660,14 +660,22 @@ impl GdnCheckpointPool {
                     .free_host_slots
                     .pop()
                     .ok_or_else(|| CudaError::new(-11, "no free L2 host slot for L1 spill"))?;
-                self.copy_vram_to_host_slot(v_idx, h_idx, stream)?;
+                if let Err(e) = self.copy_vram_to_host_slot(v_idx, h_idx, stream) {
+                    self.free_host_slots.push(h_idx);
+                    return Err(e);
+                }
                 self.vram_lru.remove(0);
                 self.locations[victim_logical] = Some(CkptLocation::Host(h_idx));
                 self.host_spills += 1;
                 v_idx
             };
             let dev_addr = self.vram_slot_addr(target_v_idx);
-            self.launch_pack_to_dev_frame(state_pool, src_active_slot, dev_addr, stream)?;
+            if let Err(e) =
+                self.launch_pack_to_dev_frame(state_pool, src_active_slot, dev_addr, stream)
+            {
+                self.free_vram_slots.push(target_v_idx);
+                return Err(e);
+            }
             self.locations[logical_id] = Some(CkptLocation::Vram(target_v_idx));
             self.touch_vram_lru(logical_id);
             Ok(())
@@ -681,27 +689,35 @@ impl GdnCheckpointPool {
                 HostCheckpointSlot::Pinned(pinned) => Some(pinned.dev_addr()),
                 HostCheckpointSlot::Pageable(_) => None,
             };
-            if let Some(dev_addr) = pinned_dev_addr {
-                self.launch_pack_to_dev_frame(state_pool, src_active_slot, dev_addr, stream)?;
+            let pack_res = if let Some(dev_addr) = pinned_dev_addr {
+                self.launch_pack_to_dev_frame(state_pool, src_active_slot, dev_addr, stream)
             } else {
-                let stage_addr = self.ensure_staging_addr(stream)?;
-                self.launch_pack_to_dev_frame(state_pool, src_active_slot, stage_addr, stream)?;
-                let bytes = self.layout.bundle_bytes;
-                if let Some(HostCheckpointSlot::Pageable(boxed)) = &mut self.host_storage[h_idx] {
-                    check_rc(
-                        // SAFETY: `stage_addr` and `boxed` both span `bytes`; synced below.
-                        unsafe {
-                            ffi::warp34_memcpy_d2h_async(
-                                boxed.as_mut_ptr().cast(),
-                                stage_addr as *const c_void,
-                                bytes,
-                                stream.handle,
-                            )
-                        },
-                        "pack GDN checkpoint stage->pageable",
-                    )?;
-                    stream.synchronize()?;
-                }
+                (|| -> Result<()> {
+                    let stage_addr = self.ensure_staging_addr(stream)?;
+                    self.launch_pack_to_dev_frame(state_pool, src_active_slot, stage_addr, stream)?;
+                    let bytes = self.layout.bundle_bytes;
+                    if let Some(HostCheckpointSlot::Pageable(boxed)) = &mut self.host_storage[h_idx]
+                    {
+                        check_rc(
+                            // SAFETY: `stage_addr` and `boxed` both span `bytes`; synced below.
+                            unsafe {
+                                ffi::warp34_memcpy_d2h_async(
+                                    boxed.as_mut_ptr().cast(),
+                                    stage_addr as *const c_void,
+                                    bytes,
+                                    stream.handle,
+                                )
+                            },
+                            "pack GDN checkpoint stage->pageable",
+                        )?;
+                        stream.synchronize()?;
+                    }
+                    Ok(())
+                })()
+            };
+            if let Err(e) = pack_res {
+                self.free_host_slots.push(h_idx);
+                return Err(e);
             }
             self.locations[logical_id] = Some(CkptLocation::Host(h_idx));
             Ok(())

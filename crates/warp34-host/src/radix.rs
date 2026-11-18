@@ -835,6 +835,45 @@ impl MambaRadixCache {
         n.mamba_lock_ref == 1 && n.mamba_value.is_some()
     }
 
+    pub fn can_recycle_locked_checkpoint_mamba(&self, nid: RadixNodeId) -> bool {
+        self.can_recycle_locked_mamba(nid)
+            && self.nodes[nid.0]
+                .mamba_value
+                .is_some_and(crate::cache::is_checkpoint_pool_slot)
+    }
+
+    /// Tombstones or deletes any live node currently holding `mamba_value == Some(slot)`,
+    /// returning any KV pages freed from unlocked leaf nodes.
+    pub fn invalidate_mamba_slot(&mut self, slot: i32) -> RadixEvictResult {
+        let mut out = RadixEvictResult::default();
+        if self.disable {
+            return out;
+        }
+        let nids: Vec<RadixNodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| n.alive && n.mamba_value == Some(slot))
+            .map(|n| n.id)
+            .collect();
+        for nid in nids {
+            if !self.nodes[nid.0].alive {
+                continue;
+            }
+            if !self.nodes[nid.0].children.is_empty() || self.nodes[nid.0].full_lock_ref > 0 {
+                self.nodes[nid.0].mamba_value = None;
+                if self.nodes[nid.0].mamba_lock_ref == 0 {
+                    self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
+                    self.mamba_lru_remove(nid);
+                }
+            } else {
+                self.delete_leaf_and_cleanup_tombstones(nid, &mut out);
+                // The caller (`apply_radix_donation`) already owns freeing `slot` on failure.
+                out.freed_mamba_slots.retain(|&s| s != slot);
+            }
+        }
+        out
+    }
+
     fn reclaim_internal_mamba(&mut self, nid: RadixNodeId) -> Option<i32> {
         if self.disable || nid == RadixNodeId::ROOT {
             return None;
@@ -1229,6 +1268,9 @@ impl ReqRadixState {
         let mut outcome = RadixDonationOutcome::default();
 
         let external_ckpt = replacement_slot.filter(|&s| crate::cache::is_checkpoint_pool_slot(s));
+        let recycle_prev_ckpt = external_ckpt.is_none()
+            && replacement_slot.is_none()
+            && radix.can_recycle_locked_checkpoint_mamba(self.last_locked_node);
         if let Some(cache_len) = self.last_track_seqlen
             && cache_len > self.protected_pages * self.page_size
             && cache_len <= self.token_ids.len()
@@ -1285,6 +1327,13 @@ impl ReqRadixState {
                     outcome.freed_mamba_slots.push(ckpt_slot);
                 } else {
                     outcome.pending_checkpoint_pack = Some((src_fp32_slot, ckpt_slot));
+                }
+            } else if recycle_prev_ckpt {
+                if !ins.mamba_already_existed
+                    && let Some(recycled_ckpt) = radix.reclaim_internal_mamba(prev_locked)
+                {
+                    radix.nodes[ins.terminal_node.0].mamba_value = Some(recycled_ckpt);
+                    outcome.pending_checkpoint_pack = Some((src_fp32_slot, recycled_ckpt));
                 }
             } else if ins.mamba_already_existed {
                 // Keep `donated_mamba_slot` in our ping-pong buffer (or free `replacement_slot` if provided).
@@ -1649,6 +1698,45 @@ mod tests {
         let don = req.donate_committed_checkpoint(&mut radix, None, false);
         assert_eq!(don.donated_seq_len, 128);
         assert_eq!(req.ping_pong_slots, [10, 3]);
+        assert!(radix.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_donate_committed_checkpoint_recycles_locked_checkpoint_pool_slot_and_invalidates() {
+        let ckpt0 = crate::cache::encode_checkpoint_pool_slot(0);
+        let mut radix = MambaRadixCache::new(16, 64);
+        let turn0: Vec<i32> = (0..64).collect();
+        radix.insert(&turn0, &[1, 2, 3, 4], &[], ckpt0, 0);
+
+        let mut req = ReqRadixState::new(16, 64, 1, [2, 3]);
+        let mut turn1 = turn0.clone();
+        turn1.extend(100..164);
+        let hit = radix.match_prefix(&turn1);
+        assert_eq!(hit.matched_tokens, 64);
+        assert_eq!(hit.mamba_slot, Some(ckpt0));
+        req.restore_prefix_hit(&mut radix, &turn1, &hit);
+        assert_eq!(req.pending_unpack_ckpt_slot, Some(ckpt0));
+        assert!(radix.can_recycle_locked_checkpoint_mamba(req.last_locked_node));
+
+        req.kv_pages.extend_from_slice(&[5, 6, 7, 8]);
+        let ckpts = req.plan_checkpoints(64);
+        req.commit_tokens(&turn1[64..], &ckpts);
+        // When `replacement_slot` is `None` because `checkpoint_pool` is full, finishing or
+        // advancing recycles `ckpt0` into `pending_checkpoint_pack` and frees all 3 FP32 slots.
+        let don = req.donate_committed_checkpoint(&mut radix, None, true);
+        assert_eq!(don.donated_seq_len, 128);
+        assert_eq!(don.pending_checkpoint_pack, Some((2, ckpt0)));
+        assert_eq!(don.freed_mamba_slots, vec![1, 2, 3]);
+        let hit1 = radix.match_prefix(&turn1);
+        assert_eq!(hit1.matched_tokens, 128);
+        assert_eq!(hit1.mamba_slot, Some(ckpt0));
+        assert!(radix.sanity_check().is_ok());
+
+        // If pack fails, `invalidate_mamba_slot(ckpt0)` deletes the unlocked leaf and any
+        // exposed tombstone ancestors cleanly while preserving `sanity_check()`.
+        let inv = radix.invalidate_mamba_slot(ckpt0);
+        assert_eq!(inv.freed_kv_pages, vec![5, 6, 7, 8, 1, 2, 3, 4]);
+        assert_eq!(radix.match_prefix(&turn1).matched_tokens, 0);
         assert!(radix.sanity_check().is_ok());
     }
 }

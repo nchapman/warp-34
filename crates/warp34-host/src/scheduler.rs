@@ -763,12 +763,16 @@ impl SchedulerV1 {
             if seq.prefix_bidir_len.is_some() {
                 Some(seq.radix_state.abort_and_release(&mut self.radix))
             } else if self.use_checkpoint_pool {
+                let can_recycle_ckpt = self
+                    .radix
+                    .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node);
                 let ckpt = if seq.radix_state.has_donatable_checkpoint() {
                     alloc_replacement_slot(&mut self.radix)
                 } else {
                     None
                 };
-                if ckpt.is_none() && seq.radix_state.has_donatable_checkpoint() {
+                if ckpt.is_none() && !can_recycle_ckpt && seq.radix_state.has_donatable_checkpoint()
+                {
                     Some(seq.radix_state.abort_and_release(&mut self.radix))
                 } else {
                     Some(
@@ -789,12 +793,14 @@ impl SchedulerV1 {
             // Donate intermediate or completed prefill checkpoint so concurrent
             // requests and retries can hit the warm prompt prefix.
             let rep = alloc_replacement_slot(&mut self.radix);
-            if rep.is_some()
-                || (!self.use_checkpoint_pool
-                    && self
-                        .radix
-                        .can_recycle_locked_mamba(seq.radix_state.last_locked_node))
-            {
+            let can_recycle = if self.use_checkpoint_pool {
+                self.radix
+                    .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node)
+            } else {
+                self.radix
+                    .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
+            };
+            if rep.is_some() || can_recycle {
                 Some(
                     seq.radix_state
                         .donate_committed_checkpoint(&mut self.radix, rep, false),
@@ -845,12 +851,15 @@ impl SchedulerV1 {
         if seq.prefix_bidir_len.is_some() {
             Some(seq.radix_state.abort_and_release(&mut self.radix))
         } else if self.use_checkpoint_pool {
+            let can_recycle_ckpt = self
+                .radix
+                .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node);
             let ckpt = if seq.radix_state.has_donatable_checkpoint() {
                 alloc_ckpt_slot(&mut self.radix)
             } else {
                 None
             };
-            if ckpt.is_none() && seq.radix_state.has_donatable_checkpoint() {
+            if ckpt.is_none() && !can_recycle_ckpt && seq.radix_state.has_donatable_checkpoint() {
                 Some(seq.radix_state.abort_and_release(&mut self.radix))
             } else {
                 Some(
