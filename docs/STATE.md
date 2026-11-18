@@ -1,8 +1,13 @@
 # warp34 — Session Orientation & Current State
 
-## Generation request diagnostics
+## Generation request diagnostics & automatic serving VRAM fit (`warp34 serve`)
 
-`warp34 serve` now emits structured per-turn summaries on stderr for generation APIs, including requested vs effective output budgets, stop reasons, cache usage and response timing. See [per-turn Docker logs](METRICS.md#per-turn-docker-logs) for a truncation query and field semantics. This is a source change, not part of the `0.1.0` image.
+- **Automatic Context & KV Format Fitting (`crates/warp34-host/src/model/{rank_capacity.rs,rank.rs,engine.rs}`, `crates/warp34-host/src/cli/{options.rs,commands.rs}`):**
+  - When `--ctx-size` / `--kv-pages` and `--max-model-len` are omitted, `warp34 serve` (`Qwen3_5Engine::load_for_serving_with_auto_fit` / `Qwen3_5ModelRank::fit_serving_plan`) automatically fits the largest `64`-page-aligned (`1,024`-token) context window up to the model's `max_position_embeddings` (`262,144` tokens / `16,384` pages) across Plain, `MTP`, and `DFlash2` after reserving weights (with automatic `MappedHostBuffer` embedding offload when needed), scratch arena, speculative drafter reserve, required GDN state slots, and runtime headroom.
+  - When `--kv-format` is omitted or set to `auto` on `head_dim == 256` models, `warp34 serve` prefers `tq4` (`3.07×`, rotated `Q8_0` boundaries + `TQ4` interior) when the full target context fits, and automatically steps down to `tq4_all` (`3.88×`, `132 B/row` `TQ4` across all attention layers) when doing so unlocks a larger context window (for example, fitting the full `262,144` context + `13` GDN state slots for `Qwen3.8-27B-W4A16-HGPTQ` + `DFlash2` on a single 24 GiB RTX 3090 Ti). When `--kv-format` is explicitly pinned, `warp34 serve` preserves the chosen format and auto-fits the maximum context that fits in VRAM.
+  - Added a `warp34` ASCII startup banner (`format_serve_boot_banner`) displaying hardware, model, speculative drafter, KV format (`[auto]` / `[auto: stepped down from tq4 to fit full context]` / `[configured]`), context window (`[auto-fit: ...% of ... model max]` / `[configured]`), GDN state pool slots, memory placement, and HTTP endpoint.
+- **Structured Per-Turn Request & Cache Logging (`crates/warp34-host/src/server/{request_log.rs,http.rs}`, `crates/warp34-host/src/{scheduler.rs,radix.rs}`):**
+  - `warp34 serve` emits structured per-turn JSON summaries (`inference.turn_end`, `inference.http_error`) on stderr for generation APIs, including requested vs effective output budgets, stop reasons, `MambaRadixCache` lookup diagnostics (`lookup_tokens`, `kv_matched_tokens`, `checkpoint_tokens`, `restored_tokens`, `reason`), and response timing. See [per-turn Docker logs](METRICS.md#per-turn-docker-logs) for a truncation query and field semantics.
 
 ## Multi-Architecture Hardware Verification (`sm_80` 2× A100-SXM4-40GB, `sm_86` 2× RTX 3090 / 3090 Ti, `sm_89` 2× RTX 4090)
 

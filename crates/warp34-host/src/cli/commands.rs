@@ -274,7 +274,7 @@ pub(crate) fn run_bench(
         } else if min_stage_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
             Some(min_stage_pages)
         } else {
-            None
+            Some(crate::model::DEFAULT_SERVING_TARGET_KV_PAGES)
         };
         let pages = kv_pages.or(default_pages);
         let state_slot_seqs = serve_state_slot_seqs(batch_size.max(8), spec_config.as_ref());
@@ -722,13 +722,151 @@ pub(crate) fn serve_state_slot_seqs(
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub(crate) struct ServeBootSummary {
+    pub(crate) served_model: String,
+    pub(crate) checkpoint_label: String,
+    pub(crate) gpu_name: String,
+    pub(crate) gpu_sm_tag: String,
+    pub(crate) gpu_sm_count: i32,
+    pub(crate) tp_size: usize,
+    pub(crate) total_vram_bytes: usize,
+    pub(crate) post_load_free_vram_bytes: usize,
+    pub(crate) kv_policy: KvFormatPolicy,
+    pub(crate) kv_policy_explicit: bool,
+    pub(crate) kv_policy_auto_adjusted: bool,
+    pub(crate) kv_pages: usize,
+    pub(crate) context_limit: usize,
+    pub(crate) max_model_context_tokens: usize,
+    pub(crate) context_auto_fitted: bool,
+    pub(crate) kv_pool_bytes_per_rank: usize,
+    pub(crate) state_slots: usize,
+    pub(crate) state_pool_bytes_per_rank: usize,
+    pub(crate) weight_bytes_per_rank: usize,
+    pub(crate) scratch_bytes_per_rank: usize,
+    pub(crate) host_embed_offload: bool,
+    pub(crate) embed_saved_bytes: usize,
+    pub(crate) speculative_label: String,
+    pub(crate) max_num_seqs: usize,
+    pub(crate) bind_addr: String,
+    pub(crate) auth_enabled: bool,
+    pub(crate) webui_enabled: bool,
+    pub(crate) use_cuda_graph: bool,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    let mib = 1024.0 * 1024.0;
+    let kv_desc = match s.kv_policy {
+        KvFormatPolicy::Tq4 => "tq4 (3.07x, rotated Q8_0 boundaries + TQ4 interior)",
+        KvFormatPolicy::Tq4All => "tq4_all (3.88x, 132B/row TQ4 all attention layers)",
+        KvFormatPolicy::Fp8 => "fp8 (2.00x, hardware E4M3)",
+        KvFormatPolicy::Q8_0 => "q8_0 (1.88x, 272B/row)",
+        KvFormatPolicy::Fp16 => "fp16 (1.00x, 512B/row)",
+        KvFormatPolicy::Bf16 => "bf16 (1.00x, 512B/row)",
+    };
+    let kv_mode_tag = if s.kv_policy_auto_adjusted {
+        "[auto: stepped down from tq4 to fit full context]"
+    } else if s.kv_policy_explicit {
+        "[configured]"
+    } else {
+        "[auto]"
+    };
+    let ctx_pct = if s.max_model_context_tokens > 0 {
+        ((s.context_limit as f64 / s.max_model_context_tokens as f64) * 100.0).round() as usize
+    } else {
+        100
+    };
+    let ctx_mode_tag = if s.context_auto_fitted {
+        format!(
+            "[auto-fit: {}% of {} model max]",
+            ctx_pct, s.max_model_context_tokens
+        )
+    } else {
+        "[configured]".to_string()
+    };
+    let embed_desc = if s.host_embed_offload {
+        format!(
+            "host-mapped ({:.2} GiB VRAM saved) [auto]",
+            s.embed_saved_bytes as f64 / gib
+        )
+    } else {
+        "gpu-resident".to_string()
+    };
+    let model_line = if s.served_model == s.checkpoint_label {
+        s.served_model.clone()
+    } else {
+        format!("{} ({})", s.served_model, s.checkpoint_label)
+    };
+    format!(
+        concat!(
+            "\n",
+            "                         _____ __ __\n",
+            " _      ______ _________|__  // // /\n",
+            "| | /| / / __ `/ ___/ __ \\/_ </ // /_\n",
+            "| |/ |/ / /_/ / /  / /_/ /__/ /__  __/\n",
+            "|__/|__/\\__,_/_/  / .___/____/  /_/   v{}\n",
+            "                 /_/                  Hybrid GDN + Attention + MoE CUDA Engine\n",
+            "\n",
+            "  Model        : {}\n",
+            "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
+            "  Speculative  : {}\n",
+            "  KV Cache     : {} {}\n",
+            "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
+            "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}) [auto-sized]\n",
+            "  Placement    : weights={:.2} GiB, scratch={:.0} MiB, embed={}, free={:.0} MiB\n",
+            "  Endpoint     : http://{} (auth={}, webui={}, cuda_graph={})\n",
+        ),
+        env!("CARGO_PKG_VERSION"),
+        model_line,
+        s.tp_size,
+        s.gpu_name,
+        s.gpu_sm_tag,
+        s.gpu_sm_count,
+        s.total_vram_bytes as f64 / gib,
+        s.tp_size,
+        s.speculative_label,
+        kv_desc,
+        kv_mode_tag,
+        s.context_limit,
+        s.kv_pages,
+        s.kv_pool_bytes_per_rank as f64 / gib,
+        ctx_mode_tag,
+        s.state_slots,
+        s.state_pool_bytes_per_rank as f64 / gib,
+        s.max_num_seqs,
+        s.weight_bytes_per_rank as f64 / gib,
+        s.scratch_bytes_per_rank as f64 / mib,
+        embed_desc,
+        s.post_load_free_vram_bytes as f64 / mib,
+        s.bind_addr,
+        if s.auth_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if s.webui_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if s.use_cuda_graph {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    )
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_serve(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
-        model,
+        model: raw_model,
         serve,
         resolved_model,
         tp,
@@ -736,29 +874,53 @@ pub(crate) fn run_serve(
         port,
         allow_remote_images,
         kv_format,
+        explicit_kv_format,
         kv_pages,
         use_cuda_graph,
         lora_modules,
         ..
     } = options;
+    let checkpoint_label = raw_model.clone();
     let model = serve
         .model_name
-        .map_or(model, |name| name.trim().to_string());
+        .map_or(raw_model, |name| name.trim().to_string());
     let max_num_seqs = serve.options.max_num_seqs;
     let max_model_len = serve.options.max_model_len;
     let auth_enabled = serve.options.api_key.is_some();
+    let webui_enabled = serve.options.webui;
     let spec_label = match spec_config.as_ref().map(|s| s.kind) {
         Some(crate::proposer::SpeculativeKind::Mtp) => {
             format!("mtp (k={})", spec_config.as_ref().map_or(3, |s| s.mtp_k))
         }
-        Some(crate::proposer::SpeculativeKind::DFlash2) => "dflash2".to_string(),
+        Some(crate::proposer::SpeculativeKind::DFlash2) => {
+            if let Some(draft) = spec_config.as_ref().and_then(|s| s.draft_model.as_deref()) {
+                let draft_short = std::path::Path::new(draft)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(draft);
+                format!("dflash2 ({draft_short})")
+            } else {
+                "dflash2".to_string()
+            }
+        }
         None => "none".to_string(),
     };
     let bind_addr = format!("{host}:{port}");
+    let kv_mode_init = if explicit_kv_format {
+        kv_format.clone()
+    } else {
+        format!("{kv_format} (auto)")
+    };
     println!(
-        "[warp34 serve] loading model={model} tp={tp} kv={kv_format} speculative={spec_label} for http://{bind_addr}"
+        "[warp34 serve] loading model={model} tp={tp} kv={kv_mode_init} speculative={spec_label} for http://{bind_addr}"
     );
     let worker_model = resolved_model;
+    let boot_info = std::sync::Arc::new(std::sync::OnceLock::new());
+    let boot_info_loader = std::sync::Arc::clone(&boot_info);
+    let spec_label_loader = spec_label.clone();
+    let checkpoint_label_loader = checkpoint_label.clone();
+    let model_loader = model.clone();
+    let bind_addr_loader = bind_addr.clone();
     let state = crate::server::OpenAiServerState::from_loader_with_options(
         model,
         allow_remote_images,
@@ -767,10 +929,11 @@ pub(crate) fn run_serve(
             let pages =
                 ServeCliConfig::effective_kv_pages(kv_pages, max_model_len, spec_config.as_ref());
             let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
-            let mut engine = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
+            let mut engine = Qwen3_5Engine::load_for_serving_with_auto_fit(
                 &worker_model,
                 tp,
                 policy,
+                !explicit_kv_format,
                 pages,
                 use_cuda_graph,
                 state_slot_seqs,
@@ -779,9 +942,70 @@ pub(crate) fn run_serve(
             )
             .map_err(|e| e.to_string())?;
             attach_cli_lora(&mut engine, &lora_modules, None, false).map_err(|e| e.to_string())?;
+            if let Some(r0) = engine.ranks.first() {
+                let props = r0.device.props().ok();
+                let (post_free, total_vram) = r0.device.mem_info().unwrap_or((0, 0));
+                let supports_fp8 = props.as_ref().is_some_and(|p| p.supports_fp8_kv());
+                let fit = engine.serving_fit;
+                let selected_kv_policy = fit.map_or(policy, |f| f.kv_policy);
+                let (page_bytes, state_bytes) = crate::model::Qwen3_5ModelRank::pool_geometry(
+                    &engine.cfg,
+                    tp,
+                    selected_kv_policy,
+                    supports_fp8,
+                );
+                let max_model_ctx = fit.map_or_else(
+                    || engine.cfg.max_position_embeddings.unwrap_or(262_144),
+                    |f| f.max_model_context_tokens,
+                );
+                let _ = boot_info_loader.set(ServeBootSummary {
+                    served_model: model_loader,
+                    checkpoint_label: checkpoint_label_loader,
+                    gpu_name: props
+                        .as_ref()
+                        .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
+                    gpu_sm_tag: props
+                        .as_ref()
+                        .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
+                    gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
+                    tp_size: tp,
+                    total_vram_bytes: total_vram,
+                    post_load_free_vram_bytes: post_free,
+                    kv_policy: selected_kv_policy,
+                    kv_policy_explicit: explicit_kv_format,
+                    kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
+                    kv_pages: r0.kv_pool.num_pages,
+                    context_limit: max_model_len
+                        .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
+                    max_model_context_tokens: max_model_ctx,
+                    context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
+                    kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
+                    state_slots: r0.state_pool.total_slots,
+                    state_pool_bytes_per_rank: state_bytes
+                        .saturating_mul(r0.state_pool.total_slots),
+                    weight_bytes_per_rank: r0.weight_arena.used(),
+                    scratch_bytes_per_rank: r0.scratch_arena.capacity(),
+                    host_embed_offload: r0.host_embed_tokens.is_some(),
+                    embed_saved_bytes: engine
+                        .cfg
+                        .vocab_size
+                        .saturating_mul(engine.cfg.hidden_size)
+                        .saturating_mul(2),
+                    speculative_label: spec_label_loader,
+                    max_num_seqs,
+                    bind_addr: bind_addr_loader,
+                    auth_enabled,
+                    webui_enabled,
+                    use_cuda_graph,
+                });
+            }
             Ok(engine)
         },
     )?;
+    if let Some(mut summary) = boot_info.get().cloned() {
+        summary.context_limit = state.worker.max_model_len();
+        print!("{}", format_serve_boot_banner(&summary));
+    }
     println!(
         "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens",
         if auth_enabled { "enabled" } else { "disabled" },

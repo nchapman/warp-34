@@ -39,6 +39,7 @@ pub struct Qwen3_5Engine {
     pub lora_registry: crate::lora::LoraAdapterRegistry,
     pub active_lora_id: i32,
     pub slice_lora_ids: Vec<i32>,
+    pub serving_fit: Option<ServingAutoFitPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,18 +122,42 @@ impl Qwen3_5Engine {
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve_hf_model_dir", e.to_string()))?;
-        Self::load_from_dir_with_capacity(
-            &dir,
+        let cfg = ModelConfig::from_dir(&dir)
+            .map_err(|e| loader_err_ctx("ModelConfig::from_dir", e.to_string()))?;
+        let archive = SafetensorsArchive::open(&dir)
+            .map_err(|e| loader_err_ctx("SafetensorsArchive::open", e.to_string()))?;
+        let (mut fit_plan, _, _) = Qwen3_5ModelRank::fit_serving_plan(
+            &archive,
+            &cfg,
             tp_size,
             kv_policy,
+            false,
+            requested_kv_pages,
+            state_slots,
+            native_mtp,
+            None,
+            LoraCapacityReserve::default(),
+        )?;
+        let mut engine = Self::load_from_dir_with_capacity(
+            &dir,
+            tp_size,
+            fit_plan.kv_policy,
             PoolCapacity {
-                kv_pages: requested_kv_pages,
+                kv_pages: Some(fit_plan.kv_pages),
                 state_slots: Some(state_slots),
                 native_mtp,
                 ..PoolCapacity::default()
             },
             use_cuda_graph,
-        )
+        )?;
+        if let Some(r0) = engine.ranks.first() {
+            fit_plan.kv_pages = r0.kv_pool.num_pages;
+            fit_plan.context_tokens = r0.kv_pool.num_pages.saturating_mul(16);
+            fit_plan.estimated_state_slots = r0.state_pool.total_slots;
+            fit_plan.host_embed_offload = r0.host_embed_tokens.is_some();
+        }
+        engine.serving_fit = Some(fit_plan);
+        Ok(engine)
     }
 
     /// Serving admission and activation with the selected speculative checkpoint.
@@ -172,20 +197,58 @@ impl Qwen3_5Engine {
         speculative: Option<&crate::proposer::SpeculativeConfig>,
         lora_modules: &[crate::lora::LoraModuleSpec],
     ) -> Result<Self> {
+        Self::load_for_serving_with_auto_fit(
+            model_spec,
+            tp_size,
+            kv_policy,
+            false,
+            requested_kv_pages,
+            use_cuda_graph,
+            max_num_seqs,
+            speculative,
+            lora_modules,
+        )
+    }
+
+    /// Serving admission and activation with automatic VRAM context fitting and optional
+    /// `tq4 -> tq4_all` KV format step-down when `--kv-format` was not explicitly pinned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_serving_with_auto_fit(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        allow_kv_format_stepdown: bool,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+        speculative: Option<&crate::proposer::SpeculativeConfig>,
+        lora_modules: &[crate::lora::LoraModuleSpec],
+    ) -> Result<Self> {
         use crate::proposer::SpeculativeKind;
         let base_state_slots = serving_state_slots(max_num_seqs)?;
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
+        if let Some(config) = speculative
+            && config.kind == SpeculativeKind::DFlash2
+            && config.draft_model.is_none()
+        {
+            return Err(loader_err("DFlash2 requires --draft-model"));
+        }
         let lora_reserve = crate::lora::estimate_lora_reserve_from_specs(lora_modules, tp_size)
             .map_err(|e| loader_err_ctx("LoRA memory preflight", e.to_string()))?;
         let mut selected = speculative.cloned();
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve target checkpoint", e.to_string()))?;
+        let cfg = ModelConfig::from_dir(&dir)
+            .map_err(|e| loader_err_ctx("target config", e.to_string()))?;
+        let archive = SafetensorsArchive::open(&dir)
+            .map_err(|e| loader_err_ctx("SafetensorsArchive::open", e.to_string()))?;
         let mut capacity = PoolCapacity {
             kv_pages: requested_kv_pages,
             state_slots: Some(base_state_slots),
             lora_reserve,
             ..PoolCapacity::default()
         };
+        let mut resolved_draft: Option<std::path::PathBuf> = None;
         if let Some(config) = &mut selected {
             match config.kind {
                 SpeculativeKind::Mtp => {
@@ -200,24 +263,6 @@ impl Qwen3_5Engine {
                         .ok_or_else(|| loader_err("DFlash2 requires --draft-model"))?;
                     let draft = resolve_hf_model_dir(name)
                         .map_err(|e| loader_err_ctx("resolve DFlash2 checkpoint", e.to_string()))?;
-                    let cfg = ModelConfig::from_dir(&dir)
-                        .map_err(|e| loader_err_ctx("target config", e.to_string()))?;
-                    // Fix the page request explicitly. Pool admission must not grow
-                    // beyond this bound, which also bounds draft suffix/KV/RoPE.
-                    let pages = requested_kv_pages.unwrap_or(256);
-                    let tokens = pages
-                        .checked_mul(16)
-                        .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
-                    let draft_plan = crate::dflash::serving_reserve(&draft, &cfg, tp_size, tokens)
-                        .map_err(|e| {
-                            loader_err_ctx(
-                                "DFlash2 memory preflight",
-                                format!("{}: {e}", draft.display()),
-                            )
-                        })?;
-                    capacity.dflash_reserve_bytes = draft_plan.resident_bytes;
-                    capacity.dflash_min_state_slots = draft_plan.min_state_slots;
-                    capacity.kv_pages = Some(pages);
                     capacity.state_slots = Some(
                         serving_state_slots(max_num_seqs.max(6))?
                             .max(max_num_seqs.saturating_mul(10)),
@@ -228,11 +273,34 @@ impl Qwen3_5Engine {
                             .ok_or_else(|| loader_err("DFlash checkpoint path is not UTF-8"))?
                             .to_owned(),
                     );
+                    resolved_draft = Some(draft);
                 }
             }
         }
-        let mut engine =
-            Self::load_from_dir_with_capacity(&dir, tp_size, kv_policy, capacity, use_cuda_graph)?;
+        let (mut fit_plan, dflash_reserve_bytes, dflash_min_state_slots) =
+            Qwen3_5ModelRank::fit_serving_plan(
+                &archive,
+                &cfg,
+                tp_size,
+                kv_policy,
+                allow_kv_format_stepdown,
+                requested_kv_pages,
+                capacity.state_slots.unwrap_or(base_state_slots),
+                capacity.native_mtp,
+                resolved_draft.as_deref(),
+                lora_reserve,
+            )?;
+        capacity.kv_pages = Some(fit_plan.kv_pages);
+        capacity.dflash_reserve_bytes = dflash_reserve_bytes;
+        capacity.dflash_min_state_slots = dflash_min_state_slots;
+
+        let mut engine = Self::load_from_dir_with_capacity(
+            &dir,
+            tp_size,
+            fit_plan.kv_policy,
+            capacity,
+            use_cuda_graph,
+        )?;
         if capacity.dflash_reserve_bytes != 0
             && engine
                 .ranks
@@ -249,6 +317,13 @@ impl Qwen3_5Engine {
         if let Some(config) = &selected {
             engine.enable_speculative(config)?;
         }
+        if let Some(r0) = engine.ranks.first() {
+            fit_plan.kv_pages = r0.kv_pool.num_pages;
+            fit_plan.context_tokens = r0.kv_pool.num_pages.saturating_mul(16);
+            fit_plan.estimated_state_slots = r0.state_pool.total_slots;
+            fit_plan.host_embed_offload = r0.host_embed_tokens.is_some();
+        }
+        engine.serving_fit = Some(fit_plan);
         Ok(engine)
     }
 
@@ -519,6 +594,7 @@ impl Qwen3_5Engine {
             lora_registry: crate::lora::LoraAdapterRegistry::new(),
             active_lora_id: crate::lora::BASE_MODEL_LORA_ID,
             slice_lora_ids: Vec::new(),
+            serving_fit: None,
         })
     }
 

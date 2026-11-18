@@ -680,6 +680,139 @@ mod serving_capacity_tests {
     }
 
     #[test]
+    fn evaluate_serving_kv_candidate_budget_distinguishes_tq4_and_tq4_all_at_256k() {
+        use super::super::rank_capacity::evaluate_serving_kv_candidate_budget;
+        let mib = 1024 * 1024;
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.tie_word_embeddings = false;
+        cfg.vocab_size = 248_320;
+        cfg.hidden_size = 5120;
+        cfg.num_hidden_layers = 64;
+        cfg.indexer_n_heads = 0;
+        cfg.ple_layer_ids.clear();
+        cfg.num_key_value_heads = 4;
+        cfg.head_dim = 256;
+        cfg.linear_num_key_heads = 16;
+        cfg.linear_num_value_heads = 48;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.linear_conv_kernel_dim = 4;
+        cfg.layer_types = (0..64)
+            .map(|i| {
+                if i % 4 == 3 {
+                    LayerKind::FullAttention
+                } else {
+                    LayerKind::LinearAttention
+                }
+            })
+            .collect();
+
+        let raw_est = 17_024 * mib;
+        let staging = 256 * mib;
+        let marlin_ws = 8 * mib;
+        let free_24g = 24_148 * mib;
+        let dflash_reserve = 2_150 * mib;
+        let dflash_min_slots = 11;
+
+        // 1. On 1x 24 GiB with 27B + DFlash2, 256K (16,384 pages) does not fit in Tq4
+        //    with 11 required GDN state slots, but fits in Tq4All with >= 11 state slots
+        //    and host-mapped embed_tokens.
+        assert_eq!(
+            evaluate_serving_kv_candidate_budget(
+                &cfg,
+                1,
+                KvFormatPolicy::Tq4,
+                false,
+                16_384,
+                raw_est,
+                staging,
+                marlin_ws,
+                free_24g,
+                60,
+                false,
+                false,
+                true,
+                dflash_reserve,
+                dflash_min_slots,
+                LoraCapacityReserve::default(),
+                true,
+            ),
+            None
+        );
+        let (slots_tq4_all, host_embed) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4All,
+            false,
+            16_384,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            60,
+            false,
+            false,
+            true,
+            dflash_reserve,
+            dflash_min_slots,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B + DFlash2 must fit 256K in Tq4All on 24 GiB");
+        assert!(slots_tq4_all >= dflash_min_slots);
+        assert!(host_embed);
+
+        // 2. When --kv-format tq4 is explicitly pinned, 27B + DFlash2 still fits >= 220K
+        //    (13,760 pages) on 24 GiB.
+        let (slots_tq4_220k, host_embed_220k) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            13_760,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            60,
+            false,
+            false,
+            true,
+            dflash_reserve,
+            dflash_min_slots,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B + DFlash2 with explicit Tq4 must fit 220K on 24 GiB");
+        assert!(slots_tq4_220k >= dflash_min_slots);
+        assert!(host_embed_220k);
+
+        // 3. Without DFlash2 (27B Plain), 256K (16,384 pages) fits directly in Tq4.
+        let (slots_plain, _) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            16_384,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            8,
+            false,
+            false,
+            true,
+            0,
+            0,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B Plain must fit 256K in Tq4 on 24 GiB");
+        assert!(slots_plain >= 4);
+    }
+
+    #[test]
     fn plan_mtp_draft_lm_head_bytes_respects_quantization_geometry_and_headroom() {
         use crate::mtp::{
             MTP_DRAFT_LM_HEAD_ARENA_SLACK_BYTES, MTP_DRAFT_LM_HEAD_GROUP_SIZE,

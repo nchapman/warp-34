@@ -91,10 +91,11 @@ Model & Hub Options:
   --lora, --active-lora <name|spec>   Activate a LoRA adapter for single-sequence CLI commands
 
 Context & KV Cache Options:
-  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (default: auto up to 32k serve,
+  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (default: auto-fit up to 256k in serve,
                                       16k chat, 4k generate; supports k/M suffixes: 4k, 16k, 32k, 64k, 128k, 256k;
                                       aliases: --context-length, --kv-tokens)
-  --kv-format <policy>                tq4 (default, 3.07x), tq4_all (3.88x), fp8, q8_0, fp16, bf16, auto
+  --kv-format <policy>                tq4 (default, 3.07x; auto-fits tq4_all in serve when needed for full context),
+                                      tq4_all (3.88x), fp8, q8_0, fp16, bf16, auto
                                       (aliases: --kv-cache-dtype, --cache-type-k)
   --kv-pages <n>                      Target KV pool in 16-token pages (low-level alternative to --ctx-size)
 
@@ -228,34 +229,25 @@ pub(crate) struct ServeCliConfig {
 
 #[cfg(feature = "cuda")]
 impl ServeCliConfig {
-    /// Derives the target KV page request for `warp34 serve`:
+    /// Derives the explicit KV page request for `warp34 serve`:
     /// - When `--ctx-size` or `--kv-pages` was explicitly set, honors `kv_pages`.
-    /// - When `--speculative` is enabled, pins the serving KV page request to
-    ///   `max_model_len.div_ceil(16)` or [`crate::model::DEFAULT_SERVING_TARGET_KV_PAGES`] (`2,048` pages = `32,768` tokens).
-    /// - Otherwise, if `--max-model-len` was set and requires more pages than the default,
-    ///   auto-expands the target KV page request to accommodate `max_model_len`.
+    /// - When `--max-model-len` was explicitly set, sizes the KV pool to at least
+    ///   `max_model_len.div_ceil(16)` pages.
+    /// - Otherwise returns `None` so [`Qwen3_5Engine::load_for_serving_with_auto_fit`]
+    ///   automatically fits the maximum context window up to the model's `max_position_embeddings`.
     pub(crate) fn effective_kv_pages(
         kv_pages: Option<usize>,
         max_model_len: Option<usize>,
-        spec_config: Option<&crate::proposer::SpeculativeConfig>,
+        _spec_config: Option<&crate::proposer::SpeculativeConfig>,
     ) -> Option<usize> {
         if let Some(explicit) = kv_pages {
             return Some(explicit);
         }
-        let needed_for_max_len = max_model_len.map(|tokens| tokens.div_ceil(16));
-        if spec_config.is_some() {
-            Some(
-                needed_for_max_len
-                    .unwrap_or(crate::model::DEFAULT_SERVING_TARGET_KV_PAGES)
-                    .max(crate::model::DEFAULT_TARGET_KV_PAGES),
-            )
-        } else if let Some(needed) = needed_for_max_len
-            && needed > crate::model::DEFAULT_SERVING_TARGET_KV_PAGES
-        {
-            Some(needed)
-        } else {
-            None
-        }
+        max_model_len.map(|tokens| {
+            tokens
+                .div_ceil(16)
+                .max(crate::model::DEFAULT_TARGET_KV_PAGES)
+        })
     }
 
     fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
@@ -419,6 +411,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) gen_len: usize,
     pub(crate) realistic_prompt: bool,
     pub(crate) kv_format: String,
+    pub(crate) explicit_kv_format: bool,
     pub(crate) golden_path: Option<String>,
     pub(crate) out_json: Option<String>,
     pub(crate) max_prompts: usize,
@@ -486,6 +479,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut gen_len = 128usize;
     let mut realistic_prompt = false;
     let mut kv_format = "tq4".to_string();
+    let mut explicit_kv_format = false;
     let mut golden_path: Option<String> = None;
     let mut out_json: Option<String> = None;
     let mut max_prompts = 12usize;
@@ -679,6 +673,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--kv-format" | "--kv-cache-dtype" | "--cache-type-k" => {
                 i += 1;
                 kv_format = args.get(i).cloned().ok_or("missing --kv-format")?;
+                explicit_kv_format = !kv_format.trim().eq_ignore_ascii_case("auto");
             }
             "--golden" => {
                 i += 1;
@@ -860,6 +855,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         gen_len,
         realistic_prompt,
         kv_format,
+        explicit_kv_format,
         golden_path,
         out_json,
         max_prompts,

@@ -177,6 +177,32 @@ fn single_client_27b_dflash_serving_preserves_32k_context() {
     .expect("single-client DFlash must not require the preferred 24-slot state pool");
     assert_eq!(engine.ranks[0].kv_pool.num_pages, 2048);
     assert!(engine.ranks[0].state_pool.total_slots >= 11);
+    drop(engine);
+
+    let auto_engine = Qwen3_5Engine::load_for_serving_with_auto_fit(
+        target.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Tq4,
+        true,
+        None,
+        true,
+        6,
+        Some(&SpeculativeConfig {
+            kind: SpeculativeKind::DFlash2,
+            draft_model: Some(draft.to_str().unwrap().to_owned()),
+            mtp_k: 3,
+        }),
+        &[],
+    )
+    .expect("single-client 27B DFlash2 auto-fit must select tq4_all and 262k context on 24 GiB");
+    let fit = auto_engine
+        .serving_fit
+        .expect("serving_fit must be populated");
+    assert_eq!(fit.kv_policy, KvFormatPolicy::Tq4All);
+    assert!(fit.kv_policy_auto_adjusted);
+    assert!(fit.kv_pages_auto_fitted);
+    assert_eq!(auto_engine.ranks[0].kv_pool.num_pages, 16_384);
+    assert!(auto_engine.ranks[0].state_pool.total_slots >= 11);
 }
 
 #[test]

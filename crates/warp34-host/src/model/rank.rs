@@ -887,12 +887,239 @@ impl Qwen3_5ModelRank {
         Err(loader_err_msg("missing model.embed_tokens.weight"))
     }
 
+    pub(crate) fn pool_geometry(
+        cfg: &ModelConfig,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        supports_fp8_kv: bool,
+    ) -> (usize, usize) {
+        target_pool_geometry_with_fp8(cfg, tp_size, kv_policy, supports_fp8_kv)
+    }
+
     pub(super) fn populate_shared_vocab(
         cell: &SharedVocabHost,
         archive: &SafetensorsArchive,
         cfg: &ModelConfig,
     ) {
         let _ = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));
+    }
+
+    #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+    pub(super) fn fit_serving_plan(
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+        tp_size: usize,
+        requested_policy: KvFormatPolicy,
+        allow_kv_format_stepdown: bool,
+        requested_kv_pages: Option<usize>,
+        requested_state_slots: usize,
+        native_mtp: bool,
+        dflash_draft_dir: Option<&Path>,
+        lora_reserve: LoraCapacityReserve,
+    ) -> Result<(ServingAutoFitPlan, usize, usize)> {
+        Self::validate_tp_geometry(cfg, tp_size)?;
+        let mut min_free_vram = usize::MAX;
+        let mut min_total_vram = usize::MAX;
+        let mut supports_fp8_kv = true;
+        let mut marlin_ws_bytes = 0usize;
+        for r in 0..tp_size {
+            let device_id = r as i32;
+            prepare_execution_plan(device_id)?;
+            let device = CudaDevice::set_current(device_id)?;
+            let dev_props = device.props()?;
+            dev_props.validate_supported()?;
+            supports_fp8_kv &= dev_props.supports_fp8_kv();
+            marlin_ws_bytes = marlin_ws_bytes.max(dev_props.marlin_workspace_bytes());
+            let (free_vram, total_vram) = device.mem_info()?;
+            min_free_vram = min_free_vram.min(free_vram);
+            min_total_vram = min_total_vram.min(total_vram);
+        }
+        let _ = CudaDevice::set_current(0)?;
+
+        let raw_est_default = Self::estimate_weight_arena_bytes(cfg, archive, tp_size, Some(0));
+        let raw_est_extreme = Self::estimate_weight_arena_bytes(
+            cfg,
+            archive,
+            tp_size,
+            Some(EXTREME_LONGCTX_MIN_PAGES),
+        );
+        let max_packed_tensor_bytes = archive
+            .iter_entries()
+            .filter(|(name, info)| {
+                matches!(info.dtype.as_str(), "I32" | "U32")
+                    && !name.contains(".ple_embedding.")
+                    && !(cfg.uses_tiered_moe() && name.contains(".experts."))
+            })
+            .map(|(name, info)| {
+                let bytes = info.len_bytes as usize;
+                if name.starts_with("lm_head.")
+                    || name.contains(".lm_head.")
+                    || name.contains(".experts.")
+                {
+                    bytes.div_ceil(tp_size)
+                } else {
+                    bytes
+                        .div_ceil(tp_size)
+                        .saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let staging_bytes = MIN_REPACK_STAGING_BYTES.max(max_packed_tensor_bytes);
+        let archive_has_vision = has_vision_weights(cfg, archive);
+        let mtp_experts_w4 = cfg.quant.bits() == 4
+            && (archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                    .is_some());
+
+        let max_cap_tokens = if dflash_draft_dir.is_some() {
+            crate::dflash::DFLASH2_MAX_KV_CAPACITY
+        } else {
+            262_144
+        };
+        let max_model_context_tokens = cfg
+            .max_position_embeddings
+            .unwrap_or(262_144)
+            .clamp(DEFAULT_TARGET_KV_PAGES * 16, max_cap_tokens);
+        let max_target_pages = ((max_model_context_tokens / 16) & !63).max(DEFAULT_TARGET_KV_PAGES);
+        let dflash_max_plan = if let Some(draft) = dflash_draft_dir {
+            let bound_pages = requested_kv_pages.unwrap_or(max_target_pages);
+            let tokens = bound_pages
+                .checked_mul(16)
+                .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
+            Some(
+                crate::dflash::serving_reserve(draft, cfg, tp_size, tokens).map_err(|e| {
+                    loader_err_ctx(
+                        "DFlash2 memory preflight",
+                        format!("{}: {e}", draft.display()),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let dflash_res_upper = dflash_max_plan.as_ref().map_or(0, |p| p.resident_bytes);
+        let dflash_slots_upper = dflash_max_plan.as_ref().map_or(0, |p| p.min_state_slots);
+
+        let eval_candidate = |policy: KvFormatPolicy, pages: usize, auto_mode: bool| {
+            let raw_est = if tp_size == 1
+                && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+                && pages >= EXTREME_LONGCTX_MIN_PAGES
+            {
+                raw_est_extreme
+            } else {
+                raw_est_default
+            };
+            evaluate_serving_kv_candidate_budget(
+                cfg,
+                tp_size,
+                policy,
+                supports_fp8_kv,
+                pages,
+                raw_est,
+                staging_bytes,
+                marlin_ws_bytes,
+                min_free_vram,
+                requested_state_slots,
+                native_mtp,
+                mtp_experts_w4,
+                archive_has_vision,
+                dflash_res_upper,
+                dflash_slots_upper,
+                lora_reserve,
+                auto_mode,
+            )
+        };
+
+        let find_for_policy = |policy: KvFormatPolicy| -> Option<(usize, usize, bool)> {
+            if let Some(explicit_pages) = requested_kv_pages {
+                return eval_candidate(policy, explicit_pages, false)
+                    .map(|(slots, host_embed)| (explicit_pages, slots, host_embed));
+            }
+            for auto_mode in [true, false] {
+                let mut pages = max_target_pages;
+                loop {
+                    if let Some((slots, host_embed)) = eval_candidate(policy, pages, auto_mode) {
+                        return Some((pages, slots, host_embed));
+                    }
+                    if pages <= DEFAULT_TARGET_KV_PAGES {
+                        break;
+                    }
+                    pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+                }
+            }
+            None
+        };
+
+        let mut selected_policy = requested_policy;
+        let mut policy_adjusted = false;
+        if cfg.head_dim != 256
+            && allow_kv_format_stepdown
+            && !matches!(selected_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
+        {
+            selected_policy = KvFormatPolicy::Fp16;
+            policy_adjusted = true;
+        }
+
+        let mut selected_fit = find_for_policy(selected_policy);
+        let goal_pages = requested_kv_pages.unwrap_or(max_target_pages);
+        if allow_kv_format_stepdown
+            && selected_policy == KvFormatPolicy::Tq4
+            && cfg.head_dim == 256
+            && selected_fit.map_or(0, |f| f.0) < goal_pages
+            && let Some(tq4_all_fit) = find_for_policy(KvFormatPolicy::Tq4All)
+            && selected_fit.is_none_or(|cur| tq4_all_fit.0 > cur.0)
+        {
+            selected_policy = KvFormatPolicy::Tq4All;
+            selected_fit = Some(tq4_all_fit);
+            policy_adjusted = true;
+        }
+
+        let (fitted_pages, estimated_state_slots, host_embed_offload) = selected_fit
+            .unwrap_or_else(|| {
+                let fallback_pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
+                (
+                    fallback_pages,
+                    dflash_slots_upper.max(MIN_ACTIVE_STATE_SLOTS),
+                    !cfg.tie_word_embeddings,
+                )
+            });
+
+        let (final_dflash_reserve, final_dflash_slots) = if let Some(draft) = dflash_draft_dir {
+            let tokens = fitted_pages
+                .checked_mul(16)
+                .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
+            let plan =
+                crate::dflash::serving_reserve(draft, cfg, tp_size, tokens).map_err(|e| {
+                    loader_err_ctx(
+                        "DFlash2 memory preflight",
+                        format!("{}: {e}", draft.display()),
+                    )
+                })?;
+            (plan.resident_bytes, plan.min_state_slots)
+        } else {
+            (0, 0)
+        };
+
+        Ok((
+            ServingAutoFitPlan {
+                kv_policy: selected_policy,
+                kv_pages: fitted_pages,
+                context_tokens: fitted_pages.saturating_mul(16),
+                max_model_context_tokens,
+                estimated_state_slots,
+                host_embed_offload,
+                min_free_vram_bytes: min_free_vram,
+                total_vram_bytes: min_total_vram,
+                kv_policy_auto_adjusted: policy_adjusted,
+                kv_pages_auto_fitted: requested_kv_pages.is_none(),
+            },
+            final_dflash_reserve,
+            final_dflash_slots,
+        ))
     }
 
     #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]

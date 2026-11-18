@@ -908,8 +908,9 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         assert!(res.is_err(), "{bad_args:?}");
     }
 
-    // ServeCliConfig::effective_kv_pages auto-expands target KV pages when --max-model-len
-    // exceeds the default serving budget or when --speculative is active.
+    // ServeCliConfig::effective_kv_pages returns None when neither --ctx-size/--kv-pages
+    // nor --max-model-len is set so the serving auto-fit planner sizes KV up to model max,
+    // and returns the required pages when --max-model-len or --kv-pages is explicitly set.
     let mtp = crate::proposer::SpeculativeConfig {
         kind: crate::proposer::SpeculativeKind::Mtp,
         draft_model: None,
@@ -918,7 +919,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     assert_eq!(ServeCliConfig::effective_kv_pages(None, None, None), None);
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(16_384), None),
-        None
+        Some(1024)
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(65_536), None),
@@ -926,7 +927,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, None, Some(&mtp)),
-        Some(2048)
+        None
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(16_384), Some(&mtp)),
@@ -936,6 +937,13 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         ServeCliConfig::effective_kv_pages(Some(512), Some(65_536), Some(&mtp)),
         Some(512)
     );
+
+    // --kv-format auto (or omitted --kv-format) leaves explicit_kv_format=false so serve can
+    // step down tq4 -> tq4_all when needed; explicit --kv-format pins explicit_kv_format=true.
+    assert!(!parse(&["serve", "Qwen/Qwen3.5-4B"]).explicit_kv_format);
+    assert!(!parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "auto"]).explicit_kv_format);
+    assert!(parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "tq4"]).explicit_kv_format);
+    assert!(parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "tq4_all"]).explicit_kv_format);
 }
 
 #[cfg(feature = "cuda")]
@@ -1099,4 +1107,42 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
             .any(|w| w == ["--image", "rgb://https://warp34.test/sample.ppm"])
     );
     assert!(prof_args.iter().any(|a| a == "--allow-remote-images"));
+
+    let banner = super::commands::format_serve_boot_banner(&super::commands::ServeBootSummary {
+        served_model: "qwen3.8-27b-warp34".to_string(),
+        checkpoint_label: "nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64".to_string(),
+        gpu_name: "NVIDIA GeForce RTX 3090 Ti".to_string(),
+        gpu_sm_tag: "sm_86".to_string(),
+        gpu_sm_count: 84,
+        tp_size: 1,
+        total_vram_bytes: 24 * 1024 * 1024 * 1024,
+        post_load_free_vram_bytes: 467 * 1024 * 1024,
+        kv_policy: KvFormatPolicy::Tq4All,
+        kv_policy_explicit: false,
+        kv_policy_auto_adjusted: true,
+        kv_pages: 16_384,
+        context_limit: 262_144,
+        max_model_context_tokens: 262_144,
+        context_auto_fitted: true,
+        kv_pool_bytes_per_rank: 4_429_185_024,
+        state_slots: 13,
+        state_pool_bytes_per_rank: 1_969_225_728,
+        weight_bytes_per_rank: 15_204_352_000,
+        scratch_bytes_per_rank: 336 * 1024 * 1024,
+        host_embed_offload: true,
+        embed_saved_bytes: 2_542_796_800,
+        speculative_label: "dflash2 (Qwen3.8-27B-DFlash2-W4A16-HGPTQ)".to_string(),
+        max_num_seqs: 1,
+        bind_addr: "0.0.0.0:8000".to_string(),
+        auth_enabled: false,
+        webui_enabled: true,
+        use_cuda_graph: true,
+    });
+    assert!(banner.contains("|__/|__/\\__,_/_/  / .___/____/  /_/"));
+    assert!(banner.contains("qwen3.8-27b-warp34 (nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64)"));
+    assert!(banner.contains("tq4_all (3.88x, 132B/row TQ4 all attention layers) [auto: stepped down from tq4 to fit full context]"));
+    assert!(banner.contains("262144 tokens (16384 pages"));
+    assert!(banner.contains("[auto-fit: 100% of 262144 model max]"));
+    assert!(banner.contains("13 slots"));
+    assert!(banner.contains("host-mapped"));
 }

@@ -71,8 +71,26 @@ pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 /// Layer-count threshold (`64` layers) for applying [`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`].
 pub const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
 
-/// Page-count threshold (`14,336` pages = `224K` tokens) for extreme long-context headroom.
-pub const EXTREME_LONGCTX_MIN_PAGES: usize = 14_336;
+/// Page-count threshold (`8,192` pages = `128K` tokens) for extreme long-context headroom.
+pub const EXTREME_LONGCTX_MIN_PAGES: usize = 8_192;
+
+/// Live allocation rounding margin (`64 MiB`) preserved when pre-fitting serving KV capacity.
+pub const AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Summary of the serving KV format and context capacity selected by automatic VRAM fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServingAutoFitPlan {
+    pub kv_policy: KvFormatPolicy,
+    pub kv_pages: usize,
+    pub context_tokens: usize,
+    pub max_model_context_tokens: usize,
+    pub estimated_state_slots: usize,
+    pub host_embed_offload: bool,
+    pub min_free_vram_bytes: usize,
+    pub total_vram_bytes: usize,
+    pub kv_policy_auto_adjusted: bool,
+    pub kv_pages_auto_fitted: bool,
+}
 
 /// Rounding quantum (`2 MiB`) for `weight_arena` capacity estimation.
 pub const WEIGHT_ARENA_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -739,4 +757,211 @@ pub(super) fn resident_moe_mtp_serving_reserve(
     } else {
         0
     }
+}
+
+/// Evaluates whether a candidate `(kv_policy, pages)` serving allocation passes both
+/// `load_rank_pre_pool` and `finalize_runtime_and_pools` admission on a rank with `free_vram`.
+///
+/// Returns `Some((estimated_state_slots, use_host_embed))` when the candidate fits.
+#[cfg(any(test, feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evaluate_serving_kv_candidate_budget(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    kv_policy: KvFormatPolicy,
+    supports_fp8_kv: bool,
+    pages: usize,
+    raw_est_weight_bytes: usize,
+    staging_bytes: usize,
+    marlin_ws_bytes: usize,
+    free_vram: usize,
+    requested_state_slots: usize,
+    native_mtp: bool,
+    mtp_experts_w4: bool,
+    archive_has_vision: bool,
+    dflash_reserve_bytes: usize,
+    dflash_min_state_slots: usize,
+    lora_reserve: LoraCapacityReserve,
+    auto_fit_mode: bool,
+) -> Option<(usize, bool)> {
+    if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16) {
+        return None;
+    }
+    if matches!(kv_policy, KvFormatPolicy::Fp8) && !supports_fp8_kv {
+        return None;
+    }
+    let mut scratch_bytes = plan_scratch_arena_bytes_with_lora(
+        cfg,
+        tp_size,
+        raw_est_weight_bytes,
+        Some(pages),
+        lora_reserve,
+    );
+    if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+        scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
+    }
+    let (page_bytes, state_bytes) =
+        target_pool_geometry_with_fp8(cfg, tp_size, kv_policy, supports_fp8_kv);
+    let min_state_floor = if dflash_reserve_bytes != 0 {
+        dflash_min_state_slots
+    } else {
+        MIN_ACTIVE_STATE_SLOTS
+    };
+    let base_headroom = target_base_headroom(cfg, tp_size, pages, free_vram);
+    let mtp_dense_reserve = if native_mtp {
+        crate::mtp::dense_serving_reserve(cfg, tp_size, pages.saturating_mul(16))
+    } else {
+        0
+    };
+    let steady_without_states = BATCH_META_ARENA_BYTES
+        .saturating_add(marlin_ws_bytes.saturating_mul(2))
+        .saturating_add(page_bytes.saturating_mul(pages))
+        .saturating_add(base_headroom)
+        .saturating_add(dflash_reserve_bytes)
+        .saturating_add(lora_reserve.device_bytes_per_rank)
+        .saturating_add(mtp_dense_reserve);
+    let steady_bytes =
+        steady_without_states.saturating_add(state_bytes.saturating_mul(min_state_floor));
+    let resident_moe_mtp_reserve =
+        resident_moe_mtp_serving_reserve(cfg, true, native_mtp, mtp_experts_w4);
+    let desired_slots = requested_state_slots.max(min_state_floor);
+    let vision = if archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
+        VISION_ENCODER_LAZY_RESERVE_BYTES
+    } else {
+        0
+    };
+    let desired_gpu_steady_bytes = steady_without_states
+        .saturating_add(resident_moe_mtp_reserve)
+        .saturating_add(state_bytes.saturating_mul(desired_slots))
+        .saturating_add(vision);
+    let runtime_arena_bytes = BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes);
+    let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
+        cfg,
+        raw_est_weight_bytes,
+        scratch_bytes,
+        staging_bytes,
+        free_vram,
+        runtime_arena_bytes,
+        Some(steady_bytes),
+        Some(desired_gpu_steady_bytes),
+    );
+    let min_boot_bytes = est_weight_bytes
+        .saturating_add(scratch_bytes)
+        .saturating_add(staging_bytes)
+        .saturating_add(MIN_BOOT_MARGIN_BYTES);
+    if min_boot_bytes > free_vram {
+        return None;
+    }
+    if (est_weight_bytes as u128)
+        .saturating_add(scratch_bytes as u128)
+        .saturating_add(runtime_arena_bytes as u128)
+        .saturating_add(steady_bytes as u128)
+        > free_vram as u128
+    {
+        return None;
+    }
+
+    let ple_bytes = if cfg.uses_ple() {
+        let max_ple_tokens = if cfg.uses_tiered_moe() {
+            crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
+        } else {
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        };
+        let ple_row_bytes = cfg
+            .ple_embed_dim
+            .max(cfg.hidden_size)
+            .max(MIN_PLE_ROW_STAGING_BYTES);
+        max_ple_tokens.saturating_mul(ple_row_bytes)
+    } else {
+        0
+    };
+    let live_overhead = BATCH_META_ARENA_BYTES
+        .saturating_add(marlin_ws_bytes.saturating_mul(2))
+        .saturating_add(ple_bytes)
+        .saturating_add(AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES);
+    let post_weight_available = free_vram.checked_sub(
+        est_weight_bytes
+            .saturating_add(scratch_bytes)
+            .saturating_add(live_overhead),
+    )?;
+    let req_kv_bytes = page_bytes.saturating_mul(pages);
+    let min_state_slots_for_moe = {
+        let cap = if tp_size >= 2 {
+            if dflash_reserve_bytes > 0 {
+                dflash_min_state_slots.max(14)
+            } else if native_mtp && pages < 2048 {
+                16
+            } else {
+                18
+            }
+        } else {
+            PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+        };
+        requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
+    };
+    let (allocated_moe_bytes, post_pool_spec_or_moe_reserve) = if cfg.uses_tiered_moe() {
+        let (_, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
+            cfg,
+            tp_size,
+            post_weight_available,
+            base_headroom
+                .saturating_add(req_kv_bytes)
+                .saturating_add(lora_reserve.device_bytes_per_rank),
+            state_bytes.saturating_mul(min_state_slots_for_moe),
+            dflash_reserve_bytes,
+        );
+        let allocated_moe =
+            total_moe_reserve.saturating_sub(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES);
+        let post_pool_reserve = if dflash_reserve_bytes > 0 {
+            dflash_reserve_bytes
+        } else {
+            total_moe_reserve.saturating_sub(allocated_moe)
+        };
+        (allocated_moe, post_pool_reserve)
+    } else {
+        (0, dflash_reserve_bytes)
+    };
+    let available_for_pools = post_weight_available.checked_sub(allocated_moe_bytes)?;
+    let required_headroom = base_headroom
+        .saturating_add(mtp_dense_reserve)
+        .saturating_add(resident_moe_mtp_reserve)
+        .saturating_add(post_pool_spec_or_moe_reserve)
+        .saturating_add(lora_reserve.device_bytes_per_rank);
+    let effective_requested_state_slots = if cfg.uses_tiered_moe() {
+        let max_tiered_serving_slots = if tp_size >= 2 {
+            if native_mtp && pages < 2048 { 16 } else { 18 }
+        } else {
+            20
+        };
+        requested_state_slots.min(max_tiered_serving_slots)
+    } else {
+        requested_state_slots
+    };
+    let base_reserved = required_headroom.saturating_add(req_kv_bytes);
+    let target_min_slots = if !auto_fit_mode {
+        min_state_floor
+    } else if dflash_reserve_bytes != 0 {
+        dflash_min_state_slots
+    } else if native_mtp {
+        8.min(effective_requested_state_slots)
+            .max(MIN_ACTIVE_STATE_SLOTS)
+    } else {
+        4.min(effective_requested_state_slots)
+            .max(MIN_ACTIVE_STATE_SLOTS)
+    };
+    if available_for_pools
+        < base_reserved.saturating_add(state_bytes.saturating_mul(target_min_slots))
+    {
+        return None;
+    }
+    let total_state_slots = clamp_state_slots(
+        effective_requested_state_slots,
+        available_for_pools,
+        base_reserved,
+        state_bytes,
+    );
+    if total_state_slots < target_min_slots {
+        return None;
+    }
+    Some((total_state_slots, use_host_embed))
 }
