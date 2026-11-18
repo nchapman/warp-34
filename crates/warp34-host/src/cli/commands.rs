@@ -802,12 +802,12 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
     format!(
         concat!(
             "\n",
-            "                         _____ __ __\n",
-            " _      ______ _________|__  // // /\n",
-            "| | /| / / __ `/ ___/ __ \\/_ </ // /_\n",
+            "                          _____  __ __\n",
+            " _      ______ _________ |__  / / // /\n",
+            "| | /| / / __ `/ ___/ __ \\/_ < / // /_\n",
             "| |/ |/ / /_/ / /  / /_/ /__/ /__  __/\n",
-            "|__/|__/\\__,_/_/  / .___/____/  /_/   v{}\n",
-            "                 /_/                  Hybrid GDN + Attention + MoE CUDA Engine\n",
+            "|__/|__/\\__,_/_/  / .___/____/  /_/    v{}\n",
+            "                 /_/                   Hybrid GDN + Attention + MoE CUDA Engine\n",
             "\n",
             "  Model        : {}\n",
             "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
