@@ -2478,8 +2478,8 @@ mod tests {
         // follow-up prompt (`104,528` tokens) strips `<think>...</think>` back to `103,552`,
         // the 1,104-page single-slot ring still holds `[88,592 .. 106,248]`, so `103,552` is
         // restored directly without stepping back to `102,464` (`admission_filter`).
-        let long_res: Vec<i32> = (0..106_248).map(|i| i as i32).collect();
-        let next_prompt: Vec<i32> = (0..104_528).map(|i| i as i32).collect();
+        let long_res: Vec<i32> = (0..106_248).collect();
+        let next_prompt: Vec<i32> = (0..104_528).collect();
         assert!(!dflash_slot_has_prefix_for_prompt(
             &long_res,
             0,
