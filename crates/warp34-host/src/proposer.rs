@@ -53,6 +53,7 @@ struct MtpBatchSlot {
     tail: Vec<DeviceBuffer>,
     captured_verify_hidden: Vec<DeviceBuffer>,
     resident_tokens: Vec<i32>,
+    resident_valid_from: usize,
     processed: usize,
     current: Option<PrefixMemo>,
     last_used_tick: u64,
@@ -71,6 +72,7 @@ pub struct NativeProposer {
     current: Option<PrefixMemo>,
     memo_pinned_staging: Option<crate::cuda::MappedHostBuffer>,
     resident_tokens: Vec<i32>,
+    resident_valid_from: usize,
     processed: usize,
     mtp_batch_active_slot: usize,
     active_slot_last_used_tick: u64,
@@ -96,8 +98,25 @@ fn grow_memo_features(buf: &mut Vec<u8>, new_len: usize, row_bytes: usize) {
     buf.resize(new_len, 0);
 }
 
+pub(crate) fn dflash_effective_valid_from(
+    res_len: usize,
+    valid_from: usize,
+    ring_pages: Option<usize>,
+) -> usize {
+    if let Some(phys_pages) = ring_pages
+        && phys_pages > 0
+    {
+        let l_pages = res_len.div_ceil(16);
+        let ring_floor = l_pages.saturating_sub(phys_pages) * 16;
+        valid_from.max(ring_floor)
+    } else {
+        valid_from
+    }
+}
+
 pub(crate) fn dflash_slot_has_prefix_for_prompt(
     res: &[i32],
+    valid_from: usize,
     tokens: &[i32],
     prompt_len: usize,
     ring_pages: Option<usize>,
@@ -109,11 +128,20 @@ pub(crate) fn dflash_slot_has_prefix_for_prompt(
     if let Some(phys_pages) = ring_pages {
         let w = if window > 0 { window } else { 2048 };
         let effective_len = prompt_len.max(tokens.len());
-        let l_pages = res.len().div_ceil(16);
         let win_start_page = effective_len.saturating_sub(w) / 16;
+        let win_start_tok = win_start_page * 16;
+        if tokens.len() <= win_start_tok {
+            return true;
+        }
+        if valid_from > win_start_tok {
+            return false;
+        }
+        let l_pages = res.len().div_ceil(16);
         if l_pages.saturating_sub(win_start_page) > phys_pages {
             return false;
         }
+    } else if valid_from > 0 {
+        return false;
     }
     true
 }
@@ -337,6 +365,7 @@ impl NativeProposer {
                     tail: slot_tail,
                     captured_verify_hidden,
                     resident_tokens: vec![],
+                    resident_valid_from: 0,
                     processed: 0,
                     current: None,
                     last_used_tick: 0,
@@ -362,6 +391,7 @@ impl NativeProposer {
             current: None,
             memo_pinned_staging,
             resident_tokens: vec![],
+            resident_valid_from: 0,
             processed: 0,
             mtp_batch_active_slot: 0,
             active_slot_last_used_tick: 0,
@@ -378,8 +408,9 @@ impl NativeProposer {
         self.current = None;
         self.reset()
     }
-    fn reset(&mut self) -> Result<()> {
+    pub(crate) fn reset(&mut self) -> Result<()> {
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.last_accepted.clear();
         self.last_restored_tokens = 0;
@@ -423,6 +454,7 @@ impl NativeProposer {
                 }
                 dflash_slot_has_prefix_for_prompt(
                     &self.resident_tokens,
+                    self.resident_valid_from,
                     tokens,
                     prompt_len,
                     ring_pages,
@@ -431,6 +463,7 @@ impl NativeProposer {
                     && self.mtp_batch_slots.iter().take(slot_count).any(|s| {
                         dflash_slot_has_prefix_for_prompt(
                             &s.resident_tokens,
+                            s.resident_valid_from,
                             tokens,
                             prompt_len,
                             ring_pages,
@@ -466,39 +499,62 @@ impl NativeProposer {
             let n = tokens.len();
             let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
             let window = rs.first().map_or(0, |r| r.sliding_window());
-            if self.resident_tokens.starts_with(tokens) {
+            let self_eff = self.resident_tokens.starts_with(tokens).then(|| {
+                dflash_effective_valid_from(
+                    self.resident_tokens.len(),
+                    self.resident_valid_from,
+                    ring_pages,
+                )
+            });
+            let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
+            let best_donor = rs
+                .first()
+                .is_some_and(|r| r.is_batch_mode())
+                .then(|| {
+                    (0..slot_count)
+                        .filter(|&s| {
+                            s != self.mtp_batch_active_slot
+                                && self.mtp_batch_slots[s].resident_tokens.starts_with(tokens)
+                        })
+                        .map(|s| {
+                            let eff = dflash_effective_valid_from(
+                                self.mtp_batch_slots[s].resident_tokens.len(),
+                                self.mtp_batch_slots[s].resident_valid_from,
+                                ring_pages,
+                            );
+                            (s, eff)
+                        })
+                        .min_by_key(|&(_, eff)| eff)
+                })
+                .flatten();
+            if let Some((donor, donor_eff)) = best_donor
+                && donor_eff < n
+                && self_eff.is_none_or(|se| donor_eff < se)
+            {
+                let dst = self.mtp_batch_active_slot;
+                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                    r.copy_kv_from_slot(t, donor, dst, n)?;
+                }
+                self.resident_tokens.clear();
+                self.resident_tokens.extend_from_slice(tokens);
+                self.resident_valid_from = donor_eff;
+            } else if let Some(se) = self_eff
+                && se < n
+            {
                 for r in rs {
                     r.truncate(n)?;
                 }
                 self.resident_tokens.truncate(n);
-            } else {
-                let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
-                let donor = rs
-                    .first()
-                    .is_some_and(|r| r.is_batch_mode())
-                    .then(|| {
-                        (0..slot_count).find(|&s| {
-                            s != self.mtp_batch_active_slot
-                                && self.mtp_batch_slots[s].resident_tokens.starts_with(tokens)
-                        })
-                    })
-                    .flatten();
-                if let Some(donor) = donor {
-                    let dst = self.mtp_batch_active_slot;
-                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                        r.copy_kv_from_slot(t, donor, dst, n)?;
-                    }
-                    self.resident_tokens.clear();
-                    self.resident_tokens.extend_from_slice(tokens);
-                } else if window > 0 && ring_pages.is_some() {
-                    for r in rs {
-                        r.set_committed(n)?;
-                    }
-                    self.resident_tokens.clear();
-                    self.resident_tokens.extend_from_slice(tokens);
-                } else {
-                    return Err(loader_err("missing DFlash2 resident prefix"));
+                self.resident_valid_from = se;
+            } else if window > 0 && ring_pages.is_some() {
+                for r in rs {
+                    r.set_committed(n)?;
                 }
+                self.resident_tokens.clear();
+                self.resident_tokens.extend_from_slice(tokens);
+                self.resident_valid_from = n;
+            } else {
+                return Err(loader_err("missing DFlash2 resident prefix"));
             }
             self.processed = n;
             self.last_accepted.clear();
@@ -932,6 +988,7 @@ impl NativeProposer {
             }
         };
         if let Err(e) = ingest_res {
+            self.current = None;
             let _ = engine.ranks[0].device.make_current();
             let _ = engine.ranks[0].stream.synchronize();
             return Err(e);
@@ -2350,10 +2407,35 @@ mod tests {
         // inside a 138-page (`2,208`-token) ring buffer (`1,402 - 1,288 = 114 <= 138`).
         assert!(dflash_slot_has_prefix_for_prompt(
             &res,
+            0,
             &prompt[..21_952],
             prompt.len(),
             Some(138),
             2048,
         ));
+        // If a prior restore took the `set_committed(21_952)` shortcut without writing
+        // `[0..21_952]` into the ring buffer (`valid_from = 21_952`), a subsequent short-suffix
+        // request (`prompt_len = 22_670`, needing KV from `20_608..21_952`) must reject it,
+        // whereas a request whose suffix (`>= 2,048`) overwrites the entire window is allowed.
+        assert!(!dflash_slot_has_prefix_for_prompt(
+            &res,
+            21_952,
+            &prompt[..21_952],
+            prompt.len(),
+            Some(138),
+            2048,
+        ));
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &res[..21_952],
+            21_952,
+            &prompt[..21_952],
+            21_952 + 2_048,
+            Some(138),
+            2048,
+        ));
+        assert_eq!(
+            dflash_effective_valid_from(22_430, 0, Some(138)),
+            (22_430usize.div_ceil(16) - 138) * 16
+        );
     }
 }

@@ -500,11 +500,13 @@ impl NativeProposer {
         };
         for slot in &mut self.mtp_batch_slots {
             slot.resident_tokens.clear();
+            slot.resident_valid_from = 0;
             slot.processed = 0;
             slot.current = None;
             slot.last_used_tick = 0;
         }
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.current = None;
         self.mtp_batch_active_slot = 0;
@@ -547,6 +549,7 @@ impl NativeProposer {
         for (idx, slot) in self.mtp_batch_slots.iter_mut().enumerate() {
             if idx != 0 {
                 slot.resident_tokens.clear();
+                slot.resident_valid_from = 0;
                 slot.processed = 0;
                 slot.current = None;
                 slot.last_used_tick = 0;
@@ -610,6 +613,10 @@ impl NativeProposer {
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[prev].resident_tokens,
         );
+        std::mem::swap(
+            &mut self.resident_valid_from,
+            &mut self.mtp_batch_slots[prev].resident_valid_from,
+        );
         std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[prev].current);
         self.mtp_batch_slots[prev].processed = self.processed;
         self.mtp_batch_slots[prev].last_used_tick = self.active_slot_last_used_tick;
@@ -621,6 +628,10 @@ impl NativeProposer {
         std::mem::swap(
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[slot].resident_tokens,
+        );
+        std::mem::swap(
+            &mut self.resident_valid_from,
+            &mut self.mtp_batch_slots[slot].resident_valid_from,
         );
         std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[slot].current);
         self.processed = self.mtp_batch_slots[slot].processed;
@@ -723,6 +734,7 @@ impl NativeProposer {
             }
         }
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.current = None;
         Ok(())

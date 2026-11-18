@@ -280,7 +280,11 @@ fn cancel_requests(
         stats.cancelled.fetch_add(1, Ordering::Relaxed);
         if *speculative_id == Some(id) {
             if let Some(mut p) = engine.speculative.take() {
-                let _ = p.finish_scheduled(engine, pending_ingest);
+                if let Err(err) = p.finish_scheduled(engine, pending_ingest) {
+                    eprintln!("[warp34] speculative cancel flush failed: {err}");
+                    p.abort_scheduled();
+                    let _ = p.reset();
+                }
                 engine.speculative = Some(p);
             }
             *speculative_id = None;
@@ -291,7 +295,12 @@ fn cancel_requests(
                 && let Some((_, mut slot_pending)) = slot_entry.take()
                 && let Some(mut p) = engine.speculative.take()
             {
-                let _ = p.finish_mtp_batch_slot(engine, slot_idx, &mut slot_pending);
+                if let Err(err) = p.finish_mtp_batch_slot(engine, slot_idx, &mut slot_pending) {
+                    eprintln!(
+                        "[warp34] speculative batch slot {slot_idx} cancel flush failed: {err}"
+                    );
+                    let _ = p.reset_mtp_batch_slot(slot_idx);
+                }
                 engine.speculative = Some(p);
             }
         }
