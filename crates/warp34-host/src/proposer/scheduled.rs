@@ -295,12 +295,6 @@ impl NativeProposer {
             pending_ingest.clear();
             out
         };
-        if engine.has_checkpoint_pool()
-            && seq.prefix_bidir_len.is_none()
-            && seq.radix_state.should_donate_decode_checkpoint()
-        {
-            engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
-        }
         if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
             let pos_before = seq.generated_tokens.len() + idx;
             if pos_before < sampler.params.min_tokens {
@@ -911,14 +905,6 @@ impl NativeProposer {
                     }
                 };
                 if let Err(e) = engine.materialize_pending_checkpoint(&mut seq.radix_state) {
-                    engine.free_state_slots(&extras);
-                    return Err(e);
-                }
-                if engine.has_checkpoint_pool()
-                    && seq.prefix_bidir_len.is_none()
-                    && seq.radix_state.should_donate_decode_checkpoint()
-                    && let Err(e) = engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)
-                {
                     engine.free_state_slots(&extras);
                     return Err(e);
                 }

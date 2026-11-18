@@ -1015,10 +1015,6 @@ pub struct PlannedCheckpoint {
     pub abs_seq_len: usize,
 }
 
-/// Periodic decode checkpoint donation stride (`512` tokens = `8` Mamba `C = 64` chunks),
-/// bounding worst-case rollback on cancelled or diverged long decodes to `< 512` tokens.
-pub const DECODE_CHECKPOINT_INTERVAL_TOKENS: usize = 512;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RadixDonationOutcome {
     pub donated_seq_len: usize,
@@ -1132,17 +1128,6 @@ impl ReqRadixState {
                 && cache_len.is_multiple_of(self.page_size)
                 && self.ping_pong_slots[keep_idx] >= 0
         })
-    }
-
-    /// Returns `true` when decode has advanced at least [`DECODE_CHECKPOINT_INTERVAL_TOKENS`]
-    /// past the last donated checkpoint and has a valid aligned snapshot ready to pack.
-    #[inline]
-    pub fn should_donate_decode_checkpoint(&self) -> bool {
-        self.has_donatable_checkpoint()
-            && self.last_track_seqlen.is_some_and(|cache_len| {
-                cache_len.saturating_sub(self.protected_pages * self.page_size)
-                    >= DECODE_CHECKPOINT_INTERVAL_TOKENS
-            })
     }
 
     /// Returns the `state_in_slot` for the next forward/verify launch (`cow_src_state_slot` if set,

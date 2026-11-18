@@ -782,11 +782,12 @@ impl SchedulerV1 {
                         .donate_committed_checkpoint(&mut self.radix, None, true),
                 )
             }
-        } else if seq.prefix_bidir_len.is_none()
-            && ((slice.is_prefill_chunk && seq.radix_state.has_donatable_checkpoint())
-                || (self.use_checkpoint_pool && seq.radix_state.should_donate_decode_checkpoint()))
+        } else if slice.is_prefill_chunk
+            && seq.prefix_bidir_len.is_none()
+            && seq.radix_state.has_donatable_checkpoint()
         {
-            // Donate intermediate chunked-prefill or periodic 512-token decode checkpoint!
+            // Donate intermediate or completed prefill checkpoint so concurrent
+            // requests and retries can hit the warm prompt prefix.
             let rep = alloc_replacement_slot(&mut self.radix);
             if rep.is_some()
                 || (!self.use_checkpoint_pool

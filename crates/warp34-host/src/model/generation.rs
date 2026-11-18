@@ -61,21 +61,21 @@ impl Qwen3_5Engine {
         if only_with_checkpoint_pool && !self.has_checkpoint_pool() {
             return Ok(0);
         }
-        if (cursor < prompt_len || max_new_tokens > 1) && req_state.has_donatable_checkpoint() {
-            let aligned_at_cursor =
-                cursor < prompt_len && req_state.last_track_seqlen == Some(cursor);
-            if self.has_checkpoint_pool() {
+        if !req_state.has_donatable_checkpoint() {
+            return Ok(0);
+        }
+        if self.has_checkpoint_pool() {
+            if cursor >= prompt_len && max_new_tokens > 1 {
                 let donation = self.donate_into_self_radix(req_state, false)?;
-                if aligned_at_cursor && let Some((_, dst_ckpt)) = donation.pending_checkpoint_pack {
-                    self.unpack_checkpoint_to_active(dst_ckpt, req_state.active_state_slot)?;
-                }
                 return Ok(donation.donated_seq_len);
-            } else if let Some(rep) = self.alloc_state_slot() {
-                let don = req_state.donate_committed_checkpoint(&mut self.radix, Some(rep), false);
-                self.free_kv_pages(&don.freed_kv_pages);
-                self.free_state_slots(&don.freed_mamba_slots);
-                return Ok(don.donated_seq_len);
             }
+        } else if (cursor < prompt_len || max_new_tokens > 1)
+            && let Some(rep) = self.alloc_state_slot()
+        {
+            let don = req_state.donate_committed_checkpoint(&mut self.radix, Some(rep), false);
+            self.free_kv_pages(&don.freed_kv_pages);
+            self.free_state_slots(&don.freed_mamba_slots);
+            return Ok(don.donated_seq_len);
         }
         Ok(0)
     }
