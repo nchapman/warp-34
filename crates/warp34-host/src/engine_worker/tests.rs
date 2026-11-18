@@ -392,6 +392,7 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         eos_token_ids: vec![2],
         vocab_size: 1024,
         default_preserve_thinking: false,
+        default_sampling_params: SamplingParams::default(),
         decision_profile: crate::decision::DecisionModelProfile::CausalLm { temperature: 1.0 },
         vision_config: None,
         has_vision_weights: false,

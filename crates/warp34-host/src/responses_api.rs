@@ -1012,12 +1012,10 @@ pub fn translate_responses_to_chat(
     }
     chat_req.insert("stream".into(), json!(stream));
     chat_req.insert("parallel_tool_calls".into(), json!(parallel_tool_calls));
-    chat_req.insert("temperature".into(), json!(temperature));
-    chat_req.insert("top_p".into(), json!(top_p));
-    if let Some(top_k) = obj.get("top_k").filter(|v| !v.is_null()) {
-        chat_req.insert("top_k".into(), top_k.clone());
-    }
     for key in [
+        "temperature",
+        "top_p",
+        "top_k",
         "lora",
         "adapter",
         "min_p",

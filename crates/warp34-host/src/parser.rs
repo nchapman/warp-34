@@ -120,6 +120,87 @@ impl SamplingParams {
         }
         self.stop_token_ids.contains(&tid)
     }
+
+    /// Loads default serving sampling parameters from `<model_dir>/generation_config.json`
+    /// (`vLLM` `ModelConfig._load_generation_config_dict` parity), falling back to
+    /// [`SamplingParams::default`] when the file is absent or omits sampling fields.
+    pub fn from_generation_config_dir(model_dir: &std::path::Path) -> Self {
+        std::fs::read_to_string(model_dir.join("generation_config.json"))
+            .ok()
+            .map_or_else(Self::default, |text| {
+                Self::from_generation_config_json(&text)
+            })
+    }
+
+    /// Parses default serving sampling parameters (`temperature`, `top_p`, `top_k`, `min_p`,
+    /// `repetition_penalty`, `frequency_penalty`, `presence_penalty`, and `do_sample: false`)
+    /// from a `generation_config.json` payload.
+    pub fn from_generation_config_json(json_text: &str) -> Self {
+        let mut params = Self::default();
+        let Ok(serde_json::Value::Object(obj)) = serde_json::from_str(json_text) else {
+            return params;
+        };
+        if let Some(t) = obj
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t))
+        {
+            params.temperature = t;
+        }
+        if let Some(p) = obj
+            .get("top_p")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|p| p.is_finite() && *p > 0.0 && *p <= 1.0)
+        {
+            params.top_p = p;
+        }
+        if let Some(k) = obj
+            .get("top_k")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|v| i32::try_from(v).ok())
+            .filter(|k| *k >= -1)
+        {
+            params.top_k = if k == 0 { -1 } else { k };
+        }
+        if let Some(mp) = obj
+            .get("min_p")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|mp| mp.is_finite() && (0.0..=1.0).contains(mp))
+        {
+            params.min_p = mp;
+        }
+        if let Some(rp) = obj
+            .get("repetition_penalty")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|rp| rp.is_finite() && *rp > 0.0)
+        {
+            params.repetition_penalty = rp;
+        }
+        if let Some(fp) = obj
+            .get("frequency_penalty")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|fp| fp.is_finite() && (-2.0..=2.0).contains(fp))
+        {
+            params.frequency_penalty = fp;
+        }
+        if let Some(pp) = obj
+            .get("presence_penalty")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|pp| pp.is_finite() && (-2.0..=2.0).contains(pp))
+        {
+            params.presence_penalty = pp;
+        }
+        if obj.get("do_sample").and_then(serde_json::Value::as_bool) == Some(false) {
+            params.temperature = 0.0;
+        }
+        params
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

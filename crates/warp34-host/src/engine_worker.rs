@@ -246,6 +246,7 @@ pub struct EngineWorker {
     pub eos_token_ids: Vec<i32>,
     pub vocab_size: usize,
     pub default_preserve_thinking: bool,
+    pub default_sampling_params: SamplingParams,
     pub decision_profile: crate::decision::DecisionModelProfile,
     pub vision_config: Option<crate::vision::VisionConfig>,
     pub has_vision_weights: bool,
@@ -355,6 +356,8 @@ impl EngineWorker {
                     }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
+                    let default_sampling_params =
+                        SamplingParams::from_generation_config_dir(&engine.model_dir);
                     let unshareable_prefill = engine.cfg.noncausal_full_attention
                         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
                     let info = (
@@ -362,6 +365,7 @@ impl EngineWorker {
                         engine.cfg.eos_token_ids.clone(),
                         engine.cfg.vocab_size,
                         default_preserve_thinking,
+                        default_sampling_params,
                         engine.decision_profile.clone(),
                         engine.cfg.vision_config.clone(),
                         engine.has_vision_weights,
@@ -393,6 +397,7 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            default_sampling_params,
             decision_profile,
             vision_config,
             has_vision_weights,
@@ -423,6 +428,7 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            default_sampling_params,
             decision_profile,
             vision_config,
             has_vision_weights,

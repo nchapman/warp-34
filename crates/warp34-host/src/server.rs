@@ -201,6 +201,20 @@ pub fn completion_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,
 ) -> Result<crate::parser::SamplingParams, String> {
+    completion_sampling_params_with_defaults(
+        req,
+        max_tokens,
+        &crate::parser::SamplingParams::default(),
+    )
+}
+
+/// Endpoint-specific wire validation for `/v1/completions` using model-level default
+/// sampling parameters (e.g. from `generation_config.json`) when request fields are omitted.
+pub fn completion_sampling_params_with_defaults(
+    req: &serde_json::Value,
+    max_tokens: usize,
+    defaults: &crate::parser::SamplingParams,
+) -> Result<crate::parser::SamplingParams, String> {
     if !req.is_object() {
         return Err("completion request must be a JSON object".into());
     }
@@ -225,7 +239,7 @@ pub fn completion_sampling_params(
     }
     normalized["logprobs"] = serde_json::json!(count.is_some());
     normalized["top_logprobs"] = serde_json::json!(count.unwrap_or(0));
-    native_sampling_params(&normalized, max_tokens)
+    native_sampling_params_with_defaults(&normalized, max_tokens, defaults)
 }
 
 /// Convert token records to the legacy parallel-array wire shape. Offsets are
@@ -274,6 +288,16 @@ pub fn native_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,
 ) -> Result<crate::parser::SamplingParams, String> {
+    native_sampling_params_with_defaults(req, max_tokens, &crate::parser::SamplingParams::default())
+}
+
+/// Parses OpenAI chat/completion sampling parameters from `req`, falling back to `defaults`
+/// (e.g. loaded from `<model_dir>/generation_config.json`) for omitted or `null` fields.
+pub fn native_sampling_params_with_defaults(
+    req: &serde_json::Value,
+    max_tokens: usize,
+    defaults: &crate::parser::SamplingParams,
+) -> Result<crate::parser::SamplingParams, String> {
     use crate::parser::SamplingParams;
     if max_tokens == 0 || max_tokens > MAX_OUTPUT_TOKENS {
         return Err(format!("max_tokens must be in 1..={MAX_OUTPUT_TOKENS}"));
@@ -289,23 +313,28 @@ pub fn native_sampling_params(
     {
         return Err("stop_token_ids and logit_bias are limited to 256 entries each".into());
     }
-    let defaults = SamplingParams::default();
     let number = |name: &str, default: f32| -> Result<f32, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_f64()
-                .map(|x| x as f32)
-                .ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_f64()
+                    .map(|x| x as f32)
+                    .ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let boolean = |name: &str| -> Result<bool, String> {
-        req.get(name).map_or(Ok(false), |v| {
-            v.as_bool().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(false), |v| {
+                v.as_bool().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let unsigned = |name: &str, default: u64| -> Result<u64, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_u64().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_u64().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let stop_strings = match req.get("stop") {
         None | Some(serde_json::Value::Null) => Vec::new(),
@@ -347,11 +376,14 @@ pub fn native_sampling_params(
     }
     let params = SamplingParams {
         temperature: number("temperature", defaults.temperature)?,
-        top_k: req.get("top_k").map_or(Ok(defaults.top_k), |v| {
-            v.as_i64()
-                .and_then(|x| i32::try_from(x).ok())
-                .ok_or("invalid top_k")
-        })?,
+        top_k: req
+            .get("top_k")
+            .filter(|v| !v.is_null())
+            .map_or(Ok(defaults.top_k), |v| {
+                v.as_i64()
+                    .and_then(|x| i32::try_from(x).ok())
+                    .ok_or("invalid top_k")
+            })?,
         top_p: number("top_p", defaults.top_p)?,
         min_p: number("min_p", defaults.min_p)?,
         repetition_penalty: number("repetition_penalty", defaults.repetition_penalty)?,
@@ -368,7 +400,7 @@ pub fn native_sampling_params(
         logit_bias,
         stop_strings,
         stop_token_ids,
-        ..defaults
+        ..defaults.clone()
     };
     params.validate()?;
     if params.min_tokens > max_tokens {
@@ -679,5 +711,61 @@ mod tests {
             WorkerError::sampler_status(2).http_status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn test_generation_config_default_sampling_params_inheritance_and_overrides() {
+        use crate::parser::SamplingParams;
+
+        let qwen_gen_cfg = SamplingParams::from_generation_config_json(
+            r#"{
+                "bos_token_id": 248044,
+                "eos_token_id": [248046, 248044],
+                "pad_token_id": 248044,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "do_sample": true
+            }"#,
+        );
+        assert_eq!(qwen_gen_cfg.temperature, 1.0);
+        assert_eq!(qwen_gen_cfg.top_p, 0.95);
+        assert_eq!(qwen_gen_cfg.top_k, 20);
+
+        // `do_sample: false` forces greedy `temperature = 0.0` even if `temperature` is listed.
+        let greedy_gen_cfg = SamplingParams::from_generation_config_json(
+            r#"{"temperature": 0.7, "top_p": 0.9, "top_k": 0, "do_sample": false}"#,
+        );
+        assert_eq!(greedy_gen_cfg.temperature, 0.0);
+        assert_eq!(greedy_gen_cfg.top_p, 0.9);
+        assert_eq!(greedy_gen_cfg.top_k, -1);
+
+        // Omitted and explicit `null` sampling fields inherit model `generation_config.json` defaults.
+        for req in [
+            serde_json::json!({}),
+            serde_json::json!({"temperature": null, "top_p": null, "top_k": null, "seed": null}),
+        ] {
+            let chat_p = native_sampling_params_with_defaults(&req, 256, &qwen_gen_cfg).unwrap();
+            assert_eq!(chat_p.temperature, 1.0);
+            assert_eq!(chat_p.top_p, 0.95);
+            assert_eq!(chat_p.top_k, 20);
+            assert!(!chat_p.is_plain_greedy(false));
+
+            let comp_p =
+                completion_sampling_params_with_defaults(&req, 256, &qwen_gen_cfg).unwrap();
+            assert_eq!(comp_p.temperature, 1.0);
+            assert_eq!(comp_p.top_p, 0.95);
+            assert_eq!(comp_p.top_k, 20);
+        }
+
+        // Explicit `"temperature": 0.0` overrides `generation_config.json` and enters plain greedy.
+        let explicit_greedy = native_sampling_params_with_defaults(
+            &serde_json::json!({"temperature": 0.0}),
+            128,
+            &qwen_gen_cfg,
+        )
+        .unwrap();
+        assert_eq!(explicit_greedy.temperature, 0.0);
+        assert!(explicit_greedy.is_plain_greedy(false));
     }
 }

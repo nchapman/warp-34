@@ -612,9 +612,17 @@ fn prepare(
     };
     let initial_max_tokens = explicit_max_tokens.unwrap_or(super::MAX_OUTPUT_TOKENS);
     let mut params = if chat {
-        super::native_sampling_params(&request, initial_max_tokens)?
+        super::native_sampling_params_with_defaults(
+            &request,
+            initial_max_tokens,
+            &s.worker.default_sampling_params,
+        )?
     } else {
-        super::completion_sampling_params(&request, initial_max_tokens)?
+        super::completion_sampling_params_with_defaults(
+            &request,
+            initial_max_tokens,
+            &s.worker.default_sampling_params,
+        )?
     };
     params.eos_token_ids.clone_from(&s.worker.eos_token_ids);
     if params
@@ -1409,6 +1417,8 @@ async fn responses_create(
     .await?;
     meta.model.clone_from(&prepared.served_model);
     meta.max_output_tokens = prepared.params.max_tokens;
+    meta.temperature = f64::from(prepared.params.temperature);
+    meta.top_p = f64::from(prepared.params.top_p);
     let mut log = prepared.turn_log(
         meta.response_id.clone(),
         "responses",

@@ -176,6 +176,25 @@ fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
 const MTP_STAGE_ROWS: usize = 256;
 const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
 const TIERED_MOE_DFLASH2_MAX_TAP_ROWS: usize = 2048;
+pub(crate) fn plan_proposer_max_rows(
+    uses_tiered_moe: bool,
+    kind: SpeculativeKind,
+    tp_size: usize,
+    num_pages: usize,
+) -> usize {
+    let capacity = num_pages.saturating_mul(16);
+    if uses_tiered_moe {
+        match kind {
+            SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
+            SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
+        }
+    } else if num_pages >= 4096 && (num_pages < 14336 || tp_size > 1) {
+        capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
+    } else {
+        capacity.min(DFLASH2_MAX_BATCH_ROWS)
+    }
+}
+
 impl NativeProposer {
     pub fn set_mtp_k(&mut self, k: usize) -> Result<()> {
         if !matches!(self.ranks, Ranks::Mtp(_)) || !(1..=self.max_k).contains(&k) {
@@ -207,16 +226,12 @@ impl NativeProposer {
         }
         let num_pages = engine.ranks[0].kv_pool.num_pages;
         let capacity = num_pages * 16;
-        let max_rows = if engine.cfg.uses_tiered_moe() {
-            match config.kind {
-                SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
-                SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
-            }
-        } else if (4096..14336).contains(&num_pages) {
-            capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
-        } else {
-            capacity.min(DFLASH2_MAX_BATCH_ROWS)
-        };
+        let mut max_rows = plan_proposer_max_rows(
+            engine.cfg.uses_tiered_moe(),
+            config.kind,
+            engine.tp_size,
+            num_pages,
+        );
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
         }
@@ -326,15 +341,27 @@ impl NativeProposer {
             .iter()
             .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * t.local_vocab_size * 2))
             .collect::<Result<Vec<_>>>()?;
-        for rank in 0..engine.ranks.len() {
-            if let Err(e) = engine.ranks[rank].configure_speculative_taps(
-                &taps,
-                config.kind == SpeculativeKind::Mtp,
-                max_rows,
-            ) {
-                for t in &mut engine.ranks {
-                    let _ = t.configure_speculative_taps(&[], false, 0);
+        let try_configure_taps = |engine: &mut Qwen3_5Engine, rows: usize| -> Result<()> {
+            for rank in 0..engine.ranks.len() {
+                if let Err(e) = engine.ranks[rank].configure_speculative_taps(
+                    &taps,
+                    config.kind == SpeculativeKind::Mtp,
+                    rows,
+                ) {
+                    for t in &mut engine.ranks {
+                        let _ = t.configure_speculative_taps(&[], false, 0);
+                    }
+                    return Err(e);
                 }
+            }
+            Ok(())
+        };
+        if let Err(e) = try_configure_taps(engine, max_rows) {
+            let fallback_rows = capacity.min(DFLASH2_MAX_BATCH_ROWS);
+            if max_rows > fallback_rows {
+                max_rows = fallback_rows;
+                try_configure_taps(engine, max_rows)?;
+            } else {
                 return Err(e);
             }
         }
@@ -2436,6 +2463,32 @@ mod tests {
         assert_eq!(
             dflash_effective_valid_from(22_430, 0, Some(138)),
             (22_430usize.div_ceil(16) - 138) * 16
+        );
+    }
+
+    #[test]
+    fn proposer_max_rows_preserves_2048_chunk_prefill_for_tp2_262k_serving() {
+        for kind in [SpeculativeKind::Mtp, SpeculativeKind::DFlash2] {
+            // Small test pools (< 4096 pages) use 256-row tap buffers.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 256), 256);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 256), 256);
+
+            // Standard serving pools (4096..14336 pages = 64K..224K tokens) use 2048-row tap buffers.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 4096), 2048);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 8192), 2048);
+
+            // TP=1 extreme long-context (>= 14336 pages = 229K..262K on 1x 24GB GPU) caps at 256 rows,
+            // while TP>=2 262K serving (16384 pages across 2x 24GB GPUs) keeps 2048-row prefill chunks.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 16384), 256);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 16384), 2048);
+        }
+        assert_eq!(
+            plan_proposer_max_rows(true, SpeculativeKind::Mtp, 2, 4096),
+            6144
+        );
+        assert_eq!(
+            plan_proposer_max_rows(true, SpeculativeKind::DFlash2, 2, 4096),
+            2048
         );
     }
 }
