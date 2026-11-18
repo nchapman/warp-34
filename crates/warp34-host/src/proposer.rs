@@ -190,6 +190,8 @@ pub(crate) fn plan_proposer_max_rows(
         }
     } else if num_pages >= 4096 && (num_pages < 14336 || tp_size > 1) {
         capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
+    } else if num_pages >= 14336 {
+        capacity.min(crate::scheduler::MEDIUM_SCRATCH_MAX_BATCHED_TOKENS)
     } else {
         capacity.min(DFLASH2_MAX_BATCH_ROWS)
     }
@@ -232,6 +234,12 @@ impl NativeProposer {
             engine.tp_size,
             num_pages,
         );
+        if let Ok(prefill_cap) = engine.ranks[0].ordinary_prefill_token_capacity(1) {
+            let aligned_cap = (prefill_cap / 16) * 16;
+            if aligned_cap >= DFLASH2_MAX_BATCH_ROWS {
+                max_rows = max_rows.min(aligned_cap);
+            }
+        }
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
         }
@@ -2477,9 +2485,9 @@ mod tests {
             assert_eq!(plan_proposer_max_rows(false, kind, 1, 4096), 2048);
             assert_eq!(plan_proposer_max_rows(false, kind, 2, 8192), 2048);
 
-            // TP=1 extreme long-context (>= 14336 pages = 229K..262K on 1x 24GB GPU) caps at 256 rows,
-            // while TP>=2 262K serving (16384 pages across 2x 24GB GPUs) keeps 2048-row prefill chunks.
-            assert_eq!(plan_proposer_max_rows(false, kind, 1, 16384), 256);
+            // TP=1 extreme long-context (>= 14336 pages = 229K..262K on 1x 24GB GPU with 336 MiB scratch)
+            // uses 1024-row prefill chunks (with OOM fallback to 256), while TP>=2 262K serving keeps 2048.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 16384), 1024);
             assert_eq!(plan_proposer_max_rows(false, kind, 2, 16384), 2048);
         }
         assert_eq!(
