@@ -876,8 +876,9 @@ impl Qwen3Parser {
             Self::schema_types(schema, &mut types);
         }
         if schema.is_some() && types.is_empty() {
-            return serde_json::from_str(raw)
-                .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()));
+            return serde_json::from_str(raw).unwrap_or_else(|_| {
+                serde_json::Value::String(Self::trim_wrapping_newlines(raw).to_owned())
+            });
         }
         for candidate in ["null", "integer", "number", "boolean", "object", "array"] {
             if !types.iter().any(|t| t == candidate) {
@@ -913,11 +914,14 @@ impl Qwen3Parser {
                 return value;
             }
         }
-        // Prefer all raw bytes for unconstrained string branches. Const/enum
-        // rules, unlike xml_string, can own one padding whitespace byte on each
-        // side (the native builder uses max_whitespace_cnt: 1).
+        // Strip Qwen3-XML's single wrapping newline on each side first (matching
+        // `vllm`'s `_trim_wrapping_newlines`), while still allowing `const`/`enum`
+        // rules (which use `max_whitespace_cnt: 1`) to fall back to `raw` or
+        // single-byte whitespace-trimmed variants.
+        let trimmed_nl = Self::trim_wrapping_newlines(raw);
         let leading = raw.strip_prefix([' ', '\n', '\r', '\t']).unwrap_or(raw);
         for candidate in [
+            trimmed_nl,
             raw,
             leading,
             raw.strip_suffix([' ', '\n', '\r', '\t']).unwrap_or(raw),
@@ -930,7 +934,7 @@ impl Qwen3Parser {
                 return value;
             }
         }
-        serde_json::Value::String(raw.to_owned())
+        serde_json::Value::String(trimmed_nl.to_owned())
     }
 
     fn trim_wrapping_newlines(s: &str) -> &str {
@@ -1622,6 +1626,35 @@ mod tests {
         let turn = parser.finish().1;
         assert!(turn.tool_calls.is_empty());
         assert!(turn.content.unwrap().ends_with("\"unfinished"));
+    }
+
+    #[test]
+    fn native_qwen_strips_single_wrapping_newlines_like_vllm() {
+        use serde_json::json;
+        let tools = [json!({"type":"function","function":{
+            "name":"bash",
+            "parameters":{"type":"object","properties":{
+                "command":{"type":"string"},
+                "raw":{},
+                "spaced":{"type":"string"}
+            }}
+        }})];
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        parser.push_str(
+            "<tool_call>\n<function=bash>\n<parameter=command>\nnode --version\n</parameter>\n<parameter=raw>\nhello world\n</parameter>\n<parameter=spaced>\n  spaced  \n</parameter>\n</function>\n</tool_call>",
+        );
+        let turn = parser.finish().1;
+        assert_eq!(turn.tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args,
+            json!({
+                "command": "node --version",
+                "raw": "hello world",
+                "spaced": "  spaced  "
+            })
+        );
     }
 
     #[test]
