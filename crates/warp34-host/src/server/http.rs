@@ -559,6 +559,9 @@ struct Prepared {
     served_model: String,
     stream: bool,
     include_usage: bool,
+    messages_count: Option<usize>,
+    tools_count: Option<usize>,
+    enable_thinking: Option<bool>,
 }
 impl Prepared {
     fn turn_log(&self, id: String, api: &'static str, context: usize) -> TurnLog {
@@ -571,6 +574,12 @@ impl Prepared {
             self.explicit_max_tokens,
             self.params.max_tokens,
             context,
+        )
+        .with_turn_metadata(
+            self.messages_count,
+            self.tools_count,
+            self.enable_thinking,
+            &self.params,
         )
     }
 }
@@ -639,7 +648,7 @@ fn prepare(
         false
     };
     params.enable_thinking = thinking;
-    let (prompt, images) = if chat {
+    let (prompt, images, messages_count, tools_count, enable_thinking) = if chat {
         let (messages, images) = super::parse_openai_messages_with_image_policy(
             request.get("messages").ok_or("missing messages")?,
             s.allow_remote_images,
@@ -653,16 +662,17 @@ fn prepare(
                     .and_then(Value::as_bool)
             })
             .unwrap_or(s.worker.default_preserve_thinking);
+        let active_tools = request
+            .get("tools")
+            .filter(|v| !v.is_null() && request["tool_choice"] != "none");
+        let msg_cnt = messages.len();
+        let tool_cnt = active_tools.and_then(Value::as_array).map_or(0, Vec::len);
         (
-            super::format_chatml_prompt_with_options(
-                &messages,
-                request
-                    .get("tools")
-                    .filter(|v| !v.is_null() && request["tool_choice"] != "none"),
-                thinking,
-                preserve,
-            ),
+            super::format_chatml_prompt_with_options(&messages, active_tools, thinking, preserve),
             images,
+            Some(msg_cnt),
+            Some(tool_cnt),
+            Some(thinking),
         )
     } else {
         (
@@ -672,6 +682,9 @@ fn prepare(
                 .ok_or("missing string prompt")?
                 .to_owned(),
             Vec::new(),
+            None,
+            None,
+            None,
         )
     };
     let tokenizer = s.worker.tokenizer.as_ref().ok_or("tokenizer unavailable")?;
@@ -747,6 +760,9 @@ fn prepare(
         served_model,
         stream,
         include_usage,
+        messages_count,
+        tools_count,
+        enable_thinking,
     })
 }
 async fn generate(
@@ -784,7 +800,10 @@ async fn generate(
         .await?
     };
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let id = format!("{}-{request_id}", if chat { "chatcmpl" } else { "cmpl" });
+    let id = crate::responses_api::generate_unguessable_prefixed_id(
+        if chat { "chatcmpl-" } else { "cmpl-" },
+        request_id,
+    );
     let mut log = prepared.turn_log(
         id.clone(),
         if chat { "chat" } else { "completions" },
@@ -1040,7 +1059,14 @@ fn output_stream(
                         continue;
                     }
                     let decoded = match decoder.step(id as u32) {
-                        Ok(Some(text)) => text, Ok(None) if chat => continue, Ok(None) => String::new(),
+                        Ok(Some(text)) => text,
+                        Ok(None) if chat => {
+                            if parser.in_reasoning() {
+                                log.reasoning_token();
+                            }
+                            continue;
+                        }
+                        Ok(None) => String::new(),
                         Err(e) => { log.finish("error", false); yield Output::Error(WorkerError::internal(e.to_string())); return; }
                     };
                     if !chat {
@@ -1055,7 +1081,17 @@ fn output_stream(
                     let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                     let (visible, matched) = stops.push(&decoded, active_stops);
                     text.push_str(&visible);
-                    let delta = if chat { delta_value(parser.push_str(&visible),&mut tool_index) } else { json!({"content":visible}) };
+                    let was_reasoning = chat && parser.in_reasoning();
+                    let delta = if chat {
+                        let raw_delta = parser.push_str(&visible);
+                        if was_reasoning && (parser.in_reasoning() || raw_delta.reasoning_delta.is_some()) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
+                        delta_value(raw_delta, &mut tool_index)
+                    } else {
+                        json!({"content":visible})
+                    };
                     if delta.as_object().is_some_and(|o| !o.is_empty()) || lp.is_some() {
                         yield Output::Delta(chunk(delta,lp.map_or(Value::Null,|v| if chat { json!({"content":[v]}) } else { super::completion_logprobs(&[v], &mut legacy_offset) })));
                     }
@@ -1078,6 +1114,14 @@ fn output_stream(
         let (tail,turn) = parser.finish();
         let delta = delta_value(tail,&mut tool_index);
         if chat && delta.as_object().is_some_and(|o| !o.is_empty()) { yield Output::Delta(chunk(delta,Value::Null)); }
+        if chat {
+            let reasoning_override = turn
+                .reasoning_content
+                .as_deref()
+                .is_none_or(str::is_empty)
+                .then_some(0);
+            log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
+        }
         let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && (count >= params.max_tokens || hit_limit) { "length" } else { "stop" };
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
@@ -1485,7 +1529,12 @@ async fn responses_create(
                         }
                         let decoded = match decoder.step(id as u32) {
                             Ok(Some(t)) => t,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if parser.in_reasoning() {
+                                    log.reasoning_token();
+                                }
+                                continue;
+                            }
                             Err(e) => {
                                 log.finish("error", false);
                                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &e.to_string());
@@ -1495,9 +1544,16 @@ async fn responses_create(
                         };
                         let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                         let (visible, matched) = stops.push(&decoded, active_stops);
-                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible)) {
+                        let was_reasoning = parser.in_reasoning();
+                        let raw_delta = parser.push_str(&visible);
+                        let emitted_reasoning = raw_delta.reasoning_delta.is_some();
+                        for (ev_name, payload) in sse.push_delta(raw_delta) {
                             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         }
+                        if was_reasoning && (parser.in_reasoning() || emitted_reasoning) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
                         if matched {
                             stopped = true;
                             done = true;
@@ -1545,6 +1601,7 @@ async fn responses_create(
                 "stop"
             };
             let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
+            log.set_turn_outcome(Some(reasoning_tokens as u64), turn.tool_calls.len());
             let (end_frames, final_resp, history) =
                 sse.finish_output(&turn, finish, prompt_len, cached, count, reasoning_tokens);
             let final_resp = finalize_response(&s.response_store, &meta, caller_scope.as_deref(), final_resp, history);
@@ -1601,7 +1658,12 @@ async fn responses_create(
                         &[]
                     };
                     let (visible, matched) = stops.push(&decoded, active_stops);
+                    let was_reasoning = parser.in_reasoning();
                     let _ = parser.push_str(&visible);
+                    if was_reasoning && parser.in_reasoning() {
+                        log.reasoning_token();
+                    }
+                    log.set_tool_calls(parser.emitted_tool_calls_count());
                     if matched {
                         stopped = true;
                         done = true;
@@ -1652,6 +1714,7 @@ async fn responses_create(
             "stop"
         };
         let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
+        log.set_turn_outcome(Some(reasoning_tokens as u64), turn.tool_calls.len());
         let (resp, history) = crate::responses_api::build_response_object(
             &meta,
             &turn,
@@ -1750,7 +1813,12 @@ async fn anthropic_messages(
                         }
                         let decoded = match decoder.step(id as u32) {
                             Ok(Some(t)) => t,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if parser.in_reasoning() {
+                                    log.reasoning_token();
+                                }
+                                continue;
+                            }
                             Err(e) => {
                                 log.finish("error", false);
                                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&e.to_string());
@@ -1760,9 +1828,16 @@ async fn anthropic_messages(
                         };
                         let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                         let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
-                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible), cached) {
+                        let was_reasoning = parser.in_reasoning();
+                        let raw_delta = parser.push_str(&visible);
+                        let emitted_reasoning = raw_delta.reasoning_delta.is_some();
+                        for (ev_name, payload) in sse.push_delta(raw_delta, cached) {
                             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         }
+                        if was_reasoning && (parser.in_reasoning() || emitted_reasoning) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
                         if let Some(seq) = m_stop {
                             matched_stop = Some(seq);
                             stopped = true;
@@ -1805,6 +1880,12 @@ async fn anthropic_messages(
             for (ev_name, payload) in sse.push_delta(tail_delta, cached) {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
+            let reasoning_override = turn
+                .reasoning_content
+                .as_deref()
+                .is_none_or(str::is_empty)
+                .then_some(0);
+            log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
             let finish = if !turn.tool_calls.is_empty() {
                 "tool_calls"
             } else if !stopped && (count >= params.max_tokens || hit_limit) {
@@ -1849,7 +1930,12 @@ async fn anthropic_messages(
                     }
                     let decoded = match decoder.step(id as u32) {
                         Ok(Some(t)) => t,
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            if parser.in_reasoning() {
+                                log.reasoning_token();
+                            }
+                            continue;
+                        }
                         Err(e) => {
                             log.finish("error", false);
                             return Err(anthropic_api_err(
@@ -1864,7 +1950,14 @@ async fn anthropic_messages(
                         &[]
                     };
                     let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
-                    let _ = parser.push_str(&visible);
+                    let was_reasoning = parser.in_reasoning();
+                    let raw_delta = parser.push_str(&visible);
+                    if was_reasoning
+                        && (parser.in_reasoning() || raw_delta.reasoning_delta.is_some())
+                    {
+                        log.reasoning_token();
+                    }
+                    log.set_tool_calls(parser.emitted_tool_calls_count());
                     if let Some(seq) = m_stop {
                         matched_stop = Some(seq);
                         stopped = true;
@@ -1900,6 +1993,12 @@ async fn anthropic_messages(
             let _ = parser.push_str(&tail);
         }
         let (_, turn) = parser.finish();
+        let reasoning_override = turn
+            .reasoning_content
+            .as_deref()
+            .is_none_or(str::is_empty)
+            .then_some(0);
+        log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
         let finish = if !turn.tool_calls.is_empty() {
             "tool_calls"
         } else if !stopped && (count >= prepared.params.max_tokens || hit_limit) {

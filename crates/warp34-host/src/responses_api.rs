@@ -85,9 +85,9 @@ pub struct StoredResponse {
     pub history_messages: Vec<Value>,
 }
 
-/// Generates a 128-bit cryptographically random response identifier (`resp_<32 hex>`) from OS
-/// CSPRNG (`/dev/urandom`), preventing response-ID enumeration across callers.
-pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
+/// Generates a 128-bit cryptographically random identifier (`<prefix><32 hex>`) from OS
+/// CSPRNG (`/dev/urandom`), preventing request/response-ID collisions and enumeration across restarts.
+pub fn generate_unguessable_prefixed_id(prefix: &str, seq_fallback: u64) -> String {
     let mut buf = [0u8; 16];
     let ok = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
@@ -109,13 +109,19 @@ pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
         buf[..8].copy_from_slice(&h1.finish().to_le_bytes());
         buf[8..].copy_from_slice(&h2.finish().to_le_bytes());
     }
-    let mut out = String::with_capacity(5 + 32);
-    out.push_str("resp_");
+    let mut out = String::with_capacity(prefix.len() + 32);
+    out.push_str(prefix);
     for b in buf {
         use std::fmt::Write;
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+/// Generates a 128-bit cryptographically random response identifier (`resp_<32 hex>`) from OS
+/// CSPRNG (`/dev/urandom`), preventing response-ID enumeration across callers.
+pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
+    generate_unguessable_prefixed_id("resp_", seq_fallback)
 }
 
 /// Bounded store for explicit opt-in (`"store": true`) responses and active cancellation handles.

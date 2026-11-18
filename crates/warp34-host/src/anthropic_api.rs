@@ -769,8 +769,7 @@ pub fn translate_anthropic_to_chat(
     }
 
     let meta = AnthropicPreparedMeta {
-        message_id: crate::responses_api::generate_unguessable_response_id(request_seq_id)
-            .replacen("resp_", "msg_", 1),
+        message_id: crate::responses_api::generate_unguessable_prefixed_id("msg_", request_seq_id),
         model,
         stream,
     };

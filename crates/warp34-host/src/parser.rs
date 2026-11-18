@@ -860,6 +860,18 @@ impl Qwen3Parser {
         Ok(parser)
     }
 
+    /// Returns whether the parser is currently inside a `<think>...</think>` reasoning block.
+    #[inline]
+    pub fn in_reasoning(&self) -> bool {
+        self.in_reasoning
+    }
+
+    /// Returns the number of tool calls completed or currently streaming a header.
+    #[inline]
+    pub fn emitted_tool_calls_count(&self) -> usize {
+        self.tool_calls.len() + usize::from(self.tool_stream.header_emitted)
+    }
+
     // Resolve only metadata used for top-level XML argument conversion. Nested
     // object properties and array items are JSON data and need no expansion.
     fn resolve_local_refs(

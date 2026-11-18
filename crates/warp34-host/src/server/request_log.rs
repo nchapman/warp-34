@@ -39,10 +39,16 @@ pub(super) struct TurnLog {
     requested: Option<usize>,
     effective: usize,
     context: usize,
+    messages: Option<usize>,
+    tools: Option<usize>,
+    enable_thinking: Option<bool>,
+    sampling: Option<Value>,
     start: Instant,
     first: Option<Instant>,
     last: Option<Instant>,
     tokens: u64,
+    reasoning_tokens: Option<u64>,
+    tool_calls: Option<usize>,
     cached: Option<Arc<AtomicU64>>,
     cache_lookup: Option<Arc<OnceLock<CacheLookup>>>,
     finished: bool,
@@ -69,14 +75,46 @@ impl TurnLog {
             requested,
             effective,
             context,
+            messages: None,
+            tools: None,
+            enable_thinking: None,
+            sampling: None,
             start: Instant::now(),
             first: None,
             last: None,
             tokens: 0,
+            reasoning_tokens: None,
+            tool_calls: None,
             cached: None,
             cache_lookup: None,
             finished: false,
         }
+    }
+    pub(super) fn with_turn_metadata(
+        mut self,
+        messages: Option<usize>,
+        tools: Option<usize>,
+        enable_thinking: Option<bool>,
+        params: &crate::parser::SamplingParams,
+    ) -> Self {
+        self.messages = messages;
+        self.tools = tools;
+        self.enable_thinking = enable_thinking;
+        if enable_thinking.is_some() {
+            self.reasoning_tokens = Some(0);
+            self.tool_calls = Some(0);
+        }
+        fn f32_json(x: f32) -> f64 {
+            x.to_string().parse::<f64>().unwrap_or(f64::from(x))
+        }
+        self.sampling = Some(json!({
+            "temperature": f32_json(params.temperature),
+            "top_p": f32_json(params.top_p),
+            "top_k": params.top_k,
+            "min_p": f32_json(params.min_p),
+            "seed": params.seed,
+        }));
+        self
     }
     pub(super) fn track_cache(
         &mut self,
@@ -88,6 +126,18 @@ impl TurnLog {
     }
     pub(super) fn token(&mut self) {
         self.token_at(Instant::now());
+    }
+    pub(super) fn reasoning_token(&mut self) {
+        *self.reasoning_tokens.get_or_insert(0) += 1;
+    }
+    pub(super) fn set_tool_calls(&mut self, count: usize) {
+        self.tool_calls = Some(count);
+    }
+    pub(super) fn set_turn_outcome(&mut self, reasoning_tokens: Option<u64>, tool_calls: usize) {
+        if let Some(r) = reasoning_tokens {
+            self.reasoning_tokens = Some(r.min(self.tokens));
+        }
+        self.tool_calls = Some(tool_calls);
     }
     fn token_at(&mut self, now: Instant) {
         self.first.get_or_insert(now);
@@ -114,9 +164,13 @@ impl TurnLog {
             "request_id":self.id, "api":self.api, "model":self.model, "stream":self.stream,
             "finish_reason":reason, "length_limit":limit, "context_window":self.context,
             "requested_max_output_tokens":self.requested, "effective_max_output_tokens":self.effective,
+            "messages":self.messages, "tools":self.tools, "enable_thinking":self.enable_thinking,
+            "sampling":self.sampling,
             "prompt_tokens":self.prompt, "cached_prompt_tokens":self.cached.as_ref().map(|c| c.load(Ordering::Acquire)),
             "cache_lookup":self.cache_lookup.as_ref().and_then(|lookup| lookup.get()),
-            "output_tokens":self.tokens, "duration_ms":(now-self.start).as_secs_f64()*1000.,
+            "output_tokens":self.tokens, "reasoning_tokens":self.reasoning_tokens.map(|r| r.min(self.tokens)),
+            "tool_calls":self.tool_calls,
+            "duration_ms":(now-self.start).as_secs_f64()*1000.,
             "ttft_ms":self.first.map(|t| (t-self.start).as_secs_f64()*1000.), "output_tokens_per_s":rate})
     }
     pub(super) fn finish(&mut self, reason: &'static str, hit_limit: bool) {
@@ -206,5 +260,48 @@ mod tests {
         assert_eq!(row["cache_lookup"], json!(snapshot));
         assert_eq!(row["cached_prompt_tokens"], 80);
         assert_eq!(row["output_tokens"], 2);
+    }
+
+    #[test]
+    fn records_request_shape_sampling_and_reasoning_tool_counts() {
+        let params = crate::parser::SamplingParams {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.05,
+            seed: 42,
+            ..Default::default()
+        };
+        let mut log = TurnLog::new(
+            "chatcmpl-0123456789abcdef0123456789abcdef".into(),
+            "chat",
+            "qwen3.8-27b-warp34".into(),
+            true,
+            13269,
+            Some(65536),
+            65536,
+            262144,
+        )
+        .with_turn_metadata(Some(5), Some(14), Some(true), &params);
+
+        let t0 = log.start + Duration::from_millis(100);
+        log.token_at(t0);
+        log.reasoning_token();
+        log.token_at(t0 + Duration::from_millis(10));
+        log.reasoning_token();
+        log.token_at(t0 + Duration::from_millis(20));
+        log.set_tool_calls(1);
+
+        let row = log.record("tool_calls", false, t0 + Duration::from_millis(30));
+        assert_eq!(row["messages"], 5);
+        assert_eq!(row["tools"], 14);
+        assert_eq!(row["enable_thinking"], true);
+        assert_eq!(row["sampling"]["temperature"], 1.0);
+        assert_eq!(row["sampling"]["top_p"], 0.95);
+        assert_eq!(row["sampling"]["top_k"], 20);
+        assert_eq!(row["sampling"]["seed"], 42);
+        assert_eq!(row["output_tokens"], 3);
+        assert_eq!(row["reasoning_tokens"], 2);
+        assert_eq!(row["tool_calls"], 1);
     }
 }
