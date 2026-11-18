@@ -1226,6 +1226,20 @@ impl Qwen3Parser {
         max_keep
     }
 
+    fn push_content_slice(&mut self, raw: &str, c_out: &mut String) {
+        let text = if self.content_accum.is_empty() {
+            raw.trim_start_matches('\n')
+        } else if !self.tool_calls.is_empty() && raw.bytes().all(|b| b == b'\n') {
+            ""
+        } else {
+            raw
+        };
+        if !text.is_empty() {
+            c_out.push_str(text);
+            self.content_accum.push_str(text);
+        }
+    }
+
     /// Feeds a streaming text chunk and returns incremental `reasoning_delta`, `content_delta`,
     /// and any newly completed `tool_calls`.
     pub fn push_str(&mut self, chunk: &str) -> StreamParseDelta {
@@ -1356,9 +1370,8 @@ impl Qwen3Parser {
             .min_by_key(|&(pos, _)| pos);
 
             if let Some((pos, kind)) = earliest {
-                let text = &self.buffer[..pos];
-                c_out.push_str(text);
-                self.content_accum.push_str(text);
+                let text = self.buffer[..pos].to_string();
+                self.push_content_slice(&text, &mut c_out);
                 match kind {
                     0 => {
                         self.buffer.drain(..pos + Self::THINK_START.len());
@@ -1382,9 +1395,8 @@ impl Qwen3Parser {
             );
             let emit_len = self.buffer.len() - keep;
             if emit_len > 0 {
-                let text = &self.buffer[..emit_len];
-                c_out.push_str(text);
-                self.content_accum.push_str(text);
+                let text = self.buffer[..emit_len].to_string();
+                self.push_content_slice(&text, &mut c_out);
                 self.buffer.drain(..emit_len);
             }
             break;
@@ -1419,8 +1431,11 @@ impl Qwen3Parser {
                 self.reasoning_accum.push_str(&rem);
                 delta.reasoning_delta.get_or_insert_default().push_str(&rem);
             } else {
-                self.content_accum.push_str(&rem);
-                delta.content_delta.get_or_insert_default().push_str(&rem);
+                let mut c_out = String::new();
+                self.push_content_slice(&rem, &mut c_out);
+                if !c_out.is_empty() {
+                    delta.content_delta.get_or_insert_default().push_str(&c_out);
+                }
             }
         }
 
@@ -1793,6 +1808,30 @@ mod tests {
             Some("Let me calculate 2 + 2 = 4.")
         );
         assert_eq!(turn.content.as_deref(), Some("The answer is 4."));
+    }
+
+    #[test]
+    fn streaming_parser_strips_template_newlines_after_think_and_between_tools() {
+        let mut parser = Qwen3Parser::new(true);
+        let d1 = parser.push_str("thinking...</think>");
+        assert_eq!(d1.reasoning_delta.as_deref(), Some("thinking..."));
+        assert_eq!(d1.content_delta, None);
+
+        // Template separator `\n\n` emitted as a separate token right after `</think>` must not
+        // produce a spurious `content_delta: Some("\n\n")` before `<tool_call>` or content.
+        let d2 = parser.push_str("\n\n");
+        assert_eq!(d2.content_delta, None);
+
+        let d3 = parser.push_str(
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>\n",
+        );
+        assert_eq!(d3.content_delta, None);
+        assert_eq!(d3.completed_tool_calls.len(), 1);
+
+        let (df, turn) = parser.finish();
+        assert_eq!(df.content_delta, None);
+        assert_eq!(turn.content, None);
+        assert_eq!(turn.tool_calls.len(), 1);
     }
 
     #[test]

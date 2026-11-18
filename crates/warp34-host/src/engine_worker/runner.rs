@@ -278,20 +278,23 @@ fn cancel_requests(
     for id in cancelled {
         stats.cancelled.fetch_add(1, Ordering::Relaxed);
         if *speculative_id == Some(id) {
-            if let Some(p) = &mut engine.speculative {
-                p.abort_scheduled();
+            if let Some(mut p) = engine.speculative.take() {
+                let _ = p.finish_scheduled(engine, pending_ingest);
+                engine.speculative = Some(p);
             }
             *speculative_id = None;
             pending_ingest.clear();
         }
         for (slot_idx, slot_entry) in mtp_batch_slots.iter_mut().enumerate() {
-            if slot_entry.as_ref().is_some_and(|(sid, _)| *sid == id) {
-                *slot_entry = None;
-                if let Some(p) = &mut engine.speculative {
-                    let _ = p.reset_mtp_batch_slot(slot_idx);
-                }
+            if slot_entry.as_ref().is_some_and(|(sid, _)| *sid == id)
+                && let Some((_, mut slot_pending)) = slot_entry.take()
+                && let Some(mut p) = engine.speculative.take()
+            {
+                let _ = p.finish_mtp_batch_slot(engine, slot_idx, &mut slot_pending);
+                engine.speculative = Some(p);
             }
         }
+        release(engine, sched.finish_request_early(id));
         release(engine, sched.cancel_request(id));
         if let Some(mut r) = requests.remove(&id)
             && let Some(tap) = r.decision_tap.take()
@@ -380,7 +383,9 @@ fn admit_into_mtp_batch_slots(
         sched.cfg.max_num_seqs = before + 1;
         sched.admit_waiting_with_filter(
             |r| engine.alloc_three_state_slots_from(r),
-            |_, prompt, matched| proposer.can_restore_batch_slot(slot_idx, &prompt[..matched]),
+            |_, prompt, matched| {
+                proposer.can_restore_batch_slot(slot_idx, &prompt[..matched], prompt.len())
+            },
         );
         sched.cfg.max_num_seqs = saved_max;
         record_admissions(sched, requests);
@@ -708,7 +713,9 @@ fn admit_requests(
                 sched.cfg.max_num_seqs = 1;
                 sched.admit_waiting_with_filter(
                     |r| engine.alloc_three_state_slots_from(r),
-                    |_, prompt, matched| proposer.can_restore_prefix(&prompt[..matched]),
+                    |_, prompt, matched| {
+                        proposer.can_restore_prefix(&prompt[..matched], prompt.len())
+                    },
                 );
                 sched.cfg.max_num_seqs = saved_max;
                 record_admissions(sched, requests);

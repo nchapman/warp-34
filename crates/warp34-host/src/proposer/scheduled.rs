@@ -55,12 +55,17 @@ impl NativeProposer {
     }
 
     #[inline]
-    pub(crate) fn can_restore_prefix(&self, prefix: &[i32]) -> bool {
-        self.can_restore(prefix)
+    pub(crate) fn can_restore_prefix(&self, prefix: &[i32], prompt_len: usize) -> bool {
+        self.can_restore_for_prompt(prefix, prompt_len)
     }
 
-    pub(crate) fn can_restore_batch_slot(&self, _slot: usize, prefix: &[i32]) -> bool {
-        self.can_restore(prefix)
+    pub(crate) fn can_restore_batch_slot(
+        &self,
+        _slot: usize,
+        prefix: &[i32],
+        prompt_len: usize,
+    ) -> bool {
+        self.can_restore_for_prompt(prefix, prompt_len)
     }
 
     pub(crate) fn restore_prefix(
@@ -73,8 +78,8 @@ impl NativeProposer {
 
     pub(crate) fn abort_scheduled(&mut self) {
         self.commit_current_memo();
-        let _ = self.reset();
         self.current = None;
+        self.last_accepted.clear();
     }
 
     pub(crate) fn finish_scheduled(

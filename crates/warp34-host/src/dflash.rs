@@ -1382,6 +1382,18 @@ impl DFlash2Rank {
     pub fn committed_len(&self) -> usize {
         self.committed
     }
+    pub fn sliding_window(&self) -> usize {
+        self.cfg.window
+    }
+    pub fn set_committed(&mut self, len: usize) -> Result<()> {
+        if len > self.capacity {
+            return Err(loader_err("DFlash committed length exceeds capacity"));
+        }
+        self.committed = len;
+        self.slot_committed[self.active_slot] = len;
+        self.proposal_anchor = None;
+        Ok(())
+    }
     pub fn kv_layouts(&self) -> Vec<ffi::Warp34KvLayerLayout> {
         self.kv.layers.iter().map(|l| l.layout).collect()
     }

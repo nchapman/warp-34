@@ -1088,3 +1088,267 @@ fn batched_mtp_full_window_budgets_stay_speculative_and_preserve_radix_cache() {
         "warm MambaRadixCache prefix must survive concurrent full-window requests via incremental KV slabs, got cached={probe_cached}"
     );
 }
+
+#[test]
+fn realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2() {
+    use serde_json::{Value, json};
+    use warp34_host::{
+        chatml::{ChatMessage, format_chatml_prompt_with_options, parse_history_tools},
+        parser::Qwen3Parser,
+    };
+
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2",
+    )
+    .is_none()
+        || common::require_or_skip_cached_model(
+            "nchapman/Qwen3.5-4B-DFlash2",
+            "realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2",
+        )
+        .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Load the first realistic trajectory from `benchmarks/perf/fixtures/open_swe_intact_16k.json`.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/perf/fixtures/open_swe_intact_16k.json");
+    let fixture_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixture_path).unwrap()).unwrap();
+    let traj = &fixture_json["trajectories"][0];
+    let system_prompt = traj["system"].as_str().unwrap();
+    let turns = traj["turns"].as_array().unwrap();
+
+    let run_trajectory = |kind: Option<SpeculativeKind>| -> (Vec<Vec<i32>>, Vec<usize>, usize) {
+        let worker = EngineWorker::from_loader(
+            move || {
+                let mut engine = Qwen3_5Engine::load_for_serving(
+                    "Qwen/Qwen3.5-4B",
+                    1,
+                    KvFormatPolicy::Tq4,
+                    Some(512),
+                    true,
+                    16,
+                )
+                .map_err(|e| e.to_string())?;
+                if let Some(kind) = kind {
+                    engine
+                        .enable_speculative(&SpeculativeConfig {
+                            kind,
+                            mtp_k: 3,
+                            draft_model: (kind == SpeculativeKind::DFlash2)
+                                .then(|| "nchapman/Qwen3.5-4B-DFlash2".into()),
+                        })
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(engine)
+            },
+            SchedulerConfig {
+                max_num_seqs: 1,
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let tok = worker.tokenizer.as_ref().unwrap().clone();
+        let encode = |text: &str| -> Vec<i32> {
+            tok.encode(text, false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .map(|&id| id as i32)
+                .collect()
+        };
+        let decode = |ids: &[i32]| -> String {
+            let u32_ids: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+            tok.decode(&u32_ids, false).unwrap()
+        };
+
+        let mut history = vec![ChatMessage {
+            role: "system".into(),
+            content: Some(system_prompt.into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        }];
+        let mut step_outputs = Vec::new();
+        let mut step_cached = Vec::new();
+        let mut prev_prompt_len = 0usize;
+
+        for (step, turn) in turns.iter().take(4).enumerate() {
+            if let Some(user_text) = turn["user"].as_str() {
+                history.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(user_text.into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                });
+            }
+            if let Some(tools) = turn["tools"].as_array()
+                && !tools.is_empty()
+            {
+                let calls_val: Vec<Value> = tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "function": {
+                                "name": t["name"],
+                                "arguments": t["arguments"]
+                            }
+                        })
+                    })
+                    .collect();
+                let calls = parse_history_tools(Some(&Value::Array(calls_val))).unwrap();
+                history.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: calls,
+                });
+                for t in tools {
+                    history.push(ChatMessage {
+                        role: "tool".into(),
+                        content: Some(t["result"].as_str().unwrap_or("").into()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                    });
+                }
+            }
+
+            let prompt_str = format_chatml_prompt_with_options(&history, None, true, true);
+            let prompt_ids = encode(&prompt_str);
+            let (out_ids, cached) = rt.block_on(async {
+                let mut stream = worker
+                    .submit(
+                        prompt_ids.clone(),
+                        SamplingParams {
+                            max_tokens: 24,
+                            ignore_eos: true,
+                            temperature: 0.0,
+                            ..SamplingParams::default()
+                        },
+                        None,
+                    )
+                    .unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    collect_with_cached(&mut stream, 24),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            });
+
+            if step > 0 {
+                let expected_min_cached = (prev_prompt_len / 64) * 64;
+                assert!(
+                    cached >= expected_min_cached,
+                    "mode={kind:?} step={step}: expected cached >= {expected_min_cached} (prev_prompt_len={prev_prompt_len}), got cached={cached}"
+                );
+            }
+            prev_prompt_len = prompt_ids.len();
+            step_cached.push(cached);
+
+            let raw_text = decode(&out_ids);
+            let parsed = Qwen3Parser::parse_complete(&raw_text, true);
+            history.push(ChatMessage {
+                role: "assistant".into(),
+                content: parsed.content,
+                reasoning_content: parsed.reasoning_content,
+                tool_calls: vec![],
+            });
+            step_outputs.push(out_ids);
+        }
+
+        // Also verify mid-turn cancellation preserves committed prefix for the follow-up turn.
+        let mut cancel_history = history.clone();
+        cancel_history.push(ChatMessage {
+            role: "user".into(),
+            content: Some("Now run pytest on the modified module and verify.".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+        let cancel_prompt_ids =
+            encode(&format_chatml_prompt_with_options(&cancel_history, None, true, true));
+        let post_cancel_cached = rt.block_on(async {
+            let mut stream = worker
+                .submit(
+                    cancel_prompt_ids.clone(),
+                    SamplingParams {
+                        max_tokens: 48,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            // Collect 4 tokens then drop `stream` to trigger client cancellation.
+            let mut got = 0usize;
+            while let Some(ev) = stream.events.recv().await {
+                if matches!(ev, GenerationEvent::Token { .. }) {
+                    got += 1;
+                    if got >= 4 {
+                        break;
+                    }
+                }
+            }
+            drop(stream);
+
+            // Follow-up request with the same prompt + extra user suffix must hit the cache.
+            let mut follow_ids = cancel_prompt_ids.clone();
+            follow_ids.extend_from_slice(&encode("\n Confirm exit code 0."));
+            let mut follow_stream = worker
+                .submit(
+                    follow_ids,
+                    SamplingParams {
+                        max_tokens: 8,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let (_, cached) = tokio::time::timeout(
+                Duration::from_secs(60),
+                collect_with_cached(&mut follow_stream, 8),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            worker.shutdown().await.unwrap();
+            cached
+        });
+
+        let expected_cancel_cached = ((cancel_prompt_ids.len() - 1) / 64) * 64;
+        assert!(
+            post_cancel_cached >= expected_cancel_cached,
+            "mode={kind:?}: post-cancel follow-up must preserve committed prefix >= {expected_cancel_cached}, got {post_cancel_cached}"
+        );
+
+        (step_outputs, step_cached, post_cancel_cached)
+    };
+
+    let (plain_outs, plain_cached, _) = run_trajectory(None);
+    let (mtp_outs, mtp_cached, _) = run_trajectory(Some(SpeculativeKind::Mtp));
+    let (dflash_outs, dflash_cached, _) = run_trajectory(Some(SpeculativeKind::DFlash2));
+
+    assert_eq!(mtp_outs, plain_outs, "MTP trajectory tokens must match Plain bit-for-bit");
+    assert_eq!(
+        dflash_outs, plain_outs,
+        "DFlash2 trajectory tokens must match Plain bit-for-bit"
+    );
+    assert_eq!(
+        mtp_cached, plain_cached,
+        "MTP cached prefix depths must match Plain on every trajectory turn"
+    );
+    assert_eq!(
+        dflash_cached, plain_cached,
+        "DFlash2 cached prefix depths must match Plain on every trajectory turn"
+    );
+}

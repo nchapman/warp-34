@@ -458,4 +458,103 @@ mod tests {
         let extracted = extract_chat_template_from_tokenizer_config(list_cfg).unwrap();
         assert!(detect_preserve_thinking_from_template(&extracted));
     }
+
+    #[test]
+    fn test_multi_turn_tool_trajectory_roundtrip_prefix_parity() {
+        use crate::parser::Qwen3Parser;
+        use serde_json::json;
+
+        let tools_vec = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        })];
+        let tools_val = json!(tools_vec);
+
+        let mut history = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("You are a coding agent.".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Check the Node version and list files.".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+        ];
+
+        let prompt_t1 = format_chatml_prompt_with_options(&history, Some(&tools_val), true, true);
+        let raw_assistant_t1 = "Let me check the environment first.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nnode --version && ls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>";
+
+        // Parse via streaming chunks with native tool schema enabled.
+        let mut parser = Qwen3Parser::with_tools(true, &tools_vec).unwrap();
+        let mut streamed_reasoning = String::new();
+        let mut streamed_content = String::new();
+        let mut streamed_calls = Vec::new();
+        for chunk in [
+            "Let me check ",
+            "the environment first.\n</think>",
+            "\n\n",
+            "<tool_call>\n<function=bash>\n<parameter=command>\nnode --version && ls -la\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            let d = parser.push_str(chunk);
+            if let Some(r) = d.reasoning_delta {
+                streamed_reasoning.push_str(&r);
+            }
+            if let Some(c) = d.content_delta {
+                streamed_content.push_str(&c);
+            }
+            streamed_calls.extend(d.completed_tool_calls);
+        }
+        let (df, turn) = parser.finish();
+        if let Some(r) = df.reasoning_delta {
+            streamed_reasoning.push_str(&r);
+        }
+        if let Some(c) = df.content_delta {
+            streamed_content.push_str(&c);
+        }
+        streamed_calls.extend(df.completed_tool_calls);
+
+        assert!(
+            streamed_content.is_empty(),
+            "no spurious content delta allowed: {streamed_content:?}"
+        );
+        assert_eq!(turn.content, None);
+        assert_eq!(streamed_calls.len(), 1);
+
+        let tool_calls_json = serde_json::to_value(&streamed_calls).unwrap();
+        let history_calls = parse_history_tools(Some(&tool_calls_json)).unwrap();
+        history.push(ChatMessage {
+            role: "assistant".into(),
+            content: (!streamed_content.is_empty()).then_some(streamed_content),
+            reasoning_content: Some(streamed_reasoning),
+            tool_calls: history_calls,
+        });
+        history.push(ChatMessage {
+            role: "tool".into(),
+            content: Some("v24.9.0\ntotal 0".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        });
+
+        let prompt_t2 = format_chatml_prompt_with_options(&history, Some(&tools_val), true, true);
+        let expected_prefix = format!("{prompt_t1}{raw_assistant_t1}<|im_end|>\n");
+        assert!(
+            prompt_t2.starts_with(&expected_prefix),
+            "Turn 2 prompt must start with exact Turn 1 prompt + output prefix!\nprompt_t2:\n{prompt_t2}\nexpected_prefix:\n{expected_prefix}"
+        );
+    }
 }

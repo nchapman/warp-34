@@ -464,8 +464,8 @@ impl SchedulerV1 {
                 };
                 // Each step trims below `hit.matched_tokens` (a 64-token Mamba checkpoint
                 // boundary), jumping directly to the next ancestor checkpoint. Cap the walk
-                // at 32 ancestor hops so admission work remains strictly O(1) bounded.
-                const MAX_ANCESTOR_FALLBACK_STEPS: usize = 32;
+                // at 64 ancestor hops so admission work remains strictly O(1) bounded.
+                const MAX_ANCESTOR_FALLBACK_STEPS: usize = 64;
                 let mut steps = 0usize;
                 while hit.matched_tokens > 0
                     && !allow_prefix_hit(w.req_id, &w.radix_key_tokens, hit.matched_tokens)
