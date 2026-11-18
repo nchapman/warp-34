@@ -1419,9 +1419,13 @@ impl DFlash2Rank {
         self.batch_mode
     }
     pub fn ring_phys_pages_per_slot(&self) -> Option<usize> {
-        self.ring_pages_dev_buf
-            .as_ref()
-            .map(|_| self.all_pages.len() / self.ring_slot_count)
+        self.ring_pages_dev_buf.as_ref().map(|_| {
+            if self.batch_mode {
+                self.all_pages.len() / self.ring_slot_count
+            } else {
+                self.all_pages.len()
+            }
+        })
     }
     fn bind_slot_pages(&mut self, slot: usize) {
         if let Some(ref ring_buf) = self.ring_pages_dev_buf {

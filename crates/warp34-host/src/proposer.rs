@@ -2472,6 +2472,30 @@ mod tests {
             dflash_effective_valid_from(22_430, 0, Some(138)),
             (22_430usize.div_ceil(16) - 138) * 16
         );
+        // In single-slot mode (`!batch_mode`, e.g. `--max-num-seqs 1`), `DFlash2Rank::pages_dev`
+        // wraps modulo `all_pages.len()` (`8 * 138 = 1,104` pages = `17,664` tokens on TP=1).
+        // When a turn at `103,552` generates `2,680` tokens (`resident_len = 106,248`) and the
+        // follow-up prompt (`104,528` tokens) strips `<think>...</think>` back to `103,552`,
+        // the 1,104-page single-slot ring still holds `[88,592 .. 106,248]`, so `103,552` is
+        // restored directly without stepping back to `102,464` (`admission_filter`).
+        let long_res: Vec<i32> = (0..106_248).map(|i| i as i32).collect();
+        let next_prompt: Vec<i32> = (0..104_528).map(|i| i as i32).collect();
+        assert!(!dflash_slot_has_prefix_for_prompt(
+            &long_res,
+            0,
+            &next_prompt[..103_552],
+            next_prompt.len(),
+            Some(138),
+            2048,
+        ));
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &long_res,
+            0,
+            &next_prompt[..103_552],
+            next_prompt.len(),
+            Some(8 * 138),
+            2048,
+        ));
     }
 
     #[test]
