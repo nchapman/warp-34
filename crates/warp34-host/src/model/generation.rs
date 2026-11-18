@@ -19,7 +19,12 @@ impl Qwen3_5Engine {
         &mut self,
         radix: &mut MambaRadixCache,
     ) -> Option<(i32, [i32; 2])> {
-        if self.ranks[0].state_pool.free_count() + radix.mamba_evictable_slots() < 3 {
+        let available_active = if self.has_checkpoint_pool() {
+            self.ranks[0].state_pool.free_count()
+        } else {
+            self.ranks[0].state_pool.free_count() + radix.mamba_evictable_slots()
+        };
+        if available_active < 3 {
             return None;
         }
         let s0 = self.alloc_state_slot_from(radix)?;
@@ -32,6 +37,47 @@ impl Qwen3_5Engine {
             return None;
         };
         Some((s0, [s1, s2]))
+    }
+
+    fn donate_into_self_radix(
+        &mut self,
+        req_state: &mut ReqRadixState,
+        finish_req: bool,
+    ) -> Result<crate::radix::RadixDonationOutcome> {
+        let mut radix = std::mem::replace(&mut self.radix, MambaRadixCache::new(16, 64));
+        let res = self.donate_req_checkpoint(&mut radix, req_state, finish_req);
+        self.radix = radix;
+        res
+    }
+
+    pub(crate) fn donate_intermediate_prefill_checkpoint(
+        &mut self,
+        req_state: &mut ReqRadixState,
+        cursor: usize,
+        prompt_len: usize,
+        max_new_tokens: usize,
+        only_with_checkpoint_pool: bool,
+    ) -> Result<usize> {
+        if only_with_checkpoint_pool && !self.has_checkpoint_pool() {
+            return Ok(0);
+        }
+        if (cursor < prompt_len || max_new_tokens > 1) && req_state.has_donatable_checkpoint() {
+            let aligned_at_cursor =
+                cursor < prompt_len && req_state.last_track_seqlen == Some(cursor);
+            if self.has_checkpoint_pool() {
+                let donation = self.donate_into_self_radix(req_state, false)?;
+                if aligned_at_cursor && let Some((_, dst_ckpt)) = donation.pending_checkpoint_pack {
+                    self.unpack_checkpoint_to_active(dst_ckpt, req_state.active_state_slot)?;
+                }
+                return Ok(donation.donated_seq_len);
+            } else if let Some(rep) = self.alloc_state_slot() {
+                let don = req_state.donate_committed_checkpoint(&mut self.radix, Some(rep), false);
+                self.free_kv_pages(&don.freed_kv_pages);
+                self.free_state_slots(&don.freed_mamba_slots);
+                return Ok(don.donated_seq_len);
+            }
+        }
+        Ok(0)
     }
 
     pub(crate) fn ensure_kv_pages_for_len(
@@ -120,7 +166,9 @@ impl Qwen3_5Engine {
         let mut req_state = ReqRadixState::new(16, 64, active_slot, [pp0, pp1]);
         req_state.restore_prefix_hit(&mut self.radix, prompt_token_ids, &match_res);
 
+        let mut prefill_donated_seq_len = 0usize;
         let step_res: Result<(f64, f64, Vec<i32>, Vec<crate::parser::StepLogprobs>)> = (|| {
+            self.materialize_pending_checkpoint(&mut req_state)?;
             self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
 
             let chunk_sz = prefill_chunk_size.max(1);
@@ -158,6 +206,14 @@ impl Qwen3_5Engine {
                 }
                 req_state.commit_tokens(slice_tokens, &planned);
                 cursor += take;
+                prefill_donated_seq_len =
+                    prefill_donated_seq_len.max(self.donate_intermediate_prefill_checkpoint(
+                        &mut req_state,
+                        cursor,
+                        prompt_token_ids.len(),
+                        max_new_tokens,
+                        true,
+                    )?);
             }
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -247,9 +303,7 @@ impl Qwen3_5Engine {
                 return Err(e);
             }
         };
-        let donation = req_state.donate_committed_checkpoint(&mut self.radix, None, true);
-        self.free_kv_pages(&donation.freed_kv_pages);
-        self.free_state_slots(&donation.freed_mamba_slots);
+        let donation = self.donate_into_self_radix(&mut req_state, true)?;
 
         let decode_steps = gen_ids.len().saturating_sub(1);
         let decode_tok_per_s = if decode_ms > 0.0 && decode_steps > 0 {
@@ -272,7 +326,7 @@ impl Qwen3_5Engine {
         Ok(RadixBenchMetrics {
             prompt_len: prompt_token_ids.len(),
             cached_prefix_tokens,
-            donated_seq_len: donation.donated_seq_len,
+            donated_seq_len: donation.donated_seq_len.max(prefill_donated_seq_len),
             gen_len: gen_ids.len(),
             ttft_ms,
             prefill_tok_per_s,
@@ -662,7 +716,9 @@ impl Qwen3_5Engine {
         let mut req_state = ReqRadixState::new(16, 64, active_slot, [pp0, pp1]);
         req_state.restore_prefix_hit(&mut self.radix, &hashed_prompt_ids, &match_res);
 
+        let mut prefill_donated_seq_len = 0usize;
         let step_res: Result<(f64, f64, Vec<i32>, Vec<crate::parser::StepLogprobs>)> = (|| {
+            self.materialize_pending_checkpoint(&mut req_state)?;
             self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
 
             let t0 = std::time::Instant::now();
@@ -768,6 +824,14 @@ impl Qwen3_5Engine {
                 drop(rank_vis_bufs);
                 req_state.commit_tokens(slice_hashed, &planned);
                 cursor += take;
+                prefill_donated_seq_len =
+                    prefill_donated_seq_len.max(self.donate_intermediate_prefill_checkpoint(
+                        &mut req_state,
+                        cursor,
+                        prompt_token_ids.len(),
+                        max_new_tokens,
+                        true,
+                    )?);
             }
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -843,9 +907,7 @@ impl Qwen3_5Engine {
                 return Err(e);
             }
         };
-        let donation = req_state.donate_committed_checkpoint(&mut self.radix, None, true);
-        self.free_kv_pages(&donation.freed_kv_pages);
-        self.free_state_slots(&donation.freed_mamba_slots);
+        let donation = self.donate_into_self_radix(&mut req_state, true)?;
 
         let decode_steps = gen_ids.len().saturating_sub(1);
         let decode_tok_per_s = if decode_ms > 0.0 && decode_steps > 0 {
@@ -868,7 +930,7 @@ impl Qwen3_5Engine {
         Ok(RadixBenchMetrics {
             prompt_len: prompt_token_ids.len(),
             cached_prefix_tokens,
-            donated_seq_len: donation.donated_seq_len,
+            donated_seq_len: donation.donated_seq_len.max(prefill_donated_seq_len),
             gen_len: gen_ids.len(),
             ttft_ms,
             prefill_tok_per_s,
@@ -917,7 +979,9 @@ impl Qwen3_5Engine {
         req_state.restore_prefix_hit(&mut self.radix, prompt_token_ids, &match_res);
 
         let mut tx = StateTx::new(req_state.active_state_slot);
+        let mut prefill_donated_seq_len = 0usize;
         let step_res: Result<(usize, Vec<usize>, Vec<i32>)> = (|| {
+            self.materialize_pending_checkpoint(&mut req_state)?;
             self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
 
             let chunk_sz = prefill_chunk_size.max(1);
@@ -954,6 +1018,14 @@ impl Qwen3_5Engine {
                 }
                 req_state.commit_tokens(slice_tokens, &planned);
                 cursor += take;
+                prefill_donated_seq_len =
+                    prefill_donated_seq_len.max(self.donate_intermediate_prefill_checkpoint(
+                        &mut req_state,
+                        cursor,
+                        prompt_token_ids.len(),
+                        max_new_tokens,
+                        true,
+                    )?);
             }
 
             let mut gen_ids = Vec::with_capacity(max_new_tokens);
@@ -1077,14 +1149,12 @@ impl Qwen3_5Engine {
             // Prevent `donate_committed_checkpoint` from freeing `active_state_slot`.
             req_state.active_state_slot = -1;
         }
-        let donation = req_state.donate_committed_checkpoint(&mut self.radix, None, true);
-        self.free_kv_pages(&donation.freed_kv_pages);
-        self.free_state_slots(&donation.freed_mamba_slots);
+        let donation = self.donate_into_self_radix(&mut req_state, true)?;
 
         Ok(SpecVerifyMetrics {
             prompt_len: prompt_token_ids.len(),
             cached_prefix_tokens,
-            donated_seq_len: donation.donated_seq_len,
+            donated_seq_len: donation.donated_seq_len.max(prefill_donated_seq_len),
             verify_rounds,
             accepted_counts_per_round,
             active_state_slot: final_active_slot,
@@ -1118,6 +1188,7 @@ impl Qwen3_5Engine {
             sched_cfg.clamp_for_token_capacity(cap);
         }
         let mut sched = SchedulerV1::new(sched_cfg);
+        sched.use_checkpoint_pool = self.has_checkpoint_pool();
         std::mem::swap(&mut sched.radix, &mut self.radix);
 
         let is_noncausal_or_midloop = self.cfg.noncausal_full_attention
@@ -1179,6 +1250,7 @@ impl Qwen3_5Engine {
                 }
 
                 for seq in &mut sched.active {
+                    self.materialize_pending_checkpoint(&mut seq.radix_state)?;
                     let total_len = seq
                         .prompt_tokens
                         .len()
@@ -1239,17 +1311,16 @@ impl Qwen3_5Engine {
                     } else {
                         None
                     };
-                    let mut rep_slot = if sl.is_prefill_chunk {
-                        self.alloc_state_slot_from(&mut sched.radix)
-                    } else {
-                        None
-                    };
-                    if let Some(don) = sched.commit_slice(sl, emitted, || rep_slot.take()) {
-                        self.free_kv_pages(&don.freed_kv_pages);
-                        self.free_state_slots(&don.freed_mamba_slots);
-                    }
-                    if let Some(unused_slot) = rep_slot {
-                        self.free_state_slots(&[unused_slot]);
+                    if let Some(don) = sched.commit_slice_with_radix(sl, emitted, |radix| {
+                        if self.has_checkpoint_pool() {
+                            self.alloc_checkpoint_slot_from(radix)
+                        } else if sl.is_prefill_chunk {
+                            self.alloc_state_slot_from(radix)
+                        } else {
+                            None
+                        }
+                    }) {
+                        self.apply_radix_donation(&don)?;
                     }
                 }
 

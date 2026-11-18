@@ -428,6 +428,12 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
         .build()
         .unwrap();
 
+    let lane_tags = [
+        "[Lane Alpha] ",
+        "[Lane Beta] ",
+        "[Lane Gamma] ",
+        "[Lane Delta] ",
+    ];
     let shared_prefix = "System architecture notes: requests carry bounded deadlines, workers pull from bounded queues, and cache invalidations execute strictly after transaction commit to preserve serializability across concurrent readers and writers. ".repeat(6);
     let suffixes = [
         "List two race conditions in cache invalidation:",
@@ -477,9 +483,12 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
             .map(|&id| id as i32)
             .collect()
     };
+    // Pair `(i, i + 4)` shares a >= 128-token prefix while wave 1 (`0..4`) starts cold in both
+    // `B=1` and `B=4`, so both workers traverse the exact same 1-hop `WHT128-Q8_0` checkpoints.
     let burst_prompts: Vec<Vec<i32>> = suffixes
         .iter()
-        .map(|s| encode(&format!("{shared_prefix}{s}")))
+        .enumerate()
+        .map(|(i, s)| encode(&format!("{}{shared_prefix}{s}", lane_tags[i % 4])))
         .collect();
     assert!(
         burst_prompts.iter().all(|p| p.len() >= 192),
@@ -1272,8 +1281,12 @@ fn realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2() {
             reasoning_content: None,
             tool_calls: vec![],
         });
-        let cancel_prompt_ids =
-            encode(&format_chatml_prompt_with_options(&cancel_history, None, true, true));
+        let cancel_prompt_ids = encode(&format_chatml_prompt_with_options(
+            &cancel_history,
+            None,
+            true,
+            true,
+        ));
         let post_cancel_cached = rt.block_on(async {
             let mut stream = worker
                 .submit(
@@ -1338,7 +1351,10 @@ fn realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2() {
     let (mtp_outs, mtp_cached, _) = run_trajectory(Some(SpeculativeKind::Mtp));
     let (dflash_outs, dflash_cached, _) = run_trajectory(Some(SpeculativeKind::DFlash2));
 
-    assert_eq!(mtp_outs, plain_outs, "MTP trajectory tokens must match Plain bit-for-bit");
+    assert_eq!(
+        mtp_outs, plain_outs,
+        "MTP trajectory tokens must match Plain bit-for-bit"
+    );
     assert_eq!(
         dflash_outs, plain_outs,
         "DFlash2 trajectory tokens must match Plain bit-for-bit"
@@ -1350,5 +1366,146 @@ fn realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2() {
     assert_eq!(
         dflash_cached, plain_cached,
         "DFlash2 cached prefix depths must match Plain on every trajectory turn"
+    );
+}
+
+#[test]
+fn periodic_decode_checkpoint_enables_mid_generation_branch_cache_hit() {
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "periodic_decode_checkpoint_enables_mid_generation_branch_cache_hit",
+    )
+    .is_none()
+    {
+        return;
+    }
+
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let run_mode = |spec: Option<SpeculativeConfig>| -> (Vec<i32>, usize, Vec<i32>) {
+        let worker = EngineWorker::from_loader(
+            move || {
+                Qwen3_5Engine::load_for_serving_with_speculative(
+                    "Qwen/Qwen3.5-4B",
+                    1,
+                    KvFormatPolicy::Tq4,
+                    Some(2048),
+                    true,
+                    2,
+                    spec.as_ref(),
+                )
+                .map_err(|e| e.to_string())
+            },
+            SchedulerConfig {
+                max_num_seqs: 2,
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+
+        let tok = worker.tokenizer.as_ref().unwrap().clone();
+        let prompt_ids: Vec<i32> = tok
+            .encode(
+                "Write a detailed step-by-step systems design walkthrough covering WAL durability, group commit, checkpoint compaction, and crash recovery invariants:\n1.",
+                false,
+            )
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+        assert!(
+            (20..96).contains(&prompt_ids.len()),
+            "prompt should leave < 96 prompt tokens so >= 512 cached comes from periodic decode checkpointing, got {}",
+            prompt_ids.len()
+        );
+        let branch_suffix: Vec<i32> = tok
+            .encode(
+                "\nAlternative branch: now analyze fsync latency spikes:",
+                false,
+            )
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+
+        rt.block_on(async {
+            // Decode 560 tokens (`prompt + 560 >= 580`), crossing the 512-token periodic decode
+            // checkpoint interval (`DECODE_CHECKPOINT_INTERVAL_TOKENS = 512`).
+            let mut s1 = worker
+                .submit(
+                    prompt_ids.clone(),
+                    SamplingParams {
+                        max_tokens: 560,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let (gen1, _) =
+                tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut s1, 560))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(gen1.len(), 560);
+
+            // Fork at `gen1[..500]` (60 tokens BEFORE the end of `gen1`) so the finish-time leaf
+            // checkpoint cannot match; only the periodic mid-decode checkpoint (`512` tokens) can!
+            let mut branch_prompt = prompt_ids.clone();
+            branch_prompt.extend_from_slice(&gen1[..500]);
+            branch_prompt.extend_from_slice(&branch_suffix);
+
+            let mut s2 = worker
+                .submit(
+                    branch_prompt,
+                    SamplingParams {
+                        max_tokens: 24,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let (gen2, cached2) =
+                tokio::time::timeout(Duration::from_secs(60), collect_with_cached(&mut s2, 24))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            worker.shutdown().await.unwrap();
+            (gen1, cached2, gen2)
+        })
+    };
+
+    let (plain_gen1, plain_cached2, plain_gen2) = run_mode(None);
+    let (mtp_gen1, mtp_cached2, mtp_gen2) = run_mode(Some(SpeculativeConfig {
+        kind: SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    }));
+
+    assert_eq!(
+        plain_cached2, 512,
+        "Plain branch 60 tokens before end of 560-token decode must hit exact 512 periodic decode checkpoint"
+    );
+    assert_eq!(
+        mtp_cached2, 512,
+        "MTP branch 60 tokens before end of 560-token decode must hit exact 512 periodic decode checkpoint"
+    );
+    assert_eq!(
+        &mtp_gen1[..500],
+        &plain_gen1[..500],
+        "prefix through 500 generated tokens (past 512 periodic checkpoint) must match bit-for-bit between MTP and Plain"
+    );
+    assert_eq!(
+        mtp_gen2, plain_gen2,
+        "branch continuation from 512 periodic decode checkpoint must match bit-for-bit between MTP and Plain"
     );
 }

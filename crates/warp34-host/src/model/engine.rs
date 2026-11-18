@@ -146,6 +146,7 @@ impl Qwen3_5Engine {
                 kv_pages: Some(fit_plan.kv_pages),
                 state_slots: Some(state_slots),
                 native_mtp,
+                enable_checkpoint_pool: true,
                 ..PoolCapacity::default()
             },
             use_cuda_graph,
@@ -246,6 +247,7 @@ impl Qwen3_5Engine {
             kv_pages: requested_kv_pages,
             state_slots: Some(base_state_slots),
             lora_reserve,
+            enable_checkpoint_pool: true,
             ..PoolCapacity::default()
         };
         let mut resolved_draft: Option<std::path::PathBuf> = None;
@@ -387,6 +389,33 @@ impl Qwen3_5Engine {
             kv_policy,
             PoolCapacity {
                 kv_pages: requested_kv_pages,
+                ..PoolCapacity::default()
+            },
+            use_cuda_graph,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_from_dir_with_checkpoint_pool(
+        dir: &Path,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        state_slots: Option<usize>,
+        checkpoint_vram_slots: usize,
+        checkpoint_host_slots: usize,
+        use_cuda_graph: bool,
+    ) -> Result<Self> {
+        Self::load_from_dir_with_capacity(
+            dir,
+            tp_size,
+            kv_policy,
+            PoolCapacity {
+                kv_pages: requested_kv_pages,
+                state_slots,
+                enable_checkpoint_pool: true,
+                checkpoint_vram_slots: Some(checkpoint_vram_slots),
+                checkpoint_host_slots: Some(checkpoint_host_slots),
                 ..PoolCapacity::default()
             },
             use_cuda_graph,
@@ -562,6 +591,33 @@ impl Qwen3_5Engine {
             for r in &mut ranks {
                 r.kv_pool.truncate_pages(common_pages);
                 r.state_pool.truncate_slots(common_slots);
+            }
+            if ranks.iter().all(|r| r.checkpoint_pool.is_some()) {
+                let common_vram = ranks
+                    .iter()
+                    .filter_map(|r| r.checkpoint_pool.as_ref().map(|c| c.vram_slots))
+                    .min()
+                    .unwrap_or(0);
+                let common_host = ranks
+                    .iter()
+                    .filter_map(|r| r.checkpoint_pool.as_ref().map(|c| c.host_slots))
+                    .min()
+                    .unwrap_or(0);
+                if common_vram + common_host == 0 {
+                    for r in &mut ranks {
+                        r.checkpoint_pool = None;
+                    }
+                } else {
+                    for r in &mut ranks {
+                        if let Some(ckpt) = &mut r.checkpoint_pool {
+                            ckpt.truncate_slots(common_vram, common_host);
+                        }
+                    }
+                }
+            } else {
+                for r in &mut ranks {
+                    r.checkpoint_pool = None;
+                }
             }
         }
 

@@ -3,6 +3,8 @@
 
 #[cfg(feature = "cuda")]
 use crate::cuda::{DeviceBuffer, Result};
+mod checkpoint_pool;
+pub use checkpoint_pool::*;
 use warp34_kernels::ffi::{
     WARP34_KV_FORMAT_BF16, WARP34_KV_FORMAT_FP8_E4M3, WARP34_KV_FORMAT_FP16, WARP34_KV_FORMAT_Q8_0,
     WARP34_KV_FORMAT_TQ4, WARP34_KV_TRANSFORM_IDENTITY, WARP34_KV_TRANSFORM_RADEMACHER_WHT256,

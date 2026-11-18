@@ -66,6 +66,11 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
         required_files=("config.json", "model.safetensors", "model_mtp.safetensors", "tokenizer.json"),
     ),
     ModelSpec(
+        repo_id="nchapman/Qwen3.5-9B-Heretic-LoRA",
+        revision="a16b7482ce42cf98cc0ed9103442cebcceab5f83",
+        required_files=("adapter_config.json", "adapter_model.safetensors"),
+    ),
+    ModelSpec(
         repo_id="nchapman/Qwen3.8-27B-W4A16-HGPTQ",
         revision="ae51987e3339a2a70070702548571e10fe8bcbc2",
         required_files=("config.json", "model.safetensors.index.json", "model_mtp.safetensors", "tokenizer.json"),

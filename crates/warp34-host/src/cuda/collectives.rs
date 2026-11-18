@@ -116,7 +116,12 @@ impl Tp2Collectives {
                 )?));
             }
         } else {
-            for _ in 0..tp_size {
+            for r in 0..tp_size {
+                check_rc(
+                    // SAFETY: binds calling thread to `r` before allocating mapped host memory for rank `r`.
+                    unsafe { ffi::warp34_set_device(r as i32) },
+                    "warp34_set_device",
+                )?;
                 let sig = MappedHostBuffer::alloc(sig_bytes)?;
                 if SIG_EPOCH_CAP_U32_IDX * 4 + 4 <= sig.len_bytes {
                     // SAFETY: `sig.host_ptr` is 128B-aligned mapped host memory of size `sig.len_bytes`,

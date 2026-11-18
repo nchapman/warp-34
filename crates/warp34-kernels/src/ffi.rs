@@ -805,6 +805,42 @@ unsafe extern "C" {
         total_state_slots: i32,
     ) -> i32;
 
+    pub fn warp34_gdn_checkpoint_pack_wht_q8(
+        ex: *const Warp34Exec,
+        ssm_layer_ptrs: *const u64,
+        conv_layer_ptrs: *const u64,
+        ple_conv_pool: *const c_void,
+        src_state_slot: i32,
+        total_state_slots: i32,
+        num_layers: i32,
+        rows_per_layer: i32,
+        head_k_dim: i32,
+        conv_elems_per_slot: i32,
+        ple_conv_elems_per_slot: i32,
+        dst_qdata: *mut c_void,
+        dst_scales_bf16: *mut c_void,
+        dst_conv_f16: *mut c_void,
+        dst_ple_conv_f16: *mut c_void,
+    ) -> i32;
+
+    pub fn warp34_gdn_checkpoint_unpack_wht_q8(
+        ex: *const Warp34Exec,
+        src_qdata: *const c_void,
+        src_scales_bf16: *const c_void,
+        src_conv_f16: *const c_void,
+        src_ple_conv_f16: *const c_void,
+        ssm_layer_ptrs: *const u64,
+        conv_layer_ptrs: *const u64,
+        ple_conv_pool: *mut c_void,
+        dst_state_slot: i32,
+        total_state_slots: i32,
+        num_layers: i32,
+        rows_per_layer: i32,
+        head_k_dim: i32,
+        conv_elems_per_slot: i32,
+        ple_conv_elems_per_slot: i32,
+    ) -> i32;
+
     pub fn warp34_tp2_signal_bytes() -> usize;
     pub fn warp34_tp2_all_reduce_f16(
         ex: *const Warp34Exec,

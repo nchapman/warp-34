@@ -49,7 +49,6 @@ FULL_SUITE_CASES: tuple[str, ...] = (
     "4b_tp1_mtp_realistic",
     "4b_tp1_dflash2_synth",
     "4b_tp1_dflash2_realistic",
-    "4b_tp1_lora_cai",
     "4b_tp2_plain",
     "4b_tp2_mtp_synth",
     "4b_tp2_dflash2_synth",

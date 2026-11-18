@@ -1127,6 +1127,9 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         kv_pool_bytes_per_rank: 4_429_185_024,
         state_slots: 13,
         state_pool_bytes_per_rank: 1_969_225_728,
+        ckpt_vram_slots: 2,
+        ckpt_host_slots: 97,
+        ckpt_bytes_per_slot: 43_094_016,
         weight_bytes_per_rank: 15_204_352_000,
         scratch_bytes_per_rank: 336 * 1024 * 1024,
         host_embed_offload: true,
@@ -1144,5 +1147,6 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
     assert!(banner.contains("262144 tokens (16384 pages"));
     assert!(banner.contains("[auto-fit: 100% of 262144 model max]"));
     assert!(banner.contains("13 slots"));
+    assert!(banner.contains("99 WHT128-Q8_0 ckpts (2 VRAM + 97 Host, 41.1 MiB/slot)"));
     assert!(banner.contains("host-mapped"));
 }

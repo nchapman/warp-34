@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Receiver;
 use super::{
     DecisionReadoutTap, DecisionTapOutput, EngineBatchSlice, GenerationEvent,
     PipelinedDecodeOutput, Qwen3_5Engine, Request, SamplerV1, ScheduledReqSlice, SchedulerV1,
-    WorkerError, release,
+    WorkerError, finish_early, release,
     runner::{emit, fail_request},
 };
 
@@ -413,7 +413,15 @@ fn run_single_vision_prefill(
     step_chunk: usize,
     vision_budget: &mut usize,
 ) -> Result<(), WorkerError> {
-    let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
+    let seq_mut = sched
+        .active
+        .iter_mut()
+        .find(|seq| seq.req_id == id)
+        .unwrap();
+    engine
+        .materialize_pending_checkpoint(&mut seq_mut.radix_state)
+        .map_err(WorkerError::Cuda)?;
+    let seq = &*seq_mut;
     let cached_toks = seq.cached_prefix_tokens;
     let can_donate = seq.prefix_bidir_len.is_none();
     engine.set_active_lora_id(seq.lora_id);
@@ -473,18 +481,16 @@ fn run_single_vision_prefill(
     } else {
         None
     };
-    let mut replacement = if !slice.is_final_prefill_chunk && can_donate {
-        engine.alloc_state_slot_from(&mut sched.radix)
-    } else {
-        None
-    };
-    release(
-        engine,
-        sched.commit_slice(&slice, token, || replacement.take()),
-    );
-    if let Some(slot) = replacement {
-        engine.free_state_slots(&[slot]);
-    }
+    let out = sched.commit_slice_with_radix(&slice, token, |radix| {
+        if engine.has_checkpoint_pool() {
+            engine.alloc_checkpoint_slot_from(radix)
+        } else if !slice.is_final_prefill_chunk && can_donate {
+            engine.alloc_state_slot_from(radix)
+        } else {
+            None
+        }
+    });
+    release(engine, out);
     Ok(())
 }
 
@@ -499,6 +505,11 @@ pub(super) fn step_plain(
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
     // splice cannot share an ordinary text prefill batch. Decode can share batches.
     step_vision_prefills(engine, sched, requests)?;
+    for seq in &mut sched.active {
+        engine
+            .materialize_pending_checkpoint(&mut seq.radix_state)
+            .map_err(WorkerError::Cuda)?;
+    }
     let slices = sched.schedule_step();
     if slices.is_empty() {
         return Ok(());
@@ -713,27 +724,27 @@ pub(super) fn step_plain(
         } else {
             None
         };
-        let can_recycle_locked = sched
+        let locked_node = sched
             .active
             .iter()
             .find(|seq| seq.req_id == s.req_id)
-            .is_some_and(|seq| {
-                sched
-                    .radix
-                    .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
-            });
-        let mut replacement =
-            alloc_prefill_checkpoint_slot(engine, &mut sched.radix, s, can_recycle_locked);
-        release(engine, sched.commit_slice(s, token, || replacement.take()));
-        if let Some(slot) = replacement {
-            engine.free_state_slots(&[slot]);
-        }
+            .map(|seq| seq.radix_state.last_locked_node);
+        let out = sched.commit_slice_with_radix(s, token, |radix| {
+            if engine.has_checkpoint_pool() {
+                engine.alloc_checkpoint_slot_from(radix)
+            } else {
+                let can_recycle_locked =
+                    locked_node.is_some_and(|n| radix.can_recycle_locked_mamba(n));
+                alloc_prefill_checkpoint_slot(engine, radix, s, can_recycle_locked)
+            }
+        });
+        release(engine, out);
         if requests
             .get(&s.req_id)
             .and_then(|r| r.sampler.constraint.as_ref())
             .is_some_and(|c| c.is_terminal_eos())
         {
-            release(engine, sched.finish_request_early(s.req_id));
+            finish_early(engine, sched, s.req_id);
         }
     }
     Ok(())
@@ -974,7 +985,9 @@ fn run_pipelined_decode_burst(
             }
             emit(r, id, lp);
             emitted_ids[i] = Some(id);
-            let outcome = sched.commit_slice(s, Some(id), || None);
+            let outcome = sched.commit_slice_with_radix(s, Some(id), |radix| {
+                engine.alloc_checkpoint_slot_from(radix)
+            });
             if outcome.is_some() || r.cancelled.load(Ordering::Acquire) {
                 any_stopped = true;
             }
@@ -1102,7 +1115,10 @@ fn commit_pipelined_step(
             continue;
         }
         emit(r, id, lp);
-        release(engine, sched.commit_slice(s, Some(id), || None));
+        let out = sched.commit_slice_with_radix(s, Some(id), |radix| {
+            engine.alloc_checkpoint_slot_from(radix)
+        });
+        release(engine, out);
     }
 }
 

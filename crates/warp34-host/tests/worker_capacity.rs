@@ -108,6 +108,12 @@ fn single_client_27b_hgptq_serving_allocates_262k_tq4_context() {
     .expect("single-client 27B HGPTQ must preserve the 262k TQ4 capacity target");
     assert_eq!(engine.ranks[0].kv_pool.num_pages, 16_384);
     assert!(engine.ranks[0].state_pool.total_slots >= 3);
+    let ckpt = engine.ranks[0]
+        .checkpoint_pool
+        .as_ref()
+        .expect("serving must allocate tiered WHT128-Q8_0 checkpoint pool");
+    assert!(ckpt.total_slots >= 24);
+    assert_eq!(ckpt.allocated_host_slots(), 0);
 }
 
 #[test]
@@ -203,6 +209,17 @@ fn single_client_27b_dflash_serving_preserves_32k_context() {
     assert!(fit.kv_pages_auto_fitted);
     assert_eq!(auto_engine.ranks[0].kv_pool.num_pages, 16_384);
     assert!(auto_engine.ranks[0].state_pool.total_slots >= 11);
+    let auto_ckpt = auto_engine.ranks[0]
+        .checkpoint_pool
+        .as_ref()
+        .expect("27B DFlash2 at 262k context must allocate tiered WHT128-Q8_0 checkpoint pool");
+    assert!(
+        auto_ckpt.total_slots >= 24 && auto_ckpt.host_slots >= 16,
+        "27B DFlash2 at 262k context must retain tiered checkpoints without starving M=8 verify slots, got vram={} host={}",
+        auto_ckpt.vram_slots,
+        auto_ckpt.host_slots
+    );
+    assert_eq!(auto_ckpt.allocated_host_slots(), 0);
 }
 
 #[test]

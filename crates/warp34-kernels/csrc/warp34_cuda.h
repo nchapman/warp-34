@@ -402,6 +402,41 @@ int warp34_gdn_recurrent_strided_f16(const warp34_exec* ex, const warp34_gdn_bat
                                   int num_v_heads, int head_v_dim,
                                   int ba_row_stride, int total_state_slots);
 
+// --- Compressed GDN Checkpoints (op_gdn_ckpt.cu) ---
+int warp34_gdn_checkpoint_pack_wht_q8(
+    const warp34_exec* ex,
+    const uint64_t* ssm_layer_ptrs,
+    const uint64_t* conv_layer_ptrs,
+    const void* ple_conv_pool,
+    int src_state_slot,
+    int total_state_slots,
+    int num_layers,
+    int rows_per_layer,
+    int head_k_dim,
+    int conv_elems_per_slot,
+    int ple_conv_elems_per_slot,
+    void* dst_qdata,
+    void* dst_scales_bf16,
+    void* dst_conv_f16,
+    void* dst_ple_conv_f16);
+
+int warp34_gdn_checkpoint_unpack_wht_q8(
+    const warp34_exec* ex,
+    const void* src_qdata,
+    const void* src_scales_bf16,
+    const void* src_conv_f16,
+    const void* src_ple_conv_f16,
+    const uint64_t* ssm_layer_ptrs,
+    const uint64_t* conv_layer_ptrs,
+    void* ple_conv_pool,
+    int dst_state_slot,
+    int total_state_slots,
+    int num_layers,
+    int rows_per_layer,
+    int head_k_dim,
+    int conv_elems_per_slot,
+    int ple_conv_elems_per_slot);
+
 // --- Pinned-Sysmem TP=2 Collectives (op_collectives.cu) ---
 size_t warp34_tp2_signal_bytes(void);
 int warp34_tp2_all_reduce_f16(const warp34_exec* ex, const void* local_in, void* out,

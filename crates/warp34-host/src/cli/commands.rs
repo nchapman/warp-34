@@ -335,9 +335,9 @@ pub(crate) fn run_bench(
     } else {
         make_prompt(prompt_len)
     };
-    // Warmup pass (captures CUDA Graph on decode step 1 and ramps GPU boost clock out of P8)
+    // Warmup pass (captures CUDA Graph on decode step 1, warms tiered MoE / L2, and ramps GPU boost clock out of P8)
     let _ = engine
-        .generate_tokens(&synth_prompt[..16.min(synth_prompt.len())], 32, false)
+        .generate_tokens(&synth_prompt, 64, false)
         .map_err(|e| e.to_string())?;
 
     let spec_label = speculative_kind.map(|k| match k {
@@ -742,6 +742,9 @@ pub(crate) struct ServeBootSummary {
     pub(crate) kv_pool_bytes_per_rank: usize,
     pub(crate) state_slots: usize,
     pub(crate) state_pool_bytes_per_rank: usize,
+    pub(crate) ckpt_vram_slots: usize,
+    pub(crate) ckpt_host_slots: usize,
+    pub(crate) ckpt_bytes_per_slot: usize,
     pub(crate) weight_bytes_per_rank: usize,
     pub(crate) scratch_bytes_per_rank: usize,
     pub(crate) host_embed_offload: bool,
@@ -794,6 +797,17 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
     } else {
         "gpu-resident".to_string()
     };
+    let ckpt_desc = if s.ckpt_vram_slots + s.ckpt_host_slots > 0 {
+        format!(
+            " + {} WHT128-Q8_0 ckpts ({} VRAM + {} Host, {:.1} MiB/slot)",
+            s.ckpt_vram_slots + s.ckpt_host_slots,
+            s.ckpt_vram_slots,
+            s.ckpt_host_slots,
+            s.ckpt_bytes_per_slot as f64 / mib,
+        )
+    } else {
+        String::new()
+    };
     let model_line = if s.served_model == s.checkpoint_label {
         s.served_model.clone()
     } else {
@@ -814,7 +828,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "  Speculative  : {}\n",
             "  KV Cache     : {} {}\n",
             "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
-            "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}) [auto-sized]\n",
+            "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}){} [auto-sized]\n",
             "  Placement    : weights={:.2} GiB, scratch={:.0} MiB, embed={}, free={:.0} MiB\n",
             "  Endpoint     : http://{} (auth={}, webui={}, cuda_graph={})\n",
         ),
@@ -836,6 +850,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.state_slots,
         s.state_pool_bytes_per_rank as f64 / gib,
         s.max_num_seqs,
+        ckpt_desc,
         s.weight_bytes_per_rank as f64 / gib,
         s.scratch_bytes_per_rank as f64 / mib,
         embed_desc,
@@ -983,6 +998,12 @@ pub(crate) fn run_serve(
                     state_slots: r0.state_pool.total_slots,
                     state_pool_bytes_per_rank: state_bytes
                         .saturating_mul(r0.state_pool.total_slots),
+                    ckpt_vram_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.vram_slots),
+                    ckpt_host_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.host_slots),
+                    ckpt_bytes_per_slot: r0
+                        .checkpoint_pool
+                        .as_ref()
+                        .map_or(0, |c| c.layout.bundle_bytes),
                     weight_bytes_per_rank: r0.weight_arena.used(),
                     scratch_bytes_per_rank: r0.scratch_arena.capacity(),
                     host_embed_offload: r0.host_embed_tokens.is_some(),

@@ -133,6 +133,7 @@ impl NativeProposer {
             .iter()
             .map(|p| (p.trigger_offset_1based, p.dst_slot))
             .collect();
+        engine.materialize_pending_checkpoint(&mut seq.radix_state)?;
         engine.set_active_lora_id(seq.lora_id);
         engine.clear_slice_lora_ids();
         let is_last_chunk = end == seq.prompt_tokens.len();
@@ -164,21 +165,26 @@ impl NativeProposer {
         seq.prefilled_tokens = end;
 
         if end < seq.prompt_tokens.len() {
-            if seq.radix_state.last_track_seqlen.is_some() {
-                let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
-                let rep = engine
-                    .alloc_state_slot_preserving_leaves(radix)
-                    .or_else(|| {
-                        (start < 2048 && !can_recycle)
-                            .then(|| engine.alloc_state_slot_from(radix))
-                            .flatten()
-                    });
-                if rep.is_some() || can_recycle {
-                    let don = seq
-                        .radix_state
-                        .donate_committed_checkpoint(radix, rep, false);
-                    engine.free_kv_pages(&don.freed_kv_pages);
-                    engine.free_state_slots(&don.freed_mamba_slots);
+            if seq.prefix_bidir_len.is_none() && seq.radix_state.has_donatable_checkpoint() {
+                if engine.has_checkpoint_pool() {
+                    engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+                } else {
+                    let can_recycle =
+                        radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+                    let rep = engine
+                        .alloc_state_slot_preserving_leaves(radix)
+                        .or_else(|| {
+                            (start < 2048 && !can_recycle)
+                                .then(|| engine.alloc_state_slot_from(radix))
+                                .flatten()
+                        });
+                    if rep.is_some() || can_recycle {
+                        let don = seq
+                            .radix_state
+                            .donate_committed_checkpoint(radix, rep, false);
+                        engine.free_kv_pages(&don.freed_kv_pages);
+                        engine.free_state_slots(&don.freed_mamba_slots);
+                    }
                 }
             }
             return Ok(None);
@@ -206,21 +212,28 @@ impl NativeProposer {
         {
             seq.finished = true;
         }
-        if !seq.finished && seq.radix_state.last_track_seqlen.is_some() {
-            let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
-            let rep = engine
-                .alloc_state_slot_preserving_leaves(radix)
-                .or_else(|| {
-                    (!can_recycle)
-                        .then(|| engine.alloc_state_slot_from(radix))
-                        .flatten()
-                });
-            if rep.is_some() || can_recycle {
-                let don = seq
-                    .radix_state
-                    .donate_committed_checkpoint(radix, rep, false);
-                engine.free_kv_pages(&don.freed_kv_pages);
-                engine.free_state_slots(&don.freed_mamba_slots);
+        if !seq.finished
+            && seq.prefix_bidir_len.is_none()
+            && seq.radix_state.has_donatable_checkpoint()
+        {
+            if engine.has_checkpoint_pool() {
+                engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+            } else {
+                let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+                let rep = engine
+                    .alloc_state_slot_preserving_leaves(radix)
+                    .or_else(|| {
+                        (!can_recycle)
+                            .then(|| engine.alloc_state_slot_from(radix))
+                            .flatten()
+                    });
+                if rep.is_some() || can_recycle {
+                    let don = seq
+                        .radix_state
+                        .donate_committed_checkpoint(radix, rep, false);
+                    engine.free_kv_pages(&don.freed_kv_pages);
+                    engine.free_state_slots(&don.freed_mamba_slots);
+                }
             }
         }
         Ok(Some((anchor, lp)))
@@ -239,6 +252,7 @@ impl NativeProposer {
             .generated_tokens
             .last()
             .ok_or_else(|| loader_err("missing anchor in step_scheduled_verify_round"))?;
+        engine.materialize_pending_checkpoint(&mut seq.radix_state)?;
         engine.set_active_lora_id(seq.lora_id);
         engine.clear_slice_lora_ids();
         let mut tx = StateTx::new(seq.radix_state.active_state_slot);
@@ -281,6 +295,12 @@ impl NativeProposer {
             pending_ingest.clear();
             out
         };
+        if engine.has_checkpoint_pool()
+            && seq.prefix_bidir_len.is_none()
+            && seq.radix_state.should_donate_decode_checkpoint()
+        {
+            engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+        }
         if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
             let pos_before = seq.generated_tokens.len() + idx;
             if pos_before < sampler.params.min_tokens {
@@ -890,6 +910,18 @@ impl NativeProposer {
                         }
                     }
                 };
+                if let Err(e) = engine.materialize_pending_checkpoint(&mut seq.radix_state) {
+                    engine.free_state_slots(&extras);
+                    return Err(e);
+                }
+                if engine.has_checkpoint_pool()
+                    && seq.prefix_bidir_len.is_none()
+                    && seq.radix_state.should_donate_decode_checkpoint()
+                    && let Err(e) = engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)
+                {
+                    engine.free_state_slots(&extras);
+                    return Err(e);
+                }
                 if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
                     let pos_before = seq.generated_tokens.len() + idx;
                     if pos_before < sampler.params.min_tokens {

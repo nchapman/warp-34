@@ -109,6 +109,48 @@ impl Qwen3_5Engine {
         out
     }
 
+    #[inline]
+    pub fn has_checkpoint_pool(&self) -> bool {
+        self.ranks
+            .first()
+            .and_then(|r| r.checkpoint_pool.as_ref())
+            .is_some_and(|p| p.total_slots > 0)
+    }
+
+    pub fn alloc_checkpoint_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
+        if !self.has_checkpoint_pool() {
+            return None;
+        }
+        if let Some(c0) = self.ranks[0]
+            .checkpoint_pool
+            .as_mut()
+            .and_then(|c| c.alloc_slot())
+        {
+            for r in &mut self.ranks[1..] {
+                let c_peer = r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot());
+                debug_assert_eq!(Some(c0), c_peer);
+            }
+            return Some(c0);
+        }
+        let ev = radix.evict_mamba(1);
+        if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
+            self.free_kv_pages(&ev.freed_kv_pages);
+            self.free_state_slots(&ev.freed_mamba_slots);
+            if let Some(c0) = self.ranks[0]
+                .checkpoint_pool
+                .as_mut()
+                .and_then(|c| c.alloc_slot())
+            {
+                for r in &mut self.ranks[1..] {
+                    let c_peer = r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot());
+                    debug_assert_eq!(Some(c0), c_peer);
+                }
+                return Some(c0);
+            }
+        }
+        None
+    }
+
     pub fn alloc_state_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
             for r in &mut self.ranks[1..] {
@@ -116,6 +158,10 @@ impl Qwen3_5Engine {
                 debug_assert_eq!(Some(s0), s_peer);
             }
             return Some(s0);
+        }
+        if self.has_checkpoint_pool() {
+            // Checkpoints in `radix` live in `checkpoint_pool`, not `state_pool`.
+            return None;
         }
         let ev = radix.evict_mamba(1);
         if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
@@ -146,7 +192,7 @@ impl Qwen3_5Engine {
             }
             return Some(s0);
         }
-        if radix.has_evictable_internal_mamba() {
+        if !self.has_checkpoint_pool() && radix.has_evictable_internal_mamba() {
             return self.alloc_state_slot_from(radix);
         }
         None
@@ -155,10 +201,111 @@ impl Qwen3_5Engine {
     pub fn free_state_slots(&mut self, slots: &[i32]) {
         for r in &mut self.ranks {
             for &s in slots {
-                if s >= 0 {
+                if crate::cache::is_checkpoint_pool_slot(s) {
+                    if let Some(ckpt) = &mut r.checkpoint_pool {
+                        ckpt.free_slot(s);
+                    }
+                } else if s >= 0 {
                     r.state_pool.free_slot(s);
                 }
             }
+        }
+    }
+
+    pub fn pack_checkpoint_from_active(
+        &mut self,
+        src_active_slot: i32,
+        dst_ckpt_slot: i32,
+    ) -> Result<()> {
+        for r in &mut self.ranks {
+            let ckpt = r
+                .checkpoint_pool
+                .as_mut()
+                .ok_or_else(|| loader_err("GdnCheckpointPool is not enabled on rank"))?;
+            ckpt.pack_from_active(&r.state_pool, src_active_slot, dst_ckpt_slot, &r.stream)?;
+        }
+        Ok(())
+    }
+
+    pub fn unpack_checkpoint_to_active(
+        &mut self,
+        src_ckpt_slot: i32,
+        dst_active_slot: i32,
+    ) -> Result<()> {
+        for r in &mut self.ranks {
+            let ckpt = r
+                .checkpoint_pool
+                .as_mut()
+                .ok_or_else(|| loader_err("GdnCheckpointPool is not enabled on rank"))?;
+            ckpt.unpack_to_active(&mut r.state_pool, src_ckpt_slot, dst_active_slot, &r.stream)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn materialize_pending_checkpoint(
+        &mut self,
+        req_state: &mut crate::radix::ReqRadixState,
+    ) -> Result<()> {
+        if let Some(ckpt_slot) = req_state.pending_unpack_ckpt_slot.take() {
+            self.unpack_checkpoint_to_active(ckpt_slot, req_state.active_state_slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_radix_donation(
+        &mut self,
+        donation: &crate::radix::RadixDonationOutcome,
+    ) -> Result<()> {
+        if let Some((src_active, dst_ckpt)) = donation.pending_checkpoint_pack {
+            self.pack_checkpoint_from_active(src_active, dst_ckpt)?;
+        }
+        self.free_kv_pages(&donation.freed_kv_pages);
+        self.free_state_slots(&donation.freed_mamba_slots);
+        Ok(())
+    }
+
+    pub fn donate_req_checkpoint(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        req_state: &mut crate::radix::ReqRadixState,
+        finish_req: bool,
+    ) -> Result<crate::radix::RadixDonationOutcome> {
+        if self.has_checkpoint_pool() {
+            let ckpt = if req_state.has_donatable_checkpoint() {
+                self.alloc_checkpoint_slot_from(radix)
+            } else {
+                None
+            };
+            let outcome = if ckpt.is_none() && req_state.has_donatable_checkpoint() {
+                if finish_req {
+                    req_state.abort_and_release(radix)
+                } else {
+                    crate::radix::RadixDonationOutcome::default()
+                }
+            } else {
+                req_state.donate_committed_checkpoint(radix, ckpt, finish_req)
+            };
+            self.apply_radix_donation(&outcome)?;
+            Ok(outcome)
+        } else {
+            let can_recycle = radix.can_recycle_locked_mamba(req_state.last_locked_node);
+            let rep = if finish_req || !req_state.has_donatable_checkpoint() {
+                None
+            } else {
+                self.alloc_state_slot_preserving_leaves(radix).or_else(|| {
+                    (!can_recycle)
+                        .then(|| self.alloc_state_slot_from(radix))
+                        .flatten()
+                })
+            };
+            let outcome = if finish_req || rep.is_some() || can_recycle {
+                req_state.donate_committed_checkpoint(radix, rep, finish_req)
+            } else {
+                crate::radix::RadixDonationOutcome::default()
+            };
+            self.apply_radix_donation(&outcome)?;
+            Ok(outcome)
         }
     }
 

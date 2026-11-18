@@ -57,6 +57,7 @@ pub struct Qwen3_5ModelRank {
     pub layers: Vec<DecoderLayerWeights>,
     pub kv_pool: KvPool,
     pub state_pool: StateBundlePool,
+    pub checkpoint_pool: Option<crate::cache::GdnCheckpointPool>,
     pub decode_io: DecodeGraphIo,
     pub decode_graph: Vec<((bool, GraphLoraMode), u64, CudaGraph)>,
     pub spec_verify_io: SpecVerifyGraphIo,
@@ -2081,6 +2082,16 @@ impl PrePoolModelRank {
             kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
         }
 
+        let checkpoint_pool = Self::build_rank_checkpoint_pool(
+            &device,
+            &stream,
+            &state_pool,
+            !gdn_layer_ids.is_empty(),
+            tp_size,
+            required_headroom,
+            capacity,
+        )?;
+
         let decode_io =
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let spec_verify_io =
@@ -2110,6 +2121,7 @@ impl PrePoolModelRank {
             layers,
             kv_pool,
             state_pool,
+            checkpoint_pool,
             decode_io,
             decode_graph: Vec::new(),
             spec_verify_io,
@@ -2147,5 +2159,48 @@ impl PrePoolModelRank {
             lora_runtime: None,
             is_capturing_graph: false,
         })
+    }
+
+    fn build_rank_checkpoint_pool(
+        device: &CudaDevice,
+        stream: &CudaStream,
+        state_pool: &StateBundlePool,
+        has_gdn_layers: bool,
+        tp_size: usize,
+        required_headroom: usize,
+        capacity: PoolCapacity,
+    ) -> Result<Option<crate::cache::GdnCheckpointPool>> {
+        if !has_gdn_layers
+            || (!capacity.enable_checkpoint_pool
+                && capacity.checkpoint_vram_slots.is_none()
+                && capacity.checkpoint_host_slots.is_none())
+        {
+            return Ok(None);
+        }
+        let ckpt_layout = crate::cache::GdnCheckpointLayout::from_state_pool(state_pool);
+        let vram_slots = match capacity.checkpoint_vram_slots {
+            Some(v) => v,
+            None => {
+                let live_free_after_kv = device.mem_info()?.0;
+                let safety_floor = required_headroom.saturating_add(256 * 1024 * 1024);
+                let spare_vram = live_free_after_kv.saturating_sub(safety_floor);
+                (spare_vram / ckpt_layout.bundle_bytes.max(1))
+                    .min(crate::cache::MAX_AUTO_VRAM_CHECKPOINT_SLOTS)
+            }
+        };
+        let host_slots = match capacity.checkpoint_host_slots {
+            Some(h) => h,
+            None => crate::cache::plan_auto_host_checkpoint_slots(
+                ckpt_layout.bundle_bytes,
+                tp_size,
+                crate::cache::detect_available_host_ram_bytes(),
+            ),
+        };
+        if vram_slots + host_slots == 0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::cache::GdnCheckpointPool::new(
+            state_pool, vram_slots, host_slots, stream,
+        )?))
     }
 }

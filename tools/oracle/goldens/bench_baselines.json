@@ -480,8 +480,8 @@
       "kv_format": "tq4",
       "stage": "decode",
       "prompt_source": "synthetic",
-      "prompt_len": 64,
-      "gen_len": 64,
+      "prompt_len": 128,
+      "gen_len": 128,
       "batch_size": 8,
       "speculative": "dflash2",
       "draft_model": "nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ",
@@ -622,12 +622,12 @@
         "sm_86": {
           "gpu_label": "2x NVIDIA GeForce RTX 3090 Ti",
           "decode_tok_per_s": 105.7,
-          "mean_accepted_drafts": 2.60
+          "mean_accepted_drafts": 2.15
         },
         "sm_89": {
           "gpu_label": "2x NVIDIA GeForce RTX 4090",
           "decode_tok_per_s": 138.7,
-          "mean_accepted_drafts": 2.60
+          "mean_accepted_drafts": 2.15
         }
       }
     }

@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{self, Receiver};
 
 use super::{
     GenerationEvent, Qwen3_5Engine, Request, SchedulerConfig, SchedulerV1, StepLogprobs,
-    WorkerError, WorkerStats, decode::step_plain, enqueue, notify_request_error,
+    WorkerError, WorkerStats, decode::step_plain, enqueue, finish_early, notify_request_error,
     panic_payload_message, publish_pools, release,
 };
 
@@ -108,6 +108,7 @@ pub(super) fn run_loop(
     stats: &WorkerStats,
 ) {
     let mut sched = SchedulerV1::new(config);
+    sched.use_checkpoint_pool = engine.has_checkpoint_pool();
     let mut speculation = SpeculativeLoopState::default();
     let mut prev_active_peak = 1usize;
     loop {
@@ -294,7 +295,7 @@ fn cancel_requests(
                 engine.speculative = Some(p);
             }
         }
-        release(engine, sched.finish_request_early(id));
+        finish_early(engine, sched, id);
         release(engine, sched.cancel_request(id));
         if let Some(mut r) = requests.remove(&id)
             && let Some(tap) = r.decision_tap.take()
@@ -865,7 +866,7 @@ fn reserve_request_capacity(
                     }
                 }
             }
-            release(engine, sched.finish_request_early(id));
+            finish_early(engine, sched, id);
         } else {
             failed.push((id, WorkerError::overload("KV pool exhausted")));
         }
@@ -1013,7 +1014,7 @@ fn step_single_speculation(
     });
     engine.speculative = Some(proposer);
     if seq.finished {
-        release(engine, sched.finish_request_early(id));
+        finish_early(engine, sched, id);
         *speculative_id = None;
     }
     Some(result.map_err(WorkerError::Cuda))
@@ -1061,7 +1062,7 @@ fn step_mtp_batch_prefill_chunk(
                     let _ = proposer.reset_mtp_batch_slot(slot_idx);
                 }
                 mtp_batch_slots[slot_idx] = None;
-                release(engine, sched.finish_request_early(id));
+                finish_early(engine, sched, id);
                 finish_res.map_err(WorkerError::Cuda)?;
             }
             Ok(still_prefilling)
@@ -1149,7 +1150,7 @@ fn step_mtp_batch_verify_round(
                 }
             }
             for id in finished_ids {
-                release(engine, sched.finish_request_early(id));
+                finish_early(engine, sched, id);
             }
             match finish_err {
                 Some(err) => Err(err),

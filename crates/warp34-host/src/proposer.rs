@@ -1939,8 +1939,10 @@ impl NativeProposer {
                 None,
             )
         });
+        let mut prefill_donated_seq_len = 0usize;
         let started = Instant::now();
         let result = (|| -> Result<(Vec<i32>, Vec<crate::parser::StepLogprobs>, f64, f64)> {
+            engine.materialize_pending_checkpoint(&mut req)?;
             engine.ensure_kv_pages_for_len(&mut req, total)?;
             let mut anchor = 0;
             let mut cursor = cached;
@@ -1997,14 +1999,14 @@ impl NativeProposer {
                 self.ingest(engine, radix_tokens, &features)?;
                 req.commit_tokens(radix_tokens, &planned);
                 cursor = end;
-                if (cursor < prompt.len() || max_new > 1)
-                    && req.last_track_seqlen.is_some()
-                    && let Some(rep) = engine.alloc_state_slot()
-                {
-                    let don = req.donate_committed_checkpoint(&mut engine.radix, Some(rep), false);
-                    engine.free_kv_pages(&don.freed_kv_pages);
-                    engine.free_state_slots(&don.freed_mamba_slots);
-                }
+                prefill_donated_seq_len =
+                    prefill_donated_seq_len.max(engine.donate_intermediate_prefill_checkpoint(
+                        &mut req,
+                        cursor,
+                        prompt.len(),
+                        max_new,
+                        false,
+                    )?);
             }
             tx.committed_slot = req.active_state_slot;
             tx.commit_prefill(prompt.len());
@@ -2162,15 +2164,21 @@ impl NativeProposer {
                 return Err(e);
             }
         };
-        let donation = req.donate_committed_checkpoint(&mut engine.radix, None, true);
-        engine.free_kv_pages(&donation.freed_kv_pages);
-        engine.free_state_slots(&donation.freed_mamba_slots);
+        let donation = {
+            let mut radix = std::mem::replace(
+                &mut engine.radix,
+                crate::radix::MambaRadixCache::new(16, 64),
+            );
+            let res = engine.donate_req_checkpoint(&mut radix, &mut req, true);
+            engine.radix = radix;
+            res?
+        };
         self.commit_current_memo();
         let steps = generated.len().saturating_sub(1);
         Ok(RadixBenchMetrics {
             prompt_len: prompt.len(),
             cached_prefix_tokens: cached,
-            donated_seq_len: donation.donated_seq_len,
+            donated_seq_len: donation.donated_seq_len.max(prefill_donated_seq_len),
             gen_len: generated.len(),
             ttft_ms: ttft,
             prefill_tok_per_s: if ttft > 0. {

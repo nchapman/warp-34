@@ -237,6 +237,9 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             r.kv_pool.reset_all_pages();
             r.state_pool.reset_all_slots();
+            if let Some(ckpt) = &mut r.checkpoint_pool {
+                ckpt.reset_all_slots();
+            }
             for st in &r.state_pool.layers {
                 st.conv_state.zero_async(&r.stream)?;
                 st.ssm_state.zero_async(&r.stream)?;

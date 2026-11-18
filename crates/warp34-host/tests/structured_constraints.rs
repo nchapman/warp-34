@@ -643,7 +643,11 @@ fn copilot_raw_newlines() {
         json!({"type":["string","null"]}),
         json!({"type":["string","object"]}),
     ] {
-        check_native_argument(schema, "\nParis\n", json!("\nParis\n"));
+        // Qwen3-XML (`chatml.rs` / `vLLM`) wraps parameter values in a single `\n...\n`;
+        // stripping one wrapper newline per side recovers `"Paris"` while `\n\nParis\n\n`
+        // preserves literal leading/trailing newlines `"\nParis\n"`.
+        check_native_argument(schema.clone(), "\nParis\n", json!("Paris"));
+        check_native_argument(schema, "\n\nParis\n\n", json!("\nParis\n"));
     }
 }
 

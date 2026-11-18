@@ -1026,6 +1026,10 @@ fn publish_pools(
 ) {
     // Logical allocation is replicated across ranks; summing TP would double count.
     let rank = &engine.ranks[0];
+    let (ckpt_total, ckpt_free) = rank
+        .checkpoint_pool
+        .as_ref()
+        .map_or((0, 0), |c| (c.total_slots, c.free_count()));
     telemetry.publish_pools(Pools {
         kv: Pool::known(
             rank.kv_pool.num_pages,
@@ -1033,18 +1037,30 @@ fn publish_pools(
             radix.full_evictable_pages(),
         ),
         gdn: Pool::known(
-            rank.state_pool.total_slots,
-            rank.state_pool.free_count(),
+            rank.state_pool.total_slots.saturating_add(ckpt_total),
+            rank.state_pool.free_count().saturating_add(ckpt_free),
             radix.mamba_evictable_slots(),
         ),
     });
 }
 
 fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonationOutcome>) {
-    if let Some(d) = donation {
+    if let Some(d) = donation
+        && let Err(e) = engine.apply_radix_donation(&d)
+    {
+        eprintln!("warning: failed to pack GDN checkpoint during radix donation: {e}");
         engine.free_kv_pages(&d.freed_kv_pages);
         engine.free_state_slots(&d.freed_mamba_slots);
     }
+}
+
+fn finish_early(engine: &mut Qwen3_5Engine, sched: &mut SchedulerV1, req_id: u64) {
+    let out = if engine.has_checkpoint_pool() {
+        sched.finish_request_early_with(req_id, |r| engine.alloc_checkpoint_slot_from(r))
+    } else {
+        sched.finish_request_early(req_id)
+    };
+    release(engine, out);
 }
 
 fn enqueue(

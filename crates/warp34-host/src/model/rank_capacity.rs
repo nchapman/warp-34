@@ -19,6 +19,10 @@ pub(super) struct PoolCapacity {
     pub(super) dflash_min_state_slots: usize,
     /// Pre-computed per-rank LoRA VRAM reserve and execution traits.
     pub(super) lora_reserve: LoraCapacityReserve,
+    /// Enables compressed `WHT128-Q8_0` `GdnCheckpointPool` (L1 VRAM + L2 Pinned Host RAM).
+    pub(super) enable_checkpoint_pool: bool,
+    pub(super) checkpoint_vram_slots: Option<usize>,
+    pub(super) checkpoint_host_slots: Option<usize>,
 }
 
 /// Number of state slots allocated per active sequence in serving mode (three private

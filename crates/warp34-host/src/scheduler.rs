@@ -219,6 +219,7 @@ pub struct SchedulerV1 {
     pub radix: MambaRadixCache,
     pub active: Vec<SeqEntry>,
     pub waiting: VecDeque<WaitingReq>,
+    pub use_checkpoint_pool: bool,
     next_req_id: u64,
 }
 
@@ -246,6 +247,7 @@ impl SchedulerV1 {
             cfg,
             active: Vec::new(),
             waiting: VecDeque::new(),
+            use_checkpoint_pool: false,
             next_req_id: 1,
         }
     }
@@ -717,6 +719,18 @@ impl SchedulerV1 {
     where
         F: FnMut() -> Option<i32>,
     {
+        self.commit_slice_with_radix(slice, emitted_token, |_| alloc_replacement_slot())
+    }
+
+    pub fn commit_slice_with_radix<F>(
+        &mut self,
+        slice: &ScheduledReqSlice,
+        emitted_token: Option<i32>,
+        mut alloc_replacement_slot: F,
+    ) -> Option<RadixDonationOutcome>
+    where
+        F: FnMut(&mut MambaRadixCache) -> Option<i32>,
+    {
         let seq = self.active.iter_mut().find(|s| s.req_id == slice.req_id)?;
         let radix_slice = if slice.is_prefill_chunk {
             &seq.radix_key_tokens
@@ -748,23 +762,37 @@ impl SchedulerV1 {
             seq.resources_released = true;
             if seq.prefix_bidir_len.is_some() {
                 Some(seq.radix_state.abort_and_release(&mut self.radix))
+            } else if self.use_checkpoint_pool {
+                let ckpt = if seq.radix_state.has_donatable_checkpoint() {
+                    alloc_replacement_slot(&mut self.radix)
+                } else {
+                    None
+                };
+                if ckpt.is_none() && seq.radix_state.has_donatable_checkpoint() {
+                    Some(seq.radix_state.abort_and_release(&mut self.radix))
+                } else {
+                    Some(
+                        seq.radix_state
+                            .donate_committed_checkpoint(&mut self.radix, ckpt, true),
+                    )
+                }
             } else {
                 Some(
                     seq.radix_state
                         .donate_committed_checkpoint(&mut self.radix, None, true),
                 )
             }
-        } else if slice.is_prefill_chunk
-            && seq.prefix_bidir_len.is_none()
-            && seq.radix_state.last_track_seqlen.is_some()
+        } else if seq.prefix_bidir_len.is_none()
+            && ((slice.is_prefill_chunk && seq.radix_state.has_donatable_checkpoint())
+                || (self.use_checkpoint_pool && seq.radix_state.should_donate_decode_checkpoint()))
         {
-            // Donate intermediate chunked-prefill checkpoint immediately so concurrent
-            // requests in the next step can hit the warm prefix!
-            let rep = alloc_replacement_slot();
+            // Donate intermediate chunked-prefill or periodic 512-token decode checkpoint!
+            let rep = alloc_replacement_slot(&mut self.radix);
             if rep.is_some()
-                || self
-                    .radix
-                    .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
+                || (!self.use_checkpoint_pool
+                    && self
+                        .radix
+                        .can_recycle_locked_mamba(seq.radix_state.last_locked_node))
             {
                 Some(
                     seq.radix_state
@@ -796,6 +824,17 @@ impl SchedulerV1 {
     /// Marks an active sequence finished early (e.g. due to a `stop` string match) and
     /// donates its committed checkpoints to `self.radix` if not already donated.
     pub fn finish_request_early(&mut self, req_id: u64) -> Option<RadixDonationOutcome> {
+        self.finish_request_early_with(req_id, |_| None)
+    }
+
+    pub fn finish_request_early_with<F>(
+        &mut self,
+        req_id: u64,
+        mut alloc_ckpt_slot: F,
+    ) -> Option<RadixDonationOutcome>
+    where
+        F: FnMut(&mut MambaRadixCache) -> Option<i32>,
+    {
         let seq = self.active.iter_mut().find(|s| s.req_id == req_id)?;
         if seq.resources_released {
             return None;
@@ -804,6 +843,20 @@ impl SchedulerV1 {
         seq.resources_released = true;
         if seq.prefix_bidir_len.is_some() {
             Some(seq.radix_state.abort_and_release(&mut self.radix))
+        } else if self.use_checkpoint_pool {
+            let ckpt = if seq.radix_state.has_donatable_checkpoint() {
+                alloc_ckpt_slot(&mut self.radix)
+            } else {
+                None
+            };
+            if ckpt.is_none() && seq.radix_state.has_donatable_checkpoint() {
+                Some(seq.radix_state.abort_and_release(&mut self.radix))
+            } else {
+                Some(
+                    seq.radix_state
+                        .donate_committed_checkpoint(&mut self.radix, ckpt, true),
+                )
+            }
         } else {
             Some(
                 seq.radix_state

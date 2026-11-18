@@ -114,6 +114,11 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         target="backbone_and_collectives",
         test_name="test_gdn_conv_paired_prefill_matches_chunked_scalar",
     ),
+    SanitizerCase(
+        subsystem="gdn",
+        target="lib",
+        test_name="cache::checkpoint_pool::tests::wht128_q8_roundtrip_and_l2_spill_restore",
+    ),
     # 4. Mixture-of-Experts (grouped MMA, down_accum, 512/k10 router, GPU LRU & CPU bridge)
     SanitizerCase(
         subsystem="moe",

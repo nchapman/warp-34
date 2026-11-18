@@ -1049,6 +1049,48 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup warp34_gdn_recurrent_f16 prefill wide"
         )?;
     }
+    let ckpt_ssm_ptrs = arena.upload_slice(&[buf_a], &stream)?;
+    let ckpt_conv_ptrs = arena.upload_slice(&[buf_b], &stream)?;
+    warmup_ffi!(
+        ffi::warp34_gdn_checkpoint_pack_wht_q8(
+            &ex,
+            ckpt_ssm_ptrs as *const u64,
+            ckpt_conv_ptrs as *const u64,
+            (buf_b + 4096) as *const c_void,
+            0,
+            1,
+            1,
+            4,
+            128,
+            64,
+            64,
+            buf_c as *mut c_void,
+            (buf_c + 4096) as *mut c_void,
+            (buf_c + 8192) as *mut c_void,
+            (buf_c + 12288) as *mut c_void,
+        ),
+        "warmup warp34_gdn_checkpoint_pack_wht_q8"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_gdn_checkpoint_unpack_wht_q8(
+            &ex,
+            buf_c as *const c_void,
+            (buf_c + 4096) as *const c_void,
+            (buf_c + 8192) as *const c_void,
+            (buf_c + 12288) as *const c_void,
+            ckpt_ssm_ptrs as *const u64,
+            ckpt_conv_ptrs as *const u64,
+            (buf_d + 4096) as *mut c_void,
+            0,
+            1,
+            1,
+            4,
+            128,
+            64,
+            64,
+        ),
+        "warmup warp34_gdn_checkpoint_unpack_wht_q8"
+    )?;
 
     // 5. Sampler & MTP / DFlash2 kernels
     warmup_ffi!(ffi::warp34_tp2_warmup(), "warmup op_collectives module")?;

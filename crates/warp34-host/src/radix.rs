@@ -1015,12 +1015,19 @@ pub struct PlannedCheckpoint {
     pub abs_seq_len: usize,
 }
 
+/// Periodic decode checkpoint donation stride (`512` tokens = `8` Mamba `C = 64` chunks),
+/// bounding worst-case rollback on cancelled or diverged long decodes to `< 512` tokens.
+pub const DECODE_CHECKPOINT_INTERVAL_TOKENS: usize = 512;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RadixDonationOutcome {
     pub donated_seq_len: usize,
     pub freed_kv_pages: Vec<i32>,
     pub freed_draft_pages: Vec<i32>,
     pub freed_mamba_slots: Vec<i32>,
+    /// Optional `(src_active_fp32_slot, dst_checkpoint_pool_slot)` to quantize into
+    /// [`crate::cache::GdnCheckpointPool`] before releasing `freed_mamba_slots`.
+    pub pending_checkpoint_pack: Option<(i32, i32)>,
 }
 
 /// Per-request `HybridReqToTokenPool` state (`SGLang` `extra_buffer` ping-pong checkpoint tracking).
@@ -1044,6 +1051,9 @@ pub struct ReqRadixState {
     /// to read from on the first continuation step (`state_in_indices`), while writing to
     /// `active_state_slot` (`state_out_indices`) for zero-copy one-pass COW!
     pub cow_src_state_slot: Option<i32>,
+    /// When restored from a compressed [`crate::cache::GdnCheckpointPool`] slot, holds the
+    /// tagged checkpoint slot until the engine unpacks it into `active_state_slot`.
+    pub pending_unpack_ckpt_slot: Option<i32>,
     ///Whether the request has a valid initial GDN state (`true` after prefix hit or first prefill chunk).
     pub has_initial_state: bool,
     /// 2-slot ping-pong `StateBundle` track buffer (`SGLang` `mamba_ping_pong_track_buffer`).
@@ -1072,6 +1082,7 @@ impl ReqRadixState {
             last_locked_node: RadixNodeId::ROOT,
             active_state_slot,
             cow_src_state_slot: None,
+            pending_unpack_ckpt_slot: None,
             has_initial_state: false,
             ping_pong_slots,
             next_track_idx: 0,
@@ -1086,7 +1097,10 @@ impl ReqRadixState {
         prompt_tokens: &[i32],
         match_res: &RadixMatchResult,
     ) {
-        if match_res.matched_tokens == 0 || match_res.mamba_slot.is_none() {
+        let Some(slot) = match_res.mamba_slot else {
+            return;
+        };
+        if match_res.matched_tokens == 0 {
             return;
         }
         radix.inc_lock_ref(match_res.last_node);
@@ -1097,8 +1111,38 @@ impl ReqRadixState {
         self.draft_pages.clone_from(&match_res.draft_pages);
         self.protected_pages = self.kv_pages.len();
         self.last_locked_node = match_res.last_node;
-        self.cow_src_state_slot = match_res.mamba_slot;
+        if crate::cache::is_checkpoint_pool_slot(slot) {
+            self.cow_src_state_slot = None;
+            self.pending_unpack_ckpt_slot = Some(slot);
+        } else {
+            self.cow_src_state_slot = Some(slot);
+            self.pending_unpack_ckpt_slot = None;
+        }
         self.has_initial_state = true;
+    }
+
+    /// Returns `true` when `ping_pong_slots[next_track_idx ^ 1]` holds a committed, aligned
+    /// checkpoint past `protected_pages` ready to donate into `MambaRadixCache`.
+    #[inline]
+    pub fn has_donatable_checkpoint(&self) -> bool {
+        self.last_track_seqlen.is_some_and(|cache_len| {
+            let keep_idx = self.next_track_idx ^ 1;
+            cache_len > self.protected_pages * self.page_size
+                && cache_len <= self.token_ids.len()
+                && cache_len.is_multiple_of(self.page_size)
+                && self.ping_pong_slots[keep_idx] >= 0
+        })
+    }
+
+    /// Returns `true` when decode has advanced at least [`DECODE_CHECKPOINT_INTERVAL_TOKENS`]
+    /// past the last donated checkpoint and has a valid aligned snapshot ready to pack.
+    #[inline]
+    pub fn should_donate_decode_checkpoint(&self) -> bool {
+        self.has_donatable_checkpoint()
+            && self.last_track_seqlen.is_some_and(|cache_len| {
+                cache_len.saturating_sub(self.protected_pages * self.page_size)
+                    >= DECODE_CHECKPOINT_INTERVAL_TOKENS
+            })
     }
 
     /// Returns the `state_in_slot` for the next forward/verify launch (`cow_src_state_slot` if set,
@@ -1199,6 +1243,7 @@ impl ReqRadixState {
         );
         let mut outcome = RadixDonationOutcome::default();
 
+        let external_ckpt = replacement_slot.filter(|&s| crate::cache::is_checkpoint_pool_slot(s));
         if let Some(cache_len) = self.last_track_seqlen
             && cache_len > self.protected_pages * self.page_size
             && cache_len <= self.token_ids.len()
@@ -1206,7 +1251,8 @@ impl ReqRadixState {
         {
             let cache_pages = cache_len / self.page_size;
             let keep_idx = self.next_track_idx ^ 1;
-            let donated_mamba_slot = self.ping_pong_slots[keep_idx];
+            let src_fp32_slot = self.ping_pong_slots[keep_idx];
+            let donated_mamba_slot = external_ckpt.unwrap_or(src_fp32_slot);
             let draft_slice = if self.draft_pages.len() >= cache_pages {
                 &self.draft_pages[..cache_pages]
             } else {
@@ -1249,7 +1295,13 @@ impl ReqRadixState {
                 self.protected_pages = cache_pages;
             }
 
-            if ins.mamba_already_existed {
+            if let Some(ckpt_slot) = external_ckpt {
+                if ins.mamba_already_existed {
+                    outcome.freed_mamba_slots.push(ckpt_slot);
+                } else {
+                    outcome.pending_checkpoint_pack = Some((src_fp32_slot, ckpt_slot));
+                }
+            } else if ins.mamba_already_existed {
                 // Keep `donated_mamba_slot` in our ping-pong buffer (or free `replacement_slot` if provided).
                 if let Some(rep) = replacement_slot {
                     outcome.freed_mamba_slots.push(rep);
@@ -1264,9 +1316,14 @@ impl ReqRadixState {
                 self.ping_pong_slots[keep_idx] = -1;
             }
             self.last_track_seqlen = None;
-        } else if finish_req {
-            radix.dec_lock_ref(self.last_locked_node);
-            self.last_locked_node = RadixNodeId::ROOT;
+        } else {
+            if let Some(ckpt_slot) = external_ckpt {
+                outcome.freed_mamba_slots.push(ckpt_slot);
+            }
+            if finish_req {
+                radix.dec_lock_ref(self.last_locked_node);
+                self.last_locked_node = RadixNodeId::ROOT;
+            }
         }
 
         if finish_req {
@@ -1299,6 +1356,7 @@ impl ReqRadixState {
     /// `last_locked_node` and returning all private KV pages and GDN state slots.
     pub fn abort_and_release(&mut self, radix: &mut MambaRadixCache) -> RadixDonationOutcome {
         self.last_track_seqlen = None;
+        self.pending_unpack_ckpt_slot = None;
         self.donate_committed_checkpoint(radix, None, true)
     }
 }
