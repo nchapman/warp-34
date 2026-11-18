@@ -678,6 +678,7 @@ enum ActiveParamStream {
     Buffered {
         name: String,
         value_start: usize,
+        is_first: bool,
     },
 }
 
@@ -1479,7 +1480,11 @@ impl Qwen3Parser {
                         });
                         return NativeToolStep::InProgress;
                     }
-                    ActiveParamStream::Buffered { name, value_start } => {
+                    ActiveParamStream::Buffered {
+                        name,
+                        value_start,
+                        is_first,
+                    } => {
                         let properties = self.properties_for_func(&func_name);
                         let schema = properties.and_then(|p| p.get(&name));
                         let grammar = self
@@ -1499,10 +1504,16 @@ impl Qwen3Parser {
                                 self.tool_stream.aborted = true;
                                 return NativeToolStep::Aborted;
                             }
+                            let key_json =
+                                serde_json::to_string(&name).expect("param name serializes");
                             let val_json =
                                 serde_json::to_string(&converted).unwrap_or_else(|_| "null".into());
+                            let chunk = format!(
+                                "{}{key_json}:{val_json}",
+                                if is_first { "{" } else { "," }
+                            );
                             let next_cursor = value_start + end_rel + "</parameter>".len();
-                            self.emit_streamed_arg_chunk(&val_json, out_deltas);
+                            self.emit_streamed_arg_chunk(&chunk, out_deltas);
                             self.tool_stream.cursor = next_cursor;
                             self.tool_stream.active_param = None;
                             continue;
@@ -1556,15 +1567,11 @@ impl Qwen3Parser {
 
                 let is_stream_str =
                     self.is_unconstrained_string_param(&func_name, &param_name_owned);
-                let key_json =
-                    serde_json::to_string(&param_name_owned).expect("param name serializes");
-                let prefix = if is_stream_str {
-                    format!("{}{key_json}:\"", if is_first { "{" } else { "," })
-                } else {
-                    format!("{}{key_json}:", if is_first { "{" } else { "," })
-                };
-                self.emit_streamed_arg_chunk(&prefix, out_deltas);
                 self.tool_stream.active_param = Some(if is_stream_str {
+                    let key_json =
+                        serde_json::to_string(&param_name_owned).expect("param name serializes");
+                    let prefix = format!("{}{key_json}:\"", if is_first { "{" } else { "," });
+                    self.emit_streamed_arg_chunk(&prefix, out_deltas);
                     ActiveParamStream::StreamString {
                         value_start: val_start,
                         value_scan_pos: val_start,
@@ -1574,6 +1581,7 @@ impl Qwen3Parser {
                     ActiveParamStream::Buffered {
                         name: param_name_owned,
                         value_start: val_start,
+                        is_first,
                     }
                 });
                 continue;
@@ -1736,8 +1744,9 @@ impl Qwen3Parser {
                         return;
                     }
                     ActiveParamStream::Buffered {
-                        name: _,
+                        name,
                         value_start,
+                        is_first,
                     } => {
                         let avail = &self.buffer[value_start..];
                         let close_param = Self::find_tool_delimiter(avail, "</parameter>");
@@ -1766,10 +1775,16 @@ impl Qwen3Parser {
                             let trimmed = Self::trim_wrapping_newlines(raw_val);
                             let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
                                 .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+                            let key_json =
+                                serde_json::to_string(&name).expect("param name serializes");
                             let val_json =
                                 serde_json::to_string(&json_val).unwrap_or_else(|_| "null".into());
+                            let chunk = format!(
+                                "{}{key_json}:{val_json}",
+                                if is_first { "{" } else { "," }
+                            );
                             let next_cursor = value_start + tag_advance;
-                            self.emit_streamed_arg_chunk(&val_json, out_deltas);
+                            self.emit_streamed_arg_chunk(&chunk, out_deltas);
                             self.tool_stream.cursor = next_cursor;
                             self.tool_stream.active_param = None;
                             if delim_kind <= 1 {
@@ -1832,14 +1847,10 @@ impl Qwen3Parser {
             let is_first = self.tool_stream.seen_params.is_empty();
             self.tool_stream.seen_params.push(param_name.clone());
             self.tool_stream.cursor = val_start;
-            let key_json = serde_json::to_string(&param_name).expect("param name serializes");
-            let prefix = if is_stream_str {
-                format!("{}{key_json}:\"", if is_first { "{" } else { "," })
-            } else {
-                format!("{}{key_json}:", if is_first { "{" } else { "," })
-            };
-            self.emit_streamed_arg_chunk(&prefix, out_deltas);
             self.tool_stream.active_param = Some(if is_stream_str {
+                let key_json = serde_json::to_string(&param_name).expect("param name serializes");
+                let prefix = format!("{}{key_json}:\"", if is_first { "{" } else { "," });
+                self.emit_streamed_arg_chunk(&prefix, out_deltas);
                 ActiveParamStream::StreamString {
                     value_start: val_start,
                     value_scan_pos: val_start,
@@ -1849,6 +1860,7 @@ impl Qwen3Parser {
                 ActiveParamStream::Buffered {
                     name: param_name,
                     value_start: val_start,
+                    is_first,
                 }
             });
         }
@@ -2760,6 +2772,71 @@ mod tests {
         let mut p_dup = Qwen3Parser::new(false);
         let _ = p_dup.push_str(dup_legacy);
         assert!(p_dup.finish().1.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn native_tool_stream_abort_and_fallback_paths() {
+        use serde_json::json;
+        let tools = vec![json!({"function":{"name":"echo","parameters":{
+            "type":"object",
+            "properties":{
+                "v":{"type":"string"},
+                "count":{"type":"integer"}
+            }
+        }}})];
+
+        // 1. Unknown function name or invalid buffered parameter value aborts before emitting
+        // any tool header delta and reconciles streamed content_delta with turn.content.
+        for bad in [
+            "<tool_call>\n<function=unknown>\n<parameter=v>x</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=echo>\n<parameter=count>not_an_int</parameter>\n</function>\n</tool_call>",
+        ] {
+            let mut p = Qwen3Parser::with_tools(false, &tools).unwrap();
+            let mut content_stream = String::new();
+            let mut tool_deltas = Vec::new();
+            for ch in bad.chars() {
+                let d = p.push_str(&ch.to_string());
+                if let Some(c) = d.content_delta {
+                    content_stream.push_str(&c);
+                }
+                tool_deltas.extend(d.tool_call_deltas);
+            }
+            let (df, turn) = p.finish();
+            if let Some(c) = df.content_delta {
+                content_stream.push_str(&c);
+            }
+            tool_deltas.extend(df.tool_call_deltas);
+            assert!(
+                tool_deltas.is_empty(),
+                "expected no orphan tool deltas for {bad:?}"
+            );
+            assert!(turn.tool_calls.is_empty());
+            assert_eq!(content_stream, bad);
+            assert_eq!(turn.content.as_deref(), Some(bad));
+        }
+
+        // 2. Post-header abort (duplicate parameter after a valid StreamString parameter):
+        // tool call is rejected (turn.tool_calls empty), turn.content retains full fallback text,
+        // and content_delta does not dump duplicate raw XML after header_emitted.
+        let dup_native = "<tool_call>\n<function=echo>\n<parameter=v>first</parameter>\n<parameter=v>dup</parameter>\n</function>\n</tool_call>";
+        let mut p_dup = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut dup_content_deltas = String::new();
+        let mut dup_tool_deltas = Vec::new();
+        for ch in dup_native.chars() {
+            let d = p_dup.push_str(&ch.to_string());
+            if let Some(c) = d.content_delta {
+                dup_content_deltas.push_str(&c);
+            }
+            dup_tool_deltas.extend(d.tool_call_deltas);
+        }
+        let (df_dup, turn_dup) = p_dup.finish();
+        if let Some(c) = df_dup.content_delta {
+            dup_content_deltas.push_str(&c);
+        }
+        assert!(!dup_tool_deltas.is_empty());
+        assert!(turn_dup.tool_calls.is_empty());
+        assert!(dup_content_deltas.is_empty());
+        assert_eq!(turn_dup.content.as_deref(), Some(dup_native));
     }
 
     #[test]
