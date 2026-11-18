@@ -876,17 +876,9 @@ pub fn build_anthropic_message(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveBlock {
     None,
-    Thinking {
-        index: usize,
-    },
-    Text {
-        index: usize,
-    },
-    ToolUse {
-        index: usize,
-        tool_index: usize,
-        emitted_delta: bool,
-    },
+    Thinking { index: usize },
+    Text { index: usize },
+    ToolUse { index: usize, tool_index: usize },
 }
 
 /// Deterministic SSE state machine for `POST /v1/messages` (`stream: true`).
@@ -896,6 +888,7 @@ pub struct AnthropicSseFormatter {
     started: bool,
     next_block_index: usize,
     next_tool_index: usize,
+    completed_tools_count: usize,
     active: ActiveBlock,
 }
 
@@ -907,6 +900,7 @@ impl AnthropicSseFormatter {
             started: false,
             next_block_index: 0,
             next_tool_index: 0,
+            completed_tools_count: 0,
             active: ActiveBlock::None,
         }
     }
@@ -968,24 +962,7 @@ impl AnthropicSseFormatter {
                 ));
                 self.active = ActiveBlock::None;
             }
-            ActiveBlock::ToolUse {
-                index,
-                emitted_delta,
-                ..
-            } => {
-                if !emitted_delta {
-                    out.push((
-                        "content_block_delta".into(),
-                        json!({
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": "{}",
-                            }
-                        }),
-                    ));
-                }
+            ActiveBlock::ToolUse { index, .. } => {
                 out.push((
                     "content_block_stop".into(),
                     json!({
@@ -995,6 +972,63 @@ impl AnthropicSseFormatter {
                 ));
                 self.active = ActiveBlock::None;
             }
+        }
+    }
+
+    fn emit_tool_call_delta(
+        &mut self,
+        tc_delta: &crate::parser::StreamToolCallDelta,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        let index = match self.active {
+            ActiveBlock::ToolUse { index, tool_index } if tool_index == tc_delta.index => index,
+            _ => {
+                self.close_active(out);
+                let index = self.next_block_index;
+                self.next_block_index += 1;
+                let tool_idx = self.next_tool_index;
+                self.next_tool_index += 1;
+                let id = tool_id_for_raw(
+                    &self.meta.message_id,
+                    tc_delta.id.as_deref().unwrap_or(""),
+                    tool_idx,
+                );
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": id,
+                            "name": tc_delta.name.clone().unwrap_or_default(),
+                            "input": {},
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::ToolUse {
+                    index,
+                    tool_index: tc_delta.index,
+                };
+                index
+            }
+        };
+        if let Some(arg_chunk) = tc_delta
+            .arguments_delta
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            out.push((
+                "content_block_delta".into(),
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": arg_chunk,
+                    }
+                }),
+            ));
         }
     }
 
@@ -1051,6 +1085,22 @@ impl AnthropicSseFormatter {
         cached_tokens: usize,
     ) -> Vec<(String, Value)> {
         let mut out = self.ensure_started(cached_tokens);
+        self.completed_tools_count += delta.completed_tool_calls.len();
+        let mut tc_slice = delta.tool_call_deltas.as_slice();
+
+        if let ActiveBlock::ToolUse {
+            tool_index: active_idx,
+            ..
+        } = self.active
+        {
+            while let Some(first) = tc_slice.first().filter(|d| d.index == active_idx) {
+                self.emit_tool_call_delta(first, &mut out);
+                tc_slice = &tc_slice[1..];
+            }
+            if active_idx < self.completed_tools_count {
+                self.close_active(&mut out);
+            }
+        }
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
             let index = if let ActiveBlock::Thinking { index } = self.active {
@@ -1121,68 +1171,13 @@ impl AnthropicSseFormatter {
         }
 
         if !delta.tool_call_deltas.is_empty() {
-            for tc_delta in &delta.tool_call_deltas {
-                let index = match self.active {
-                    ActiveBlock::ToolUse {
-                        index, tool_index, ..
-                    } if tool_index == tc_delta.index => index,
-                    _ => {
-                        self.close_active(&mut out);
-                        let index = self.next_block_index;
-                        self.next_block_index += 1;
-                        let tool_idx = self.next_tool_index;
-                        self.next_tool_index += 1;
-                        let id = tool_id_for_raw(
-                            &self.meta.message_id,
-                            tc_delta.id.as_deref().unwrap_or(""),
-                            tool_idx,
-                        );
-                        out.push((
-                            "content_block_start".into(),
-                            json!({
-                                "type": "content_block_start",
-                                "index": index,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": tc_delta.name.clone().unwrap_or_default(),
-                                    "input": {},
-                                }
-                            }),
-                        ));
-                        self.active = ActiveBlock::ToolUse {
-                            index,
-                            tool_index: tc_delta.index,
-                            emitted_delta: false,
-                        };
-                        index
-                    }
-                };
-                if let Some(arg_chunk) = tc_delta
-                    .arguments_delta
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
+            for tc_delta in tc_slice {
+                self.emit_tool_call_delta(tc_delta, &mut out);
+                if let ActiveBlock::ToolUse { tool_index, .. } = self.active
+                    && tool_index < self.completed_tools_count
                 {
-                    if let ActiveBlock::ToolUse { emitted_delta, .. } = &mut self.active {
-                        *emitted_delta = true;
-                    }
-                    out.push((
-                        "content_block_delta".into(),
-                        json!({
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": arg_chunk,
-                            }
-                        }),
-                    ));
+                    self.close_active(&mut out);
                 }
-            }
-            if !delta.completed_tool_calls.is_empty()
-                && matches!(self.active, ActiveBlock::ToolUse { .. })
-            {
-                self.close_active(&mut out);
             }
         } else {
             for tc in &delta.completed_tool_calls {
@@ -1465,6 +1460,61 @@ mod tests {
             joined_json,
             r#"{"path":"src/scene.js","content":"const x = 1;\nexport default x;"}"#
         );
+
+        // Multi-tool chunk handoff (tool 0 finishes + tool 1 starts in one chunk, then tool 1
+        // finishes + trailing text in the next chunk).
+        let (_, meta2) = translate_anthropic_to_chat(&req, "qwen", 11, true).unwrap();
+        let mut parser2 = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut sse2 = AnthropicSseFormatter::new(meta2, 50);
+        let mut ev2 = Vec::new();
+        ev2.extend(sse2.push_delta(
+            parser2.push_str(concat!(
+                "<tool_call>\n<function=write>\n<parameter=path>a.js</parameter>\n</function>\n</tool_call>\n",
+                "<tool_call>\n<function=write>\n<parameter=path>b."
+            )),
+            10,
+        ));
+        ev2.extend(sse2.push_delta(
+            parser2.push_str("js</parameter>\n</function>\n</tool_call>\nDone."),
+            10,
+        ));
+        let (tail2, turn2) = parser2.finish();
+        ev2.extend(sse2.push_delta(tail2, 10));
+        ev2.extend(sse2.finish(&turn2, "tool_calls", None, 10, 30));
+
+        let tool_starts2 = ev2
+            .iter()
+            .filter(|(n, v)| n == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .count();
+        assert_eq!(tool_starts2, 2);
+        let block0_json: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta"
+                    && v["index"] == 0
+                    && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        let block1_json: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta"
+                    && v["index"] == 1
+                    && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        let block2_text: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta" && v["index"] == 2 && v["delta"]["type"] == "text_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(block0_json, r#"{"path":"a.js"}"#);
+        assert_eq!(block1_json, r#"{"path":"b.js"}"#);
+        assert_eq!(block2_text, "Done.");
     }
 
     #[test]

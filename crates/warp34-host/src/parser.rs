@@ -1215,6 +1215,9 @@ impl Qwen3Parser {
                     break;
                 };
                 let param_name = param_name.trim().to_string();
+                if param_name.is_empty() || params.contains_key(&param_name) {
+                    return None;
+                }
                 let val_start = &after_p[p_angle + 1..];
                 let (raw_val, next_slice) = if let Some(p_end) =
                     Self::find_tool_delimiter(val_start, "</parameter>")
@@ -1339,15 +1342,21 @@ impl Qwen3Parser {
         Self::push_tool_arg_delta(self.next_tool_idx, chunk, out);
     }
 
-    fn is_unconstrained_string_param(&self, func_name: &str, param_name: &str) -> bool {
-        let Some(tools) = self.tools.as_deref() else {
-            return false;
-        };
-        let Some(schema) = tools
+    fn properties_for_func(
+        &self,
+        func_name: &str,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.tools
+            .as_deref()?
             .iter()
-            .find(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some(func_name))
-            .and_then(|t| t.pointer("/function/parameters/properties"))
-            .and_then(serde_json::Value::as_object)
+            .find(|t| t.pointer("/function/name").and_then(|v| v.as_str()) == Some(func_name))?
+            .pointer("/function/parameters/properties")?
+            .as_object()
+    }
+
+    fn is_unconstrained_string_param(&self, func_name: &str, param_name: &str) -> bool {
+        let Some(schema) = self
+            .properties_for_func(func_name)
             .and_then(|props| props.get(param_name))
         else {
             return false;
@@ -1471,10 +1480,7 @@ impl Qwen3Parser {
                         return NativeToolStep::InProgress;
                     }
                     ActiveParamStream::Buffered { name, value_start } => {
-                        let properties = self
-                            .tools
-                            .as_deref()
-                            .and_then(|t| Self::properties(&self.buffer, t));
+                        let properties = self.properties_for_func(&func_name);
                         let schema = properties.and_then(|p| p.get(&name));
                         let grammar = self
                             .value_grammars
@@ -1678,17 +1684,17 @@ impl Qwen3Parser {
                         let close_fn = Self::find_tool_delimiter(avail, "</function>");
                         let close_tc = Self::find_tool_delimiter(avail, Self::TOOL_END);
                         let earliest_delim = [
-                            close_param.map(|p| (p, true)),
-                            next_param.map(|p| (p, false)),
-                            close_fn.map(|p| (p, false)),
-                            close_tc.map(|p| (p, false)),
+                            close_param.map(|p| (p, 0u8)),
+                            next_param.map(|p| (p, 1u8)),
+                            close_fn.map(|p| (p, 2u8)),
+                            close_tc.map(|p| (p, 2u8)),
                         ]
                         .into_iter()
                         .flatten()
                         .min_by_key(|&(pos, _)| pos);
 
-                        if let Some((end_rel, is_close_param)) = earliest_delim {
-                            let tag_advance = if is_close_param {
+                        if let Some((end_rel, delim_kind)) = earliest_delim {
+                            let tag_advance = if delim_kind == 0 {
                                 let Some(gt_rel) = avail[end_rel..].find('>') else {
                                     return;
                                 };
@@ -1704,7 +1710,7 @@ impl Qwen3Parser {
                             self.emit_streamed_arg_chunk(&chunk, out_deltas);
                             self.tool_stream.cursor = next_cursor;
                             self.tool_stream.active_param = None;
-                            if is_close_param {
+                            if delim_kind <= 1 {
                                 continue;
                             }
                             return;
@@ -1734,20 +1740,42 @@ impl Qwen3Parser {
                         value_start,
                     } => {
                         let avail = &self.buffer[value_start..];
-                        if let Some(end_rel) = Self::find_tool_delimiter(avail, "</parameter>")
-                            && let Some(gt_rel) = avail[end_rel..].find('>')
-                        {
+                        let close_param = Self::find_tool_delimiter(avail, "</parameter>");
+                        let next_param = Self::find_tool_delimiter(avail, "<parameter=");
+                        let close_fn = Self::find_tool_delimiter(avail, "</function>");
+                        let close_tc = Self::find_tool_delimiter(avail, Self::TOOL_END);
+                        let earliest_delim = [
+                            close_param.map(|p| (p, 0u8)),
+                            next_param.map(|p| (p, 1u8)),
+                            close_fn.map(|p| (p, 2u8)),
+                            close_tc.map(|p| (p, 2u8)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min_by_key(|&(pos, _)| pos);
+                        if let Some((end_rel, delim_kind)) = earliest_delim {
+                            let tag_advance = if delim_kind == 0 {
+                                let Some(gt_rel) = avail[end_rel..].find('>') else {
+                                    return;
+                                };
+                                end_rel + gt_rel + 1
+                            } else {
+                                end_rel
+                            };
                             let raw_val = &avail[..end_rel];
                             let trimmed = Self::trim_wrapping_newlines(raw_val);
                             let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
                                 .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
                             let val_json =
                                 serde_json::to_string(&json_val).unwrap_or_else(|_| "null".into());
-                            let next_cursor = value_start + end_rel + gt_rel + 1;
+                            let next_cursor = value_start + tag_advance;
                             self.emit_streamed_arg_chunk(&val_json, out_deltas);
                             self.tool_stream.cursor = next_cursor;
                             self.tool_stream.active_param = None;
-                            continue;
+                            if delim_kind <= 1 {
+                                continue;
+                            }
+                            return;
                         }
                         return;
                     }
@@ -2671,8 +2699,10 @@ mod tests {
                 );
             }
         }
+    }
 
-        // Verify legacy tool-less Qwen3Parser::new also streams string parameters incrementally.
+    #[test]
+    fn legacy_tool_call_deltas_stream_and_handle_unclosed_and_duplicate_params() {
         let legacy_stream = concat!(
             "<tool_call>\n<function=write>\n",
             "<parameter=path>\nsrc/scene.js\n</parameter>\n",
@@ -2705,6 +2735,31 @@ mod tests {
             .collect();
         assert_eq!(joined_legacy, legacy_turn.tool_calls[0].function.arguments);
         assert_eq!(joined_legacy, r#"{"path":"src/scene.js","count":42}"#);
+
+        // Legacy unclosed </parameter> before next <parameter=> and duplicate parameter rejection.
+        let unclosed_legacy = "<tool_call><function=write><parameter=count>42<parameter=path>a.js</function></tool_call>";
+        let mut p_unclosed = Qwen3Parser::new(false);
+        let mut unclosed_deltas = Vec::new();
+        for ch in unclosed_legacy.chars() {
+            unclosed_deltas.extend(p_unclosed.push_str(&ch.to_string()).tool_call_deltas);
+        }
+        let (df_unclosed, turn_unclosed) = p_unclosed.finish();
+        unclosed_deltas.extend(df_unclosed.tool_call_deltas);
+        assert_eq!(turn_unclosed.tool_calls.len(), 1);
+        let joined_unclosed: String = unclosed_deltas
+            .iter()
+            .filter_map(|d| d.arguments_delta.as_deref())
+            .collect();
+        assert_eq!(
+            joined_unclosed,
+            turn_unclosed.tool_calls[0].function.arguments
+        );
+        assert_eq!(joined_unclosed, r#"{"count":42,"path":"a.js"}"#);
+
+        let dup_legacy = "<tool_call><function=write><parameter=a>1</parameter><parameter=a>2</parameter></function></tool_call>";
+        let mut p_dup = Qwen3Parser::new(false);
+        let _ = p_dup.push_str(dup_legacy);
+        assert!(p_dup.finish().1.tool_calls.is_empty());
     }
 
     #[test]

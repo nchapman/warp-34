@@ -1297,6 +1297,7 @@ pub struct ResponsesSseFormatter {
     next_output_index: usize,
     next_msg_index: usize,
     next_fc_index: usize,
+    completed_fc_count: usize,
     active: ActiveItem,
     reasoning_accum: String,
     current_msg_id: String,
@@ -1319,6 +1320,7 @@ impl ResponsesSseFormatter {
             next_output_index: 0,
             next_msg_index: 0,
             next_fc_index: 0,
+            completed_fc_count: 0,
             active: ActiveItem::None,
             reasoning_accum: String::new(),
             current_msg_id: String::new(),
@@ -1363,6 +1365,10 @@ impl ResponsesSseFormatter {
     }
 
     fn close_active(&mut self, out: &mut Vec<(String, Value)>) {
+        self.close_active_with_fc_status(true, out);
+    }
+
+    fn close_active_with_fc_status(&mut self, fc_completed: bool, out: &mut Vec<(String, Value)>) {
         match self.active {
             ActiveItem::None => {}
             ActiveItem::Reasoning { output_index } => {
@@ -1441,18 +1447,20 @@ impl ResponsesSseFormatter {
                 let name = self.current_fc_name.clone();
                 let arguments = self.current_fc_args_accum.clone();
 
-                let mut done_args = Map::new();
-                done_args.insert("item_id".into(), json!(item_id));
-                done_args.insert("output_index".into(), json!(output_index));
-                done_args.insert("call_id".into(), json!(call_id));
-                done_args.insert("name".into(), json!(name));
-                done_args.insert("arguments".into(), json!(arguments));
-                out.push(self.emit("response.function_call_arguments.done", done_args));
+                if fc_completed {
+                    let mut done_args = Map::new();
+                    done_args.insert("item_id".into(), json!(item_id));
+                    done_args.insert("output_index".into(), json!(output_index));
+                    done_args.insert("call_id".into(), json!(call_id));
+                    done_args.insert("name".into(), json!(name));
+                    done_args.insert("arguments".into(), json!(arguments));
+                    out.push(self.emit("response.function_call_arguments.done", done_args));
+                }
 
                 let done_item = json!({
                     "id": item_id,
                     "type": "function_call",
-                    "status": "completed",
+                    "status": if fc_completed { "completed" } else { "incomplete" },
                     "call_id": call_id,
                     "name": name,
                     "arguments": arguments,
@@ -1466,6 +1474,76 @@ impl ResponsesSseFormatter {
                 self.current_fc_args_accum.clear();
                 self.active = ActiveItem::None;
             }
+        }
+    }
+
+    fn emit_tool_call_delta(
+        &mut self,
+        tc_delta: &crate::parser::StreamToolCallDelta,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        let output_index = match self.active {
+            ActiveItem::FunctionCall {
+                output_index,
+                tool_index,
+            } if tool_index == tc_delta.index => output_index,
+            _ => {
+                self.close_active(out);
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                let fc_idx = self.next_fc_index;
+                self.next_fc_index += 1;
+                let suffix = self
+                    .meta
+                    .response_id
+                    .strip_prefix("resp_")
+                    .unwrap_or(&self.meta.response_id);
+                let item_id = format!("fc_{suffix}_{fc_idx}");
+                let call_id = tc_delta
+                    .id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| format!("call_{suffix}_{fc_idx}"), str::to_owned);
+                let name = tc_delta.name.clone().unwrap_or_default();
+
+                self.current_fc_item_id.clone_from(&item_id);
+                self.current_fc_call_id.clone_from(&call_id);
+                self.current_fc_name.clone_from(&name);
+                self.current_fc_args_accum.clear();
+
+                let added_item = json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                });
+                let mut a = Map::new();
+                a.insert("output_index".into(), json!(output_index));
+                a.insert("item".into(), added_item);
+                out.push(self.emit("response.output_item.added", a));
+
+                self.active = ActiveItem::FunctionCall {
+                    output_index,
+                    tool_index: tc_delta.index,
+                };
+                output_index
+            }
+        };
+
+        if let Some(arg_chunk) = tc_delta
+            .arguments_delta
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            self.current_fc_args_accum.push_str(arg_chunk);
+            let mut d = Map::new();
+            d.insert("item_id".into(), json!(self.current_fc_item_id));
+            d.insert("output_index".into(), json!(output_index));
+            d.insert("call_id".into(), json!(self.current_fc_call_id));
+            d.insert("delta".into(), json!(arg_chunk));
+            out.push(self.emit("response.function_call_arguments.delta", d));
         }
     }
 
@@ -1534,6 +1612,22 @@ impl ResponsesSseFormatter {
 
     pub fn push_delta(&mut self, delta: StreamParseDelta) -> Vec<(String, Value)> {
         let mut out = Vec::new();
+        self.completed_fc_count += delta.completed_tool_calls.len();
+        let mut tc_slice = delta.tool_call_deltas.as_slice();
+
+        if let ActiveItem::FunctionCall {
+            tool_index: active_idx,
+            ..
+        } = self.active
+        {
+            while let Some(first) = tc_slice.first().filter(|d| d.index == active_idx) {
+                self.emit_tool_call_delta(first, &mut out);
+                tc_slice = &tc_slice[1..];
+            }
+            if active_idx < self.completed_fc_count {
+                self.close_active(&mut out);
+            }
+        }
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
             let output_index = if let ActiveItem::Reasoning { output_index } = self.active {
@@ -1641,75 +1735,13 @@ impl ResponsesSseFormatter {
         }
 
         if !delta.tool_call_deltas.is_empty() {
-            for tc_delta in &delta.tool_call_deltas {
-                let output_index = match self.active {
-                    ActiveItem::FunctionCall {
-                        output_index,
-                        tool_index,
-                    } if tool_index == tc_delta.index => output_index,
-                    _ => {
-                        self.close_active(&mut out);
-                        let output_index = self.next_output_index;
-                        self.next_output_index += 1;
-                        let fc_idx = self.next_fc_index;
-                        self.next_fc_index += 1;
-                        let suffix = self
-                            .meta
-                            .response_id
-                            .strip_prefix("resp_")
-                            .unwrap_or(&self.meta.response_id);
-                        let item_id = format!("fc_{suffix}_{fc_idx}");
-                        let call_id = tc_delta
-                            .id
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .map_or_else(|| format!("call_{suffix}_{fc_idx}"), str::to_owned);
-                        let name = tc_delta.name.clone().unwrap_or_default();
-
-                        self.current_fc_item_id.clone_from(&item_id);
-                        self.current_fc_call_id.clone_from(&call_id);
-                        self.current_fc_name.clone_from(&name);
-                        self.current_fc_args_accum.clear();
-
-                        let added_item = json!({
-                            "id": item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "call_id": call_id,
-                            "name": name,
-                            "arguments": "",
-                        });
-                        let mut a = Map::new();
-                        a.insert("output_index".into(), json!(output_index));
-                        a.insert("item".into(), added_item);
-                        out.push(self.emit("response.output_item.added", a));
-
-                        self.active = ActiveItem::FunctionCall {
-                            output_index,
-                            tool_index: tc_delta.index,
-                        };
-                        output_index
-                    }
-                };
-
-                if let Some(arg_chunk) = tc_delta
-                    .arguments_delta
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
+            for tc_delta in tc_slice {
+                self.emit_tool_call_delta(tc_delta, &mut out);
+                if let ActiveItem::FunctionCall { tool_index, .. } = self.active
+                    && tool_index < self.completed_fc_count
                 {
-                    self.current_fc_args_accum.push_str(arg_chunk);
-                    let mut d = Map::new();
-                    d.insert("item_id".into(), json!(self.current_fc_item_id));
-                    d.insert("output_index".into(), json!(output_index));
-                    d.insert("call_id".into(), json!(self.current_fc_call_id));
-                    d.insert("delta".into(), json!(arg_chunk));
-                    out.push(self.emit("response.function_call_arguments.delta", d));
+                    self.close_active(&mut out);
                 }
-            }
-            if !delta.completed_tool_calls.is_empty()
-                && matches!(self.active, ActiveItem::FunctionCall { .. })
-            {
-                self.close_active(&mut out);
             }
         } else {
             for tc in &delta.completed_tool_calls {
@@ -1753,7 +1785,11 @@ impl ResponsesSseFormatter {
         reasoning_tokens: usize,
     ) -> (Vec<(String, Value)>, Value, Vec<Value>) {
         let mut out = Vec::new();
-        self.close_active(&mut out);
+        let fc_completed = !matches!(
+            self.active,
+            ActiveItem::FunctionCall { tool_index, .. } if tool_index >= turn.tool_calls.len()
+        );
+        self.close_active_with_fc_status(fc_completed, &mut out);
 
         // Emit any tool calls that were not yet emitted incrementally
         if self.next_fc_index < turn.tool_calls.len() {

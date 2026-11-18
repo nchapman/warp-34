@@ -292,6 +292,55 @@ fn responses_sse_streams_incremental_function_call_deltas_without_duplication() 
     assert_eq!(joined_deltas, expected);
     assert_eq!(final_resp["output"].as_array().unwrap().len(), 1);
     assert_eq!(final_resp["output"][0]["arguments"], expected);
+
+    // Multi-tool chunk handoff (tool 0 finishes + tool 1 starts in one chunk, then tool 1
+    // finishes + trailing text in the next chunk) + truncated tool call at finish().
+    let (_, meta2) = translate_responses_to_chat(&req, "qwen-test", &store, None, 9).unwrap();
+    let mut parser2 = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse2 = ResponsesSseFormatter::new(meta2);
+    let mut frames2 = sse2.start();
+    frames2.extend(sse2.push_delta(parser2.push_str(concat!(
+        "<tool_call>\n<function=write>\n<parameter=path>a.js</parameter>\n</function>\n</tool_call>\n",
+        "<tool_call>\n<function=write>\n<parameter=path>b."
+    ))));
+    frames2.extend(sse2.push_delta(
+        parser2.push_str("js</parameter>\n</function>\n</tool_call>\nAll files written."),
+    ));
+    let (tail2, turn2) = parser2.finish();
+    frames2.extend(sse2.push_delta(tail2));
+    let (end2, resp2, _) = sse2.finish(&turn2, "stop", 20, 10, 15, 0);
+    frames2.extend(end2);
+
+    let out_items2 = resp2["output"].as_array().unwrap();
+    assert_eq!(out_items2.len(), 3);
+    assert_eq!(out_items2[0]["type"], "function_call");
+    assert_eq!(out_items2[0]["arguments"], r#"{"path":"a.js"}"#);
+    assert_eq!(out_items2[1]["type"], "function_call");
+    assert_eq!(out_items2[1]["arguments"], r#"{"path":"b.js"}"#);
+    assert_eq!(out_items2[2]["type"], "message");
+    assert_eq!(out_items2[2]["content"][0]["text"], "All files written.");
+
+    // Truncated tool call at max_tokens marks the function_call item as incomplete.
+    let (_, meta3) = translate_responses_to_chat(&req, "qwen-test", &store, None, 10).unwrap();
+    let mut parser3 = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse3 = ResponsesSseFormatter::new(meta3);
+    let mut frames3 = sse3.start();
+    frames3.extend(
+        sse3.push_delta(parser3.push_str("<tool_call>\n<function=write>\n<parameter=path>trunc")),
+    );
+    let (tail3, turn3) = parser3.finish();
+    frames3.extend(sse3.push_delta(tail3));
+    let (end3, resp3, _) = sse3.finish(&turn3, "length", 20, 10, 15, 0);
+    frames3.extend(end3);
+    assert!(
+        !frames3
+            .iter()
+            .any(|(n, _)| n == "response.function_call_arguments.done"),
+        "truncated tool call must not emit function_call_arguments.done"
+    );
+    assert_eq!(resp3["status"], "incomplete");
+    assert_eq!(resp3["output"][0]["type"], "function_call");
+    assert_eq!(resp3["output"][0]["status"], "incomplete");
 }
 
 #[test]
