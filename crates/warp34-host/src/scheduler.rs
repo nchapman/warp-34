@@ -582,19 +582,40 @@ impl SchedulerV1 {
         }
 
         // 2. Schedule chunked prefill slices aligned to `mamba_chunk_size = 64`.
-        // Bound total co-scheduled prefill even for long prompts and low decode concurrency:
-        // a larger chunk would stall active decode streams for its entire execution time.
+        // Bound mixed-step prefill to `mixed_chunk_prefill_size` (256) so long prompts
+        // do not stall active decodes; only scale the aggregate mixed budget when
+        // multiple eligible short causal prompts (`rem <= mixed_cap`) are queued so
+        // short-prompt bursts (e.g. C=16) pack into 1-2 steps without inflating bulk
+        // mixed prefills or counting incompatible noncausal requests.
         let has_active_decodes = !batch.is_empty();
-        let mut prefill_budget = if has_active_decodes {
-            budget.min(self.cfg.effective_mixed_prefill_budget())
-        } else {
-            budget
-        };
         let mut pending_prefills = self
             .active
             .iter()
             .filter(|seq| !seq.finished && !seq.is_prefill_complete() && !seq.custom_prefill)
             .count();
+        let mixed_cap = self.cfg.effective_mixed_prefill_budget();
+        let eligible_short_mixed_prefills = if has_active_decodes {
+            self.active
+                .iter()
+                .filter(|seq| {
+                    if seq.finished || seq.is_prefill_complete() || seq.custom_prefill {
+                        return false;
+                    }
+                    let start = seq.prefilled_tokens;
+                    let is_noncausal = seq
+                        .prefix_bidir_len
+                        .is_some_and(|bidir_end| start < bidir_end || seq.max_new_tokens <= 1);
+                    !is_noncausal && (seq.prompt_tokens.len() - start) <= mixed_cap
+                })
+                .count()
+        } else {
+            0
+        };
+        let mut prefill_budget = if has_active_decodes {
+            budget.min(mixed_cap.saturating_mul(eligible_short_mixed_prefills.max(1)))
+        } else {
+            budget
+        };
         let mut batch_noncausal: Option<bool> = (!batch.is_empty()).then_some(false);
         let mut batch_noncausal_lora: Option<i32> = None;
         for seq in &self.active {
@@ -641,13 +662,15 @@ impl SchedulerV1 {
                 pending_prefills -= 1;
                 need
             } else {
-                // Share pure-prefill waves so one bulk request does not enter decode while
-                // another is still starved, forcing the remainder through the mixed-step cap.
-                // Active decodes always retain their existing latency-bounded policy.
-                let share = if !has_active_decodes && pending_prefills > 1 {
+                // Share pure-prefill waves across long bulk requests so one does not finish
+                // early and starve another, without pointlessly splitting short prompts
+                // (<= `mixed_cap`) into two chunks and doubling GDN state traffic.
+                let share = if !has_active_decodes && pending_prefills > 1 && rem > mixed_cap {
                     let aligned = (prefill_budget / pending_prefills / self.cfg.mamba_chunk_size)
                         * self.cfg.mamba_chunk_size;
                     aligned.max(self.cfg.mamba_chunk_size).min(prefill_budget)
+                } else if has_active_decodes {
+                    prefill_budget.min(mixed_cap)
                 } else {
                     prefill_budget
                 };
@@ -1151,6 +1174,87 @@ mod tests {
                 .iter()
                 .all(|s| s.is_prefill_chunk && !s.is_final_prefill_chunk)
         );
+    }
+
+    #[test]
+    fn test_short_prompt_burst_packs_without_splitting_and_scales_mixed_wave() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        for i in 0..16i32 {
+            let base = i * 1000;
+            sched.submit_request((base..base + 165).collect(), 16, vec![]);
+        }
+        let mut slot = 0;
+        sched.admit_waiting(|_| {
+            let slots = (slot, [slot + 1, slot + 2]);
+            slot += 3;
+            Some(slots)
+        });
+        for (i, seq) in sched.active.iter_mut().enumerate() {
+            seq.radix_state.kv_pages = ((i * 16) as i32..((i + 1) * 16) as i32).collect();
+        }
+
+        // Step 1 (pure prefill): 12 complete 165-token prompts (1,980 <= 2,048) finish
+        // whole without splitting all 16 into 128+37 chunks.
+        let step1 = sched.schedule_step();
+        let complete_s1: Vec<_> = step1.iter().filter(|s| s.is_final_prefill_chunk).collect();
+        assert_eq!(complete_s1.len(), 12);
+        assert!(complete_s1.iter().all(|s| s.query_tokens.len() == 165));
+        for slice in &step1 {
+            let tok = if slice.is_final_prefill_chunk {
+                Some(900)
+            } else {
+                None
+            };
+            sched.commit_slice(slice, tok, || {
+                let s = slot;
+                slot += 1;
+                Some(s)
+            });
+        }
+
+        // Step 2 (mixed decode + 4 pending prefills): mixed budget scales with
+        // pending_prefills (4 * 256 = 1,024 >= 660) so all 4 remaining prompts finish
+        // in one mixed step rather than serializing 1-by-1 under a flat 256-token cap.
+        let step2 = sched.schedule_step();
+        let decodes_s2 = step2.iter().filter(|s| !s.is_prefill_chunk).count();
+        let prefills_s2: Vec<_> = step2.iter().filter(|s| s.is_prefill_chunk).collect();
+        assert_eq!(decodes_s2, 12);
+        assert_eq!(prefills_s2.len(), 4);
+        assert!(prefills_s2.iter().all(|s| s.is_final_prefill_chunk));
+
+        // Multiple long/bulk prefills arriving behind active decodes remain bounded
+        // to `mixed_chunk_prefill_size` (256) total tokens so decodes are not stalled.
+        let mut long_sched = SchedulerV1::new(SchedulerConfig::default());
+        long_sched.submit_request((0..64).collect(), 10, vec![]);
+        let mut lslot = 0;
+        long_sched.admit_waiting(|_| {
+            let s = (lslot, [lslot + 1, lslot + 2]);
+            lslot += 3;
+            Some(s)
+        });
+        long_sched.active[0].radix_state.kv_pages = (0..8).collect();
+        let init = long_sched.schedule_step();
+        long_sched.commit_slice(&init[0], Some(901), || {
+            let s = lslot;
+            lslot += 1;
+            Some(s)
+        });
+        long_sched.submit_request((1000..5096).collect(), 10, vec![]);
+        long_sched.submit_request((10000..14096).collect(), 10, vec![]);
+        long_sched.admit_waiting(|_| {
+            let s = (lslot, [lslot + 1, lslot + 2]);
+            lslot += 3;
+            Some(s)
+        });
+        long_sched.active[1].radix_state.kv_pages = (100..400).collect();
+        long_sched.active[2].radix_state.kv_pages = (500..800).collect();
+        let mixed_bulk = long_sched.schedule_step();
+        let mixed_prefill_tokens: usize = mixed_bulk
+            .iter()
+            .filter(|s| s.is_prefill_chunk)
+            .map(|s| s.query_tokens.len())
+            .sum();
+        assert_eq!(mixed_prefill_tokens, DEFAULT_MIXED_CHUNK_PREFILL_TOKENS);
     }
 
     #[test]

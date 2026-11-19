@@ -1,5 +1,20 @@
 # warp34 — Session Orientation & Current State
 
+## 9B Single-Card Head-to-Head (`1× RTX 3090 Ti`) & Short-Prompt Burst Scheduler Fix
+
+- **Dashboard, Metrics, LoRA Visibility, & Startup Banner Accuracy (`d1bd2bf`, `ca17d41`, `1e70b8b`, `a644b6e`):**
+  - Added optional `pools.gdn_checkpoints` (`vram_capacity`/`vram_used`/`host_capacity`/`host_used`) and `config.lora_adapters` to `/api/metrics` + `warp34_pool_units{pool="gdn_ckpt_vram|gdn_ckpt_host"}` and `warp34_lora_adapters_loaded` to `/metrics` (`docs/METRICS.md`), surfaced tiered `WHT128-Q8 checkpoints`, `max_model_len`, numeric `cached` counts, and subtle LoRA badge + Playground `MODEL / LORA` selector in `dashboard/`, and added live `/v1/responses` streaming tool-call accumulation.
+  - Updated `format_serve_boot_banner` (`crates/warp34-host/src/cli/commands.rs`) to display loaded LoRAs, configured `--reasoning-effort`, exact `pool_geometry`-derived KV compression ratios, and accurate tail-anchored `TQ4` (`Q8_0` on `sm_80`/`sm_86`, `FP8` on `sm_89+` across all ranks) and `fp8` (`1.94x, 264B/row`) descriptions.
+- **9B Head-to-Head Campaign (`benchmarks/perf/campaigns/9b-head-to-head.toml`, `9a43edc`, `1× RTX 3090 Ti` `sm_86`):**
+  - Evaluated `warp34 FP16`, `warp34 TQ4`, `vLLM 0.34.0`, and `SGLang v0.5.23` serially across 11 cases (3 reps + warmup, 100% pass; raw artifacts in `benchmarks/perf/results/9b-head-to-head-2026-11-19/`):
+    - **Cold prompt processing (`pp`, tok/s p50):** `warp34 FP16` swept 5/5 (`4.9K`: `5,153` `+2.3%/+7.5%`; `19.4K`: `4,771` `+3.8%/+3.4%`; `38.7K`: `4,274` `+2.5%/+3.6%`; `57.6K`: `3,908` `+2.3%/+2.9%`; `115.1K`: `3,147` `+2.5%/+2.4%`).
+    - **Long-context coding agent:** `warp34 FP16` swept 2/2 (`64K`: `27.02 tok/s` `+4.7%/+4.7%`, warm TTFT `401 ms` vs `566`/`582 ms`; `120K`: `14.22 tok/s` `+8.2%/+6.4%`, warm TTFT `495 ms` vs `640`/`674 ms`).
+    - **Decode & batching:** `warp34 FP16` won `C4` (`460.3` `+6.4%/+4.4%`) and `C8` (`812.2` `+2.1%/+6.4%`), beat vLLM at `C1` (`127.5` `+3.0%/-1.0%`), and initially trailed at `throughput-c16` (`1,229.2` vs vLLM `1,275.8` / SGLang `1,295.1`) due to ~100–250 ms/wave TTFT inflation.
+- **Short-Prompt Burst Scheduler Fix (`crates/warp34-host/src/scheduler.rs`):**
+  - Diagnosed two causes of `throughput-c16` TTFT inflation: (1) pure-prefill equal-share chunking split 16 × 165-token prompts into `128 + 37` chunks (doubling GDN launches and intermediate state traffic), and (2) once any request entered decode, a flat `256`-token mixed cap serialized remaining short prompts 1-by-1 across 10+ forward passes.
+  - Updated `SchedulerV1::schedule_step` to skip pure-prefill splitting for short prompts (`rem <= mixed_cap`) and scale the aggregate mixed-step prefill budget by the count of eligible short causal prefills (`rem <= mixed_cap`, while keeping single-slice and multi-bulk mixed prefills strictly capped at `mixed_cap = 256`), with regression coverage in `test_short_prompt_burst_packs_without_splitting_and_scales_mixed_wave`.
+  - Verified on `1× RTX 3090 Ti`: `throughput-c16` jumped from `1,229.2` to `1,255.7–1,274.1 tok/s` and `ttft_p50` dropped from `558 ms` to `413.6 ms` (faster than both `vLLM` `456.7 ms` and `SGLang` `489.8 ms`), with `mise run check-quick`, `15/15` `scheduler::tests`, and `review` clean.
+
 ## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`) & Pre-Release Verification Pass
 
 - **Pinned Baselines & Local Oracle Environment (`BASELINE.txt`, `AGENTS.md`, `NOTICE`, `README.md`, `tools/oracle/{vllm_dump,vllm_greedy,vllm_vl_dump,hgptq_oracle,profile_diff}.py`):**
