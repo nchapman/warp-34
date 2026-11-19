@@ -1035,12 +1035,12 @@ impl Qwen3_5ModelRank {
             )
         };
 
-        let find_for_policy = |policy: KvFormatPolicy| -> Option<(usize, usize, bool)> {
-            if let Some(explicit_pages) = requested_kv_pages {
-                return eval_candidate(policy, explicit_pages, false)
-                    .map(|(slots, host_embed)| (explicit_pages, slots, host_embed));
-            }
-            for auto_mode in [true, false] {
+        let find_for_policy_mode =
+            |policy: KvFormatPolicy, auto_mode: bool| -> Option<(usize, usize, bool)> {
+                if let Some(explicit_pages) = requested_kv_pages {
+                    return eval_candidate(policy, explicit_pages, auto_mode)
+                        .map(|(slots, host_embed)| (explicit_pages, slots, host_embed));
+                }
                 let mut pages = max_target_pages;
                 loop {
                     if let Some((slots, host_embed)) = eval_candidate(policy, pages, auto_mode) {
@@ -1051,9 +1051,8 @@ impl Qwen3_5ModelRank {
                     }
                     pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
                 }
-            }
-            None
-        };
+                None
+            };
 
         let mut selected_policy = requested_policy;
         let mut policy_adjusted = false;
@@ -1065,18 +1064,36 @@ impl Qwen3_5ModelRank {
             policy_adjusted = true;
         }
 
-        let mut selected_fit = find_for_policy(selected_policy);
         let goal_pages = requested_kv_pages.unwrap_or(max_target_pages);
-        if allow_kv_format_stepdown
+        let can_stepdown_tq4_all = allow_kv_format_stepdown
             && selected_policy == KvFormatPolicy::Tq4
-            && cfg.head_dim == 256
+            && cfg.head_dim == 256;
+
+        // Try `auto_mode = true` (preserving full vision + multi-slot headroom) across
+        // `[selected_policy, Tq4All]` before falling back to `auto_mode = false` so explicit
+        // `--max-model-len` / `--kv-pages` and tight cards still step down `tq4 -> tq4_all`
+        // rather than silently dropping `vision_headroom` to 0.
+        let mut selected_fit = find_for_policy_mode(selected_policy, true);
+        if can_stepdown_tq4_all
             && selected_fit.map_or(0, |f| f.0) < goal_pages
-            && let Some(tq4_all_fit) = find_for_policy(KvFormatPolicy::Tq4All)
+            && let Some(tq4_all_fit) = find_for_policy_mode(KvFormatPolicy::Tq4All, true)
             && selected_fit.is_none_or(|cur| tq4_all_fit.0 > cur.0)
         {
             selected_policy = KvFormatPolicy::Tq4All;
             selected_fit = Some(tq4_all_fit);
             policy_adjusted = true;
+        }
+        if selected_fit.is_none() {
+            selected_fit = find_for_policy_mode(selected_policy, false);
+            if can_stepdown_tq4_all
+                && selected_fit.map_or(0, |f| f.0) < goal_pages
+                && let Some(tq4_all_fit) = find_for_policy_mode(KvFormatPolicy::Tq4All, false)
+                && selected_fit.is_none_or(|cur| tq4_all_fit.0 > cur.0)
+            {
+                selected_policy = KvFormatPolicy::Tq4All;
+                selected_fit = Some(tq4_all_fit);
+                policy_adjusted = true;
+            }
         }
 
         let (fitted_pages, estimated_state_slots, host_embed_offload) = selected_fit
@@ -1266,7 +1283,9 @@ impl Qwen3_5ModelRank {
         );
         let desired_gpu_steady_bytes = capacity.state_slots.map(|req_slots| {
             let desired_slots = req_slots.max(min_state_floor);
-            let vision = if rank == 0 && archive_has_vision {
+            // Apply vision reserve symmetrically across TP ranks so all ranks make the same
+            // host-embed offload decision and never leak unused slots on non-zero ranks.
+            let vision = if archive_has_vision {
                 VISION_ENCODER_LAZY_RESERVE_BYTES
                     .saturating_sub(target_base_headroom(cfg, tp_size, pages, free_vram))
             } else {
@@ -1277,19 +1296,22 @@ impl Qwen3_5ModelRank {
                 .saturating_add(state_bytes.saturating_mul(desired_slots))
                 .saturating_add(vision)
         });
+        let boot_persistent_bytes = BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes);
         let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
             cfg,
             raw_est_weight_bytes,
             scratch_bytes,
             staging_bytes,
             free_vram,
-            BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes),
+            boot_persistent_bytes,
             Some(steady_bytes),
             desired_gpu_steady_bytes,
         );
+        // `PinnedUploadRing::new` allocates two device repack staging buffers concurrently.
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
-            .saturating_add(staging_bytes)
+            .saturating_add(staging_bytes.saturating_mul(2))
+            .saturating_add(boot_persistent_bytes)
             .saturating_add(MIN_BOOT_MARGIN_BYTES);
         if min_boot_bytes > free_vram {
             let gib = 1024.0 * 1024.0 * 1024.0;
@@ -1951,7 +1973,8 @@ impl PrePoolModelRank {
                     }
                 } else {
                     20
-                };
+                }
+                .max(capacity.dflash_min_state_slots);
                 requested_state_slots.min(max_tiered_serving_slots)
             } else {
                 requested_state_slots
@@ -1962,18 +1985,22 @@ impl PrePoolModelRank {
                 // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
                 // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
                 // multimodal request (`ensure_vision_encoder_loaded`) and requires up to
-                // `VISION_ENCODER_LAZY_RESERVE_BYTES` (1.5 GiB) total free VRAM on rank 0
-                // (weights + ViT activations). Always reserve the delta above `base_headroom`
-                // ahead of optional extra GDN state slots, protecting only the minimum active
-                // state floor (`min_state_floor`).
+                // `VISION_ENCODER_LAZY_RESERVE_BYTES` (1.5 GiB) total free VRAM (weights +
+                // ViT activations). Always reserve the delta above `base_headroom` ahead of
+                // optional extra GDN state slots symmetrically across TP ranks (preventing
+                // non-zero ranks from allocating extra state/checkpoint buffers that
+                // `truncate_slots` cannot free), protecting only `min_state_floor`.
                 let base_reserved = required_headroom.saturating_add(req_kv_bytes);
                 let min_state_floor = if capacity.dflash_reserve_bytes != 0 {
                     capacity.dflash_min_state_slots
+                } else if capacity.native_mtp {
+                    8.min(effective_requested_state_slots)
+                        .max(MIN_ACTIVE_STATE_SLOTS)
                 } else {
                     MIN_ACTIVE_STATE_SLOTS
                 };
                 let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
-                let vision_reserve = if rank == 0 && has_vision_weights(&cfg, archive) {
+                let vision_reserve = if has_vision_weights(&cfg, archive) {
                     let desired_vision_extra =
                         VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom);
                     available_for_pools
@@ -2055,6 +2082,7 @@ impl PrePoolModelRank {
         let fixed_without_kv = plan_weight_bytes
             .saturating_add(scratch_arena.capacity())
             .saturating_add(state_pool_bytes);
+        let pool_headroom = required_headroom.saturating_add(vision_reserve);
         let planned_kv_pages = plan_target_kv_pages(
             requested_kv_pages,
             capacity.state_slots.is_some(),
@@ -2062,7 +2090,7 @@ impl PrePoolModelRank {
             capacity.native_mtp,
             plan_free_vram,
             fixed_without_kv,
-            required_headroom,
+            pool_headroom,
             bytes_per_kv_page_all_layers,
         );
         let capacity_plan = CapacityPlanner::plan_with_headroom(
@@ -2073,7 +2101,7 @@ impl PrePoolModelRank {
             state_pool_bytes,
             bytes_per_kv_page_all_layers,
             Some(planned_kv_pages),
-            required_headroom,
+            pool_headroom,
         )
         .map_err(|e| loader_err_ctx("CapacityPlanner failed", e))?;
 
@@ -2096,7 +2124,7 @@ impl PrePoolModelRank {
             &state_pool,
             !gdn_layer_ids.is_empty(),
             tp_size,
-            required_headroom.saturating_add(vision_reserve),
+            pool_headroom,
             capacity,
         )?;
 

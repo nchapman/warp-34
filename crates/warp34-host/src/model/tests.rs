@@ -708,12 +708,13 @@ mod serving_capacity_tests {
             })
             .collect();
 
-        let raw_est = 17_024 * mib;
+        // Real Qwen3.8-27B-W4A16-HGPTQ on-disk weight arena estimate (13.31 GiB body + 2.37 GiB embed)
+        let raw_est = 16_056 * mib;
         let staging = 256 * mib;
         let marlin_ws = 8 * mib;
         let free_24g = 24_148 * mib;
         let dflash_reserve = 2_150 * mib;
-        let dflash_min_slots = super::super::SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS;
+        let dflash_min_slots = 11usize; // real M=8 DFlash2 minimum (block_size + 3)
 
         // 1. On 1x 24 GiB with 27B + DFlash2 + vision, 256K (16,384 pages) does not fit in
         //    Tq4 with required GDN state slots + 1.5 GiB lazy ViT headroom, but fits in
@@ -811,6 +812,121 @@ mod serving_capacity_tests {
         )
         .expect("27B Plain must fit 256K in Tq4 on 24 GiB");
         assert!(slots_plain >= 4);
+    }
+
+    #[test]
+    fn serving_auto_planner_sme_invariants() {
+        use super::super::rank_capacity::{
+            HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES, MIN_BOOT_MARGIN_BYTES,
+            evaluate_serving_kv_candidate_budget, plan_host_embed_with_serving_budget,
+            target_pool_geometry,
+        };
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+
+        // C1: LoRA scratch sizing stays aligned with `attach_lora_adapters` even at >= 128K on 64L TP=1.
+        let mut dense_64l = sample_qwen4_exp_config();
+        dense_64l.num_experts = 0;
+        dense_64l.num_hidden_layers = 64;
+        dense_64l.indexer_n_heads = 0;
+        dense_64l.ple_layer_ids.clear();
+        let midloop_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 64 * mib,
+            has_midloop: true,
+            requires_atomic_prefix: false,
+        };
+        let std_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 64 * mib,
+            has_midloop: false,
+            requires_atomic_prefix: false,
+        };
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(&dense_64l, 1, 14 * gib, Some(16_384), midloop_lora),
+            960 * mib
+        );
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(&dense_64l, 1, 14 * gib, Some(16_384), std_lora),
+            crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+        );
+
+        // C2: Tiered MoE + DFlash2 (M=16 -> 19 min state slots) succeeds on TP=2 without
+        // capping `effective_requested_state_slots` below `dflash_min_state_slots` or
+        // double-charging `dflash_reserve_bytes`.
+        let tiered_cfg = sample_qwen4_exp_config();
+        let (slots_tiered_tp2, _) = evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            2,
+            KvFormatPolicy::Tq4,
+            false,
+            1024,
+            12 * gib,
+            256 * mib,
+            8 * mib,
+            40 * gib,
+            64,
+            false,
+            false,
+            false,
+            2_400 * mib,
+            19,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=2 tiered MoE + DFlash2 M=16 (19 slots) must fit on 40 GiB");
+        assert!(slots_tiered_tp2 >= 19);
+
+        // C3: `plan_host_embed_with_serving_budget` accounts for double-buffered `PinnedUploadRing`
+        // (2 * staging_bytes) in boot_need.
+        let mut untied = dense_64l.clone();
+        untied.tie_word_embeddings = false;
+        untied.vocab_size = 248_320;
+        untied.hidden_size = 5120;
+        let staging = 512 * mib;
+        let scratch = 512 * mib;
+        let est_weights = 16 * gib;
+        // Free VRAM fits 1x staging + slack, but NOT 2x staging + slack -> must offload embed.
+        let free_just_under_2x_staging = est_weights
+            + scratch
+            + staging
+            + MIN_BOOT_MARGIN_BYTES
+            + HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES
+            + 64 * mib;
+        let (_, use_host_embed) = plan_host_embed_with_serving_budget(
+            &untied,
+            est_weights,
+            scratch,
+            staging,
+            free_just_under_2x_staging,
+            0,
+            None,
+            None,
+        );
+        assert!(
+            use_host_embed,
+            "boot_need must account for 2 * staging_bytes in PinnedUploadRing"
+        );
+
+        // I4: QSA indexer KV geometry includes +8 padding on raw tokens (matching `KvPool::init_qsa_indexer_caches`).
+        let mut qsa_only = sample_qwen4_exp_config();
+        qsa_only.layer_types = vec![LayerKind::FullAttention];
+        qsa_only.num_hidden_layers = 1;
+        qsa_only.num_key_value_heads = 1;
+        qsa_only.head_dim = 256;
+        qsa_only.indexer_n_heads = 1;
+        qsa_only.indexer_kv_heads = 1;
+        qsa_only.indexer_head_dim = 128;
+        qsa_only.indexer_compress_ratio = 4;
+        let (page_with_qsa, _) = target_pool_geometry(&qsa_only, 1, KvFormatPolicy::Fp16);
+        let mut no_qsa = qsa_only.clone();
+        no_qsa.indexer_n_heads = 0;
+        let (page_without_qsa, _) = target_pool_geometry(&no_qsa, 1, KvFormatPolicy::Fp16);
+        let expected_qsa_bytes = (16 * (128 + 8) + 4 * 128) * 2;
+        assert_eq!(page_with_qsa - page_without_qsa, expected_qsa_bytes);
+
+        // `clamp_state_slots` must never panic when `requested < MIN_ACTIVE_STATE_SLOTS`.
+        assert_eq!(clamp_state_slots(1, 10 * gib, gib, 128 * mib), 1);
+        assert_eq!(clamp_state_slots(2, 10 * gib, gib, 128 * mib), 2);
+        assert_eq!(clamp_state_slots(0, 10 * gib, gib, 128 * mib), 0);
     }
 
     #[test]
@@ -1107,8 +1223,8 @@ mod serving_capacity_tests {
             .count();
         let qsa = full
             * cfg.indexer_kv_heads
-            * (16 + 16 / cfg.indexer_compress_ratio)
-            * cfg.indexer_head_dim
+            * (16 * (cfg.indexer_head_dim + 8)
+                + (16 / cfg.indexer_compress_ratio) * cfg.indexer_head_dim)
             * 2;
         let ple = cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 18;
         assert_eq!(tp_page, (page - qsa) / 2 + qsa);

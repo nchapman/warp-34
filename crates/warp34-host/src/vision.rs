@@ -1194,7 +1194,17 @@ impl VisionWorkspace {
     ) -> Result<&DeviceBuffer> {
         let need = min_bytes.max(4);
         if slot.as_ref().is_none_or(|b| b.len_bytes < need) {
-            *slot = Some(DeviceBuffer::alloc(device_id, need)?);
+            // Try allocating first; if VRAM is tight, drop the smaller buffer and retry once
+            // to avoid a transient `old + new` VRAM spike when a larger image follows a smaller one.
+            let buf = match DeviceBuffer::alloc(device_id, need) {
+                Ok(buf) => buf,
+                Err(_) if slot.is_some() => {
+                    *slot = None;
+                    DeviceBuffer::alloc(device_id, need)?
+                }
+                Err(err) => return Err(err),
+            };
+            *slot = Some(buf);
         }
         Ok(slot.as_ref().unwrap())
     }

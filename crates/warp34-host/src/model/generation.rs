@@ -349,7 +349,9 @@ impl Qwen3_5Engine {
             let archive = SafetensorsArchive::open(&self.model_dir)
                 .map_err(|_| loader_err("SafetensorsArchive::open for vision_encoder"))?;
             self.ranks[0].device.make_current()?;
-            if self.ranks[0].device.mem_info()?.0 < 512 * 1024 * 1024 {
+            if self.ranks[0].device.mem_info()?.0
+                < super::rank_capacity::VISION_ENCODER_LAZY_RESERVE_BYTES
+            {
                 self.vision_embed_cache.clear();
                 for rank in &mut self.ranks {
                     rank.device.make_current()?;

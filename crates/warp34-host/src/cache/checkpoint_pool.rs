@@ -403,6 +403,9 @@ impl GdnCheckpointPool {
         if new_vram < self.vram_slots || new_host < self.host_slots {
             self.vram_slots = new_vram;
             self.host_slots = new_host;
+            if new_vram == 0 {
+                self.vram_buf = None;
+            }
             self.total_slots = new_vram.saturating_add(new_host);
             self.host_storage.truncate(new_host);
             self.locations.truncate(self.total_slots);

@@ -321,19 +321,18 @@ pub fn plan_scratch_arena_bytes_with_lora(
     requested_kv_pages: Option<usize>,
     lora: LoraCapacityReserve,
 ) -> usize {
-    if tp_size == 1
+    // Keep LoRA scratch sizing aligned with `attach_lora_adapters`, which requires
+    // 960 MiB (midloop) or 1,056 MiB (non-midloop) regardless of KV page count.
+    if lora.has_midloop {
+        MIDLOOP_LORA_SCRATCH_ARENA_BYTES
+    } else if lora.requires_atomic_prefix || lora.device_bytes_per_rank > 0 {
+        crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+    } else if tp_size == 1
         && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
         && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
     {
         crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
-    } else if lora.has_midloop
-        && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
-    {
-        MIDLOOP_LORA_SCRATCH_ARENA_BYTES
-    } else if (cfg.uses_tiered_moe()
-        || cfg.requires_atomic_prefix_prefill()
-        || lora.requires_atomic_prefix
-        || lora.device_bytes_per_rank > 0)
+    } else if (cfg.uses_tiered_moe() || cfg.requires_atomic_prefix_prefill())
         && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
     {
         crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
@@ -589,10 +588,11 @@ pub(super) fn plan_host_embed_with_serving_budget(
     if cfg.uses_tiered_moe() {
         return (est_weight_bytes, true);
     }
+    // `PinnedUploadRing::new` allocates two device repack staging slots concurrently.
     let boot_need = |weights: usize| {
         weights as u128
             + scratch_bytes as u128
-            + staging_bytes as u128
+            + staging_bytes.saturating_mul(2) as u128
             + boot_persistent_bytes as u128
             + MIN_BOOT_MARGIN_BYTES as u128
     };
@@ -669,10 +669,13 @@ pub(super) fn target_pool_geometry_with_fp8(
                 .saturating_mul(rows),
         );
         if cfg.uses_qsa() {
+            let compressed = block / cfg.indexer_compress_ratio.max(1);
+            let qsa_elems = block
+                .saturating_mul(cfg.indexer_head_dim.saturating_add(8))
+                .saturating_add(compressed.saturating_mul(cfg.indexer_head_dim));
             page = page.saturating_add(
                 cfg.indexer_kv_heads
-                    .saturating_mul(block + block / cfg.indexer_compress_ratio.max(1))
-                    .saturating_mul(cfg.indexer_head_dim)
+                    .saturating_mul(qsa_elems)
                     .saturating_mul(2),
             );
         }
@@ -738,7 +741,7 @@ pub(super) fn clamp_state_slots(
     if per_slot == 0 {
         requested
     } else if free > fixed {
-        ((free - fixed) / per_slot).clamp(MIN_ACTIVE_STATE_SLOTS, requested)
+        ((free - fixed) / per_slot).clamp(MIN_ACTIVE_STATE_SLOTS.min(requested), requested)
     } else {
         MIN_ACTIVE_STATE_SLOTS.min(requested)
     }
@@ -767,6 +770,54 @@ pub(super) fn resident_moe_mtp_serving_reserve(
 /// `load_rank_pre_pool` and `finalize_runtime_and_pools` admission on a rank with `free_vram`.
 ///
 /// Returns `Some((estimated_state_slots, use_host_embed))` when the candidate fits.
+/// Computes the actual VRAM allocated by `RankTieredMoe` (resident hot experts +
+/// double-buffered H2D staging slots) for a given `hot_per_layer`.
+#[cfg(any(test, feature = "cuda"))]
+fn tiered_moe_resident_and_staging_bytes(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    hot_per_layer: usize,
+) -> usize {
+    let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
+    let actual_per_hot_step: usize = (0..cfg.num_hidden_layers)
+        .filter(|l| !cfg.mlp_only_layers.contains(l))
+        .map(|l| {
+            cfg.layer_moe_expert_pack_layout(l)
+                .map_or(exp_bytes, |lay| lay.stride)
+        })
+        .sum();
+    let stage_cap = select_tiered_moe_stage_capacity(cfg, tp_size, hot_per_layer);
+    hot_per_layer
+        .saturating_mul(actual_per_hot_step)
+        .saturating_add(stage_cap.saturating_mul(2).saturating_mul(exp_bytes))
+}
+
+#[cfg(any(test, feature = "cuda"))]
+fn serving_live_overhead_bytes(cfg: &ModelConfig, tp_size: usize, marlin_ws_bytes: usize) -> usize {
+    let ple_bytes = if cfg.uses_ple() {
+        let max_ple_tokens = if cfg.uses_tiered_moe() {
+            crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
+        } else {
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        };
+        let ple_row_bytes = cfg
+            .ple_embed_dim
+            .max(cfg.hidden_size)
+            .max(MIN_PLE_ROW_STAGING_BYTES);
+        max_ple_tokens.saturating_mul(ple_row_bytes)
+    } else {
+        0
+    };
+    // `Tp2Collectives::new_for_tp` allocates 3 x 40 MiB P2P staging buffers per rank when
+    // TP > 1 on P2P-capable links, right after `fit_serving_plan` measures `min_free_vram`.
+    let tp_comm_bytes = if tp_size > 1 { 3 * 40 * 1024 * 1024 } else { 0 };
+    BATCH_META_ARENA_BYTES
+        .saturating_add(marlin_ws_bytes.saturating_mul(2))
+        .saturating_add(ple_bytes)
+        .saturating_add(tp_comm_bytes)
+        .saturating_add(AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES)
+}
+
 #[cfg(any(test, feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_serving_kv_candidate_budget(
@@ -851,38 +902,21 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     );
     let min_boot_bytes = est_weight_bytes
         .saturating_add(scratch_bytes)
-        .saturating_add(staging_bytes)
+        .saturating_add(staging_bytes.saturating_mul(2))
+        .saturating_add(runtime_arena_bytes)
         .saturating_add(MIN_BOOT_MARGIN_BYTES);
     if min_boot_bytes > free_vram {
         return None;
     }
     if (est_weight_bytes as u128)
         .saturating_add(scratch_bytes as u128)
-        .saturating_add(runtime_arena_bytes as u128)
         .saturating_add(steady_bytes as u128)
         > free_vram as u128
     {
         return None;
     }
 
-    let ple_bytes = if cfg.uses_ple() {
-        let max_ple_tokens = if cfg.uses_tiered_moe() {
-            crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
-        } else {
-            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
-        };
-        let ple_row_bytes = cfg
-            .ple_embed_dim
-            .max(cfg.hidden_size)
-            .max(MIN_PLE_ROW_STAGING_BYTES);
-        max_ple_tokens.saturating_mul(ple_row_bytes)
-    } else {
-        0
-    };
-    let live_overhead = BATCH_META_ARENA_BYTES
-        .saturating_add(marlin_ws_bytes.saturating_mul(2))
-        .saturating_add(ple_bytes)
-        .saturating_add(AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES);
+    let live_overhead = serving_live_overhead_bytes(cfg, tp_size, marlin_ws_bytes);
     let post_weight_available = free_vram.checked_sub(
         est_weight_bytes
             .saturating_add(scratch_bytes)
@@ -899,12 +933,12 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
                 18
             }
         } else {
-            PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+            PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS.max(dflash_min_state_slots)
         };
         requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
     };
     let (allocated_moe_bytes, post_pool_spec_or_moe_reserve) = if cfg.uses_tiered_moe() {
-        let (_, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
+        let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
             cfg,
             tp_size,
             post_weight_available,
@@ -914,8 +948,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
             state_bytes.saturating_mul(min_state_slots_for_moe),
             dflash_reserve_bytes,
         );
-        let allocated_moe =
-            total_moe_reserve.saturating_sub(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES);
+        let allocated_moe = tiered_moe_resident_and_staging_bytes(cfg, tp_size, hot_per_layer);
         let post_pool_reserve = if dflash_reserve_bytes > 0 {
             dflash_reserve_bytes
         } else {
@@ -942,7 +975,8 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
             if native_mtp && pages < 2048 { 16 } else { 18 }
         } else {
             20
-        };
+        }
+        .max(dflash_min_state_slots);
         requested_state_slots.min(max_tiered_serving_slots)
     } else {
         requested_state_slots
