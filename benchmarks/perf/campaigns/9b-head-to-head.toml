@@ -1,0 +1,164 @@
+# Single-card 9B head-to-head campaign on 1x RTX 3090 Ti (24 GiB, sm_86):
+# Qwen3.5-9B comparing warp34 (FP16 & TQ4 KV) vs vLLM 0.34.0 vs SGLang v0.5.23
+# across:
+#   1. Prompt-processing (pp) scaling curve: cold unique 4K / 16K / 32K / 60K / 115K
+#   2. Steady-state decode & continuous-batching throughput: C1 / C4 / C8 / C16 (256 output tok)
+#   3. Long-context coding-agent replay: 64K / 120K warm prefix reuse
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 1
+max_inflight = 16
+timeout_s = 360
+
+[engine_defaults]
+support = "supported"
+cohort = "9b-head-to-head-sm86"
+gpu_count = 1
+parallelism = "TP=1"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b"
+model_revision = "7b2e48b7e7e8ee38925f5337c66feed22d3b031b"
+weight_format = "HGPTQ-W4A16"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+speculation = "none"
+
+[[engines]]
+id = "warp34-9b-tp1-fp16"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "fp16"
+cache_config = "FP16 KV 12288 pages (196608 tokens), FP32 SSM, max_num_seqs 16, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b --tp 1 --kv-format fp16 --kv-pages 12288 --max-num-seqs 16 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-9b-tp1-tq4"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "tq4"
+cache_config = "TQ4 (2.53x on 8 full-attn layers, rotated TQ4 + Q8_0 tail) 16384 pages (262144 tokens), FP32 SSM, max_num_seqs 16, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 16 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "vllm-9b-tp1-fp16"
+engine = "vllm"
+version = "0.34.0"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede8c5d1716d824cd843e2889c648083"
+weight_format = "AWQ-int4-g128"
+kv_format = "fp16"
+cache_config = "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90, max_num_seqs 16), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede8c5d1716d824cd843e2889c648083 --served-model-name qwen35-9b-awq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 16 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "sglang-9b-tp1-fp16"
+engine = "sglang"
+version = "0.5.23"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede8c5d1716d824cd843e2889c648083"
+weight_format = "AWQ-int4-g128"
+kv_format = "fp16"
+cache_config = "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3"
+launch_command = "docker run --rm --name warp34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.23 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede8c5d1716d824cd843e2889c648083 --served-model-name qwen35-9b-awq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 16 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
+
+# --- A. Prompt processing (pp) scaling curve (unique cold prompts, short output) ---
+
+[[cases]]
+id = "pp-4k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 52
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-16k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 210
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-32k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 420
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-60k-c1"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+context_repetitions = 1
+cache = "unique"
+requests = 1
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-115k-c1"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+context_repetitions = 2
+cache = "unique"
+requests = 1
+concurrency = 1
+max_tokens = 16
+
+# --- B. Steady-state decode & continuous-batching scaling ---
+
+[[cases]]
+id = "decode-c1"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c4"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 8
+concurrency = 4
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c8"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 16
+concurrency = 8
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c16"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 32
+concurrency = 16
+max_tokens = 256
+
+# --- C. Long-context coding-agent replay (warm prefix reuse) ---
+
+[[cases]]
+id = "swe-agent-64k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_64k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "swe-agent-120k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_120k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
