@@ -585,6 +585,7 @@ mod tests {
             .send(GenerationEvent::Finished {
                 generated_tokens: 0,
                 cached_tokens: 32,
+                thinking_budget_exhausted: false,
             })
             .await
             .unwrap();

@@ -68,6 +68,7 @@ pub struct VisionConfig {
 /// `processor_config.json["image_processor"]`, with Qwen3-VL defaults as fallback.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionPreprocessorConfig {
+    pub source_name: &'static str,
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
     pub rescale_factor: f32,
@@ -81,6 +82,7 @@ pub struct VisionPreprocessorConfig {
 impl Default for VisionPreprocessorConfig {
     fn default() -> Self {
         Self {
+            source_name: "default",
             image_mean: [0.5, 0.5, 0.5],
             image_std: [0.5, 0.5, 0.5],
             rescale_factor: 1.0 / 255.0,
@@ -121,10 +123,17 @@ impl VisionPreprocessorConfig {
                 }
             }
         };
-        let doc = read_json("preprocessor_config.json").or_else(|| {
-            read_json("processor_config.json").and_then(|r| r.get("image_processor").cloned())
-        });
+        let (source_name, doc) = match read_json("preprocessor_config.json") {
+            Some(v) => ("preprocessor_config.json", Some(v)),
+            None => match read_json("processor_config.json")
+                .and_then(|r| r.get("image_processor").cloned())
+            {
+                Some(v) => ("processor_config.json", Some(v)),
+                None => ("default", None),
+            },
+        };
         if let Some(obj) = doc.as_ref().and_then(serde_json::Value::as_object) {
+            cfg.source_name = source_name;
             cfg.apply_json_object(obj);
         }
         cfg

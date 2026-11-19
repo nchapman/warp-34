@@ -90,6 +90,7 @@ async fn terminal_finished_survives_full_queue_and_is_delivered_once() {
     request.set_terminal(GenerationEvent::Finished {
         cached_tokens: 3,
         generated_tokens: 2,
+        thinking_budget_exhausted: false,
     });
     // A later cleanup must not overwrite the already committed terminal result.
     notify_request_error(request, WorkerError::worker_stopped("late stop"));
@@ -102,6 +103,7 @@ async fn terminal_finished_survives_full_queue_and_is_delivered_once() {
         Some(GenerationEvent::Finished {
             cached_tokens: 3,
             generated_tokens: 2,
+            ..
         })
     ));
     assert!(stream.events.recv().await.is_none());

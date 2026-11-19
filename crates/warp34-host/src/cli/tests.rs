@@ -1147,12 +1147,25 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
             ..Default::default()
         },
         sampling_from_generation_config: true,
+        chat_template_source: "chat_template.jinja".to_string(),
+        preserve_thinking: true,
+        reasoning_effort_budget: true,
+        default_reasoning_budget: None,
+        default_reasoning_budget_message: None,
+        vision_banner: Some(
+            "preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)".to_string(),
+        ),
     });
     assert!(banner.contains("|__/|__/\\__,_/_/  / .___/____/  /_/"));
     assert!(banner.contains("qwen3.8-27b-warp34 (nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64)"));
     assert!(
         banner.contains("Sampling     : temp=1, top_p=0.95, top_k=20 [generation_config.json]")
     );
+    assert!(banner.contains("Template     : chat_template.jinja (preserve_thinking=true)"));
+    assert!(banner.contains("Thinking     : effort-budget=on (ceil=32768), budget=auto, cutoff="));
+    assert!(banner.contains(
+        "Vision       : preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)"
+    ));
     assert!(banner.contains("tq4_all (3.88x, 132B/row TQ4 all attention layers) [auto: stepped down from tq4 to fit full context]"));
     assert!(banner.contains("262144 tokens (16384 pages"));
     assert!(banner.contains("[auto-fit: 100% of 262144 model max]"));

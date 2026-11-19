@@ -30,7 +30,7 @@ enum ThinkingBudgetPhase {
     Idle,
     Counting { remaining: usize },
     Forcing { pos: usize },
-    Done,
+    Done { exhausted: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +63,7 @@ impl ThinkingBudgetTracker {
             _ => false,
         };
         let phase = if cfg.forced_token_ids.is_empty() {
-            ThinkingBudgetPhase::Done
+            ThinkingBudgetPhase::Done { exhausted: false }
         } else if in_think {
             if cfg.budget == 0 {
                 ThinkingBudgetPhase::Forcing { pos: 0 }
@@ -96,7 +96,7 @@ impl ThinkingBudgetTracker {
     ) {
         self.history.push(self.phase);
         if cfg.forced_token_ids.is_empty() {
-            self.phase = ThinkingBudgetPhase::Done;
+            self.phase = ThinkingBudgetPhase::Done { exhausted: false };
             return;
         }
         let ends_with_start =
@@ -108,10 +108,10 @@ impl ThinkingBudgetTracker {
                 .iter()
                 .any(|seq| !seq.is_empty() && output_history.ends_with(seq));
         self.phase = match self.phase {
-            ThinkingBudgetPhase::Done => ThinkingBudgetPhase::Done,
+            ThinkingBudgetPhase::Done { exhausted } => ThinkingBudgetPhase::Done { exhausted },
             ThinkingBudgetPhase::Idle => {
                 if exited_reasoning_gate {
-                    ThinkingBudgetPhase::Done
+                    ThinkingBudgetPhase::Done { exhausted: false }
                 } else if ends_with_start {
                     if cfg.budget == 0 {
                         ThinkingBudgetPhase::Forcing { pos: 0 }
@@ -126,7 +126,7 @@ impl ThinkingBudgetTracker {
             }
             ThinkingBudgetPhase::Counting { remaining } => {
                 if exited_reasoning_gate || ends_with_end {
-                    ThinkingBudgetPhase::Done
+                    ThinkingBudgetPhase::Done { exhausted: false }
                 } else if remaining <= 1 {
                     ThinkingBudgetPhase::Forcing { pos: 0 }
                 } else {
@@ -137,7 +137,7 @@ impl ThinkingBudgetTracker {
             }
             ThinkingBudgetPhase::Forcing { pos } => {
                 if exited_reasoning_gate || pos + 1 >= cfg.forced_token_ids.len() {
-                    ThinkingBudgetPhase::Done
+                    ThinkingBudgetPhase::Done { exhausted: true }
                 } else {
                     ThinkingBudgetPhase::Forcing { pos: pos + 1 }
                 }
@@ -399,6 +399,16 @@ impl SamplerV1 {
             constraint,
             thinking_tracker,
         }
+    }
+
+    #[inline]
+    pub fn thinking_budget_exhausted(&self) -> bool {
+        self.thinking_tracker.as_ref().is_some_and(|t| {
+            matches!(
+                t.phase,
+                ThinkingBudgetPhase::Forcing { .. } | ThinkingBudgetPhase::Done { exhausted: true }
+            )
+        })
     }
 
     #[inline]

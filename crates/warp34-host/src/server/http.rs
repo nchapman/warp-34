@@ -585,6 +585,7 @@ struct Prepared {
     messages_count: Option<usize>,
     tools_count: Option<usize>,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 impl Prepared {
     fn turn_log(&self, id: String, api: &'static str, context: usize) -> TurnLog {
@@ -602,6 +603,8 @@ impl Prepared {
             self.messages_count,
             self.tools_count,
             self.enable_thinking,
+            self.reasoning_effort.clone(),
+            self.params.thinking_budget.as_ref().map(|b| b.budget),
             &self.params,
         )
     }
@@ -921,6 +924,7 @@ fn prepare(
         messages_count,
         tools_count,
         enable_thinking,
+        reasoning_effort: resolved_effort,
     })
 }
 async fn generate(
@@ -1255,7 +1259,10 @@ fn output_stream(
                     }
                     if matched { stopped = true; done = true; break; }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => { cached = cached_tokens; done = true; break; }
+                GenerationEvent::Finished { cached_tokens, thinking_budget_exhausted, .. } => {
+                    if thinking_budget_exhausted { log.mark_thinking_budget_exhausted(); }
+                    cached = cached_tokens; done = true; break;
+                }
                 GenerationEvent::Error(err) => { log.finish("error", false); yield Output::Error(err); return; }
             }
         }
@@ -1718,7 +1725,14 @@ async fn responses_create(
                             break;
                         }
                     }
-                    GenerationEvent::Finished { cached_tokens, .. } => {
+                    GenerationEvent::Finished {
+                        cached_tokens,
+                        thinking_budget_exhausted,
+                        ..
+                    } => {
+                        if thinking_budget_exhausted {
+                            log.mark_thinking_budget_exhausted();
+                        }
                         cached = cached_tokens;
                         done = true;
                         break;
@@ -1828,7 +1842,14 @@ async fn responses_create(
                         break;
                     }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => {
+                GenerationEvent::Finished {
+                    cached_tokens,
+                    thinking_budget_exhausted,
+                    ..
+                } => {
+                    if thinking_budget_exhausted {
+                        log.mark_thinking_budget_exhausted();
+                    }
                     cached = cached_tokens;
                     done = true;
                     break;
@@ -2003,7 +2024,14 @@ async fn anthropic_messages(
                             break;
                         }
                     }
-                    GenerationEvent::Finished { cached_tokens, .. } => {
+                    GenerationEvent::Finished {
+                        cached_tokens,
+                        thinking_budget_exhausted,
+                        ..
+                    } => {
+                        if thinking_budget_exhausted {
+                            log.mark_thinking_budget_exhausted();
+                        }
                         cached = cached.max(cached_tokens);
                         done = true;
                         break;
@@ -2123,7 +2151,14 @@ async fn anthropic_messages(
                         break;
                     }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => {
+                GenerationEvent::Finished {
+                    cached_tokens,
+                    thinking_budget_exhausted,
+                    ..
+                } => {
+                    if thinking_budget_exhausted {
+                        log.mark_thinking_budget_exhausted();
+                    }
                     cached = cached_tokens;
                     done = true;
                     break;

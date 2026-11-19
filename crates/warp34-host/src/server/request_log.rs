@@ -42,6 +42,9 @@ pub(super) struct TurnLog {
     messages: Option<usize>,
     tools: Option<usize>,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
+    reasoning_budget_tokens: Option<usize>,
+    thinking_budget_exhausted: Option<bool>,
     sampling: Option<Value>,
     start: Instant,
     first: Option<Instant>,
@@ -78,6 +81,9 @@ impl TurnLog {
             messages: None,
             tools: None,
             enable_thinking: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
+            thinking_budget_exhausted: None,
             sampling: None,
             start: Instant::now(),
             first: None,
@@ -95,11 +101,16 @@ impl TurnLog {
         messages: Option<usize>,
         tools: Option<usize>,
         enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
+        reasoning_budget_tokens: Option<usize>,
         params: &crate::parser::SamplingParams,
     ) -> Self {
         self.messages = messages;
         self.tools = tools;
         self.enable_thinking = enable_thinking;
+        self.reasoning_effort = reasoning_effort;
+        self.reasoning_budget_tokens = reasoning_budget_tokens;
+        self.thinking_budget_exhausted = reasoning_budget_tokens.map(|_| false);
         if enable_thinking.is_some() {
             self.reasoning_tokens = Some(0);
             self.tool_calls = Some(0);
@@ -133,6 +144,23 @@ impl TurnLog {
     pub(super) fn set_tool_calls(&mut self, count: usize) {
         self.tool_calls = Some(count);
     }
+    pub(super) fn mark_thinking_budget_exhausted(&mut self) {
+        if self.thinking_budget_exhausted == Some(true) {
+            return;
+        }
+        self.thinking_budget_exhausted = Some(true);
+        emit(&json!({
+            "event": "inference.thinking_budget_exhausted",
+            "level": "info",
+            "timestamp_unix_ms": timestamp_ms(),
+            "request_id": self.id,
+            "api": self.api,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "reasoning_budget_tokens": self.reasoning_budget_tokens,
+            "reasoning_tokens": self.reasoning_tokens.map(|r| r.min(self.tokens)),
+        }));
+    }
     pub(super) fn set_turn_outcome(&mut self, reasoning_tokens: Option<u64>, tool_calls: usize) {
         if let Some(r) = reasoning_tokens {
             self.reasoning_tokens = Some(r.min(self.tokens));
@@ -165,6 +193,9 @@ impl TurnLog {
             "finish_reason":reason, "length_limit":limit, "context_window":self.context,
             "requested_max_output_tokens":self.requested, "effective_max_output_tokens":self.effective,
             "messages":self.messages, "tools":self.tools, "enable_thinking":self.enable_thinking,
+            "reasoning_effort":self.reasoning_effort,
+            "reasoning_budget_tokens":self.reasoning_budget_tokens,
+            "thinking_budget_exhausted":self.thinking_budget_exhausted,
             "sampling":self.sampling,
             "prompt_tokens":self.prompt, "cached_prompt_tokens":self.cached.as_ref().map(|c| c.load(Ordering::Acquire)),
             "cache_lookup":self.cache_lookup.as_ref().and_then(|lookup| lookup.get()),
@@ -282,7 +313,14 @@ mod tests {
             65536,
             262144,
         )
-        .with_turn_metadata(Some(5), Some(14), Some(true), &params);
+        .with_turn_metadata(
+            Some(5),
+            Some(14),
+            Some(true),
+            Some("medium".into()),
+            Some(16384),
+            &params,
+        );
 
         let t0 = log.start + Duration::from_millis(100);
         log.token_at(t0);
@@ -293,6 +331,12 @@ mod tests {
         log.set_tool_calls(1);
 
         let row = log.record("tool_calls", false, t0 + Duration::from_millis(30));
+        assert_eq!(row["reasoning_effort"], "medium");
+        assert_eq!(row["reasoning_budget_tokens"], 16384);
+        assert_eq!(row["thinking_budget_exhausted"], false);
+        log.mark_thinking_budget_exhausted();
+        let exhausted_row = log.record("tool_calls", false, t0 + Duration::from_millis(30));
+        assert_eq!(exhausted_row["thinking_budget_exhausted"], true);
         assert_eq!(row["messages"], 5);
         assert_eq!(row["tools"], 14);
         assert_eq!(row["enable_thinking"], true);

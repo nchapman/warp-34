@@ -1322,6 +1322,7 @@ fn complete_tick(
                 r.set_terminal(GenerationEvent::Finished {
                     cached_tokens: seq.cached_prefix_tokens,
                     generated_tokens: seq.generated_tokens.len(),
+                    thinking_budget_exhausted: r.sampler.thinking_budget_exhausted(),
                 });
             }
         }

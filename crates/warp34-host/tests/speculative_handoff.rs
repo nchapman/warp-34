@@ -397,6 +397,7 @@ async fn collect_with_cached(
             GenerationEvent::Finished {
                 cached_tokens,
                 generated_tokens,
+                ..
             } => {
                 if generated_tokens != expected_len || tokens.len() != expected_len {
                     return Err(format!(

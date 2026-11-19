@@ -749,6 +749,54 @@ pub(crate) struct ServeBootSummary {
     pub(crate) use_cuda_graph: bool,
     pub(crate) default_sampling_params: crate::parser::SamplingParams,
     pub(crate) sampling_from_generation_config: bool,
+    pub(crate) chat_template_source: String,
+    pub(crate) preserve_thinking: bool,
+    pub(crate) reasoning_effort_budget: bool,
+    pub(crate) default_reasoning_budget: Option<usize>,
+    pub(crate) default_reasoning_budget_message: Option<String>,
+    pub(crate) vision_banner: Option<String>,
+}
+
+#[cfg(feature = "cuda")]
+fn format_thinking_banner_line(
+    effort_budget: bool,
+    default_budget: Option<usize>,
+    default_message: Option<&str>,
+) -> String {
+    let effort = if effort_budget {
+        format!(
+            "effort-budget=on (ceil={})",
+            crate::server::DEFAULT_MAX_REASONING_BUDGET_TOKENS
+        )
+    } else {
+        "effort-budget=off [configured]".to_string()
+    };
+    let budget = match default_budget {
+        Some(n) => format!("budget={n} [configured]"),
+        None if effort_budget => "budget=auto".to_string(),
+        None => "budget=unlimited".to_string(),
+    };
+    let cutoff = match default_message {
+        Some("") => "cutoff=none [configured]".to_string(),
+        Some(m) => {
+            let trimmed = m.trim().replace('\n', " ");
+            let preview = if trimmed.chars().count() > 48 {
+                let s: String = trimmed.chars().take(45).collect();
+                format!("{s}...")
+            } else {
+                trimmed
+            };
+            format!("cutoff=\"{preview}\" [configured]")
+        }
+        None if effort_budget || default_budget.is_some() => {
+            let trimmed = crate::server::DEFAULT_REASONING_BUDGET_MESSAGE
+                .trim()
+                .replace('\n', " ");
+            format!("cutoff=\"{trimmed}\" [default]")
+        }
+        None => "cutoff=none".to_string(),
+    };
+    format!("{effort}, {budget}, {cutoff}")
 }
 
 #[cfg(feature = "cuda")]
@@ -846,6 +894,16 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         &s.default_sampling_params,
         s.sampling_from_generation_config,
     );
+    let thinking_line = format_thinking_banner_line(
+        s.reasoning_effort_budget,
+        s.default_reasoning_budget,
+        s.default_reasoning_budget_message.as_deref(),
+    );
+    let vision_line = s
+        .vision_banner
+        .as_deref()
+        .map(|v| format!("  Vision       : {v}\n"))
+        .unwrap_or_default();
     format!(
         concat!(
             "\n",
@@ -860,6 +918,9 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
             "  Speculative  : {}\n",
             "  Sampling     : {}\n",
+            "  Template     : {} (preserve_thinking={})\n",
+            "  Thinking     : {}\n",
+            "{}",
             "  KV Cache     : {} {}\n",
             "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
             "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}){} [auto-sized]\n",
@@ -876,6 +937,10 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.tp_size,
         s.speculative_label,
         sampling_line,
+        s.chat_template_source,
+        s.preserve_thinking,
+        thinking_line,
+        vision_line,
         kv_desc,
         kv_mode_tag,
         s.context_limit,
@@ -1076,6 +1141,22 @@ pub(crate) fn run_serve(
                             .model_dir
                             .join("generation_config.json")
                             .is_file(),
+                        chat_template_source: String::new(),
+                        preserve_thinking: false,
+                        reasoning_effort_budget: false,
+                        default_reasoning_budget: None,
+                        default_reasoning_budget_message: None,
+                        vision_banner: engine.cfg.vision_config.as_ref().map(|_| {
+                            let vp = &engine.cfg.vision_preprocessor;
+                            format!(
+                                "{} (patch={}, merge={}, pixels={}..{})",
+                                vp.source_name,
+                                vp.patch_size,
+                                vp.spatial_merge_size,
+                                vp.min_pixels,
+                                vp.max_pixels,
+                            )
+                        }),
                     });
             }
             Ok(engine)
@@ -1084,6 +1165,13 @@ pub(crate) fn run_serve(
     if let Some(mut summary) = boot_info.get().cloned() {
         summary.context_limit = state.worker.max_model_len();
         summary.default_sampling_params = state.worker.default_sampling_params.clone();
+        summary.chat_template_source = state.worker.chat_template.source_name().to_string();
+        summary.preserve_thinking = state.worker.default_preserve_thinking;
+        summary.reasoning_effort_budget = state.reasoning_effort_budget;
+        summary.default_reasoning_budget = state.default_reasoning_budget;
+        summary
+            .default_reasoning_budget_message
+            .clone_from(&state.default_reasoning_budget_message);
         print!("{}", format_serve_boot_banner(&summary));
     }
     println!(

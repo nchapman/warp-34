@@ -34,6 +34,7 @@ pub enum GenerationEvent {
     Finished {
         cached_tokens: usize,
         generated_tokens: usize,
+        thinking_budget_exhausted: bool,
     },
     Error(WorkerError),
 }
