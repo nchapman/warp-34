@@ -1604,7 +1604,7 @@ impl ResponsesSseFormatter {
                 d2.insert("output_index".into(), json!(output_index));
                 d2.insert("content_index".into(), json!(0));
                 d2.insert("part".into(), part.clone());
-                out.push(self.emit("response.reasoning_part.done", d2));
+                out.push(self.emit("response.content_part.done", d2));
 
                 let item = json!({
                     "id": item_id,
@@ -1879,7 +1879,7 @@ impl ResponsesSseFormatter {
                 a2.insert("output_index".into(), json!(idx));
                 a2.insert("content_index".into(), json!(0));
                 a2.insert("part".into(), json!({"type": "reasoning_text", "text": ""}));
-                out.push(self.emit("response.reasoning_part.added", a2));
+                out.push(self.emit("response.content_part.added", a2));
 
                 self.active = ActiveItem::Reasoning { output_index: idx };
                 idx

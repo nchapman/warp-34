@@ -141,6 +141,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
                     "system": "Reply concisely.",
+                    "thinking": {"type": "adaptive"},
                     "messages": [{"role": "user", "content": "What is 6 * 7?"}]
                 }))
                 .send()

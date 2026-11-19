@@ -258,10 +258,44 @@ fn validate_tag_schemas(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum allowed JSON value nesting depth for structured-output schemas
+/// (matches vLLM `#60036` hardening against stack overflow / compiler DoS).
+pub(crate) const MAX_JSON_SCHEMA_DEPTH: usize = 64;
+
+fn check_json_depth(root: &Value, max_depth: usize) -> Result<(), String> {
+    let mut stack: Vec<(&Value, usize)> = vec![(root, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(format!(
+                "JSON schema exceeds maximum nesting depth of {max_depth}"
+            ));
+        }
+        match node {
+            Value::Object(map) => {
+                for v in map.values() {
+                    stack.push((v, depth + 1));
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    stack.push((v, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Reject known silently weakened constraints, while leaving schema syntax and
 /// supported extensions to the native compiler. Traverse schema positions only
 /// (a property named `contains`, or an enum object, is not a keyword).
 pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
+    check_json_depth(v, MAX_JSON_SCHEMA_DEPTH)?;
+    validate_json_schema_inner(v)
+}
+
+fn validate_json_schema_inner(v: &Value) -> Result<(), String> {
     let Some(o) = v.as_object() else {
         return Ok(());
     };
@@ -355,7 +389,7 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
     for k in ["properties", "patternProperties", "$defs", "definitions"] {
         if let Some(m) = o.get(k).and_then(Value::as_object) {
             for v in m.values() {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
@@ -369,17 +403,17 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
         if let Some(v) = o.get(k) {
             if let Some(a) = v.as_array() {
                 for v in a {
-                    validate_json_schema(v)?;
+                    validate_json_schema_inner(v)?;
                 }
             } else {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
     for k in ["allOf", "anyOf", "oneOf", "prefixItems"] {
         if let Some(a) = o.get(k).and_then(Value::as_array) {
             for v in a {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
@@ -1120,5 +1154,15 @@ mod tests {
             deep = json!({"type": "array", "items": deep});
         }
         assert!(sanitize_tool_schema(&deep).is_err());
+
+        // validate_json_schema enforces MAX_JSON_SCHEMA_DEPTH (64, matching vLLM #60036).
+        let mut at_limit = json!({"type": "string"});
+        for _ in 0..63 {
+            at_limit = json!({"type": "array", "items": at_limit});
+        }
+        assert!(validate_json_schema(&at_limit).is_ok());
+        let over_limit = json!({"type": "array", "items": at_limit});
+        let err = validate_json_schema(&over_limit).unwrap_err();
+        assert!(err.contains("maximum nesting depth"), "unexpected: {err}");
     }
 }

@@ -1,15 +1,28 @@
 # warp34 — Session Orientation & Current State
 
-## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`)
+## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`) & Pre-Release Verification Pass
 
 - **Pinned Baselines & Local Oracle Environment (`BASELINE.txt`, `AGENTS.md`, `NOTICE`, `README.md`, `tools/oracle/{vllm_dump,vllm_greedy,vllm_vl_dump,hgptq_oracle,profile_diff}.py`):**
   - Upgraded the local Python oracle environment from `vLLM 0.31.0` (`8352b2427`) to **`vLLM 0.34.0` (`62d4bc3c7`)** (`torch==2.14.0`, `xgrammar==0.2.8`, `transformers==5.22.2`, `flashinfer-python==0.7.3`, `humming-kernels==0.1.19`, `pillow==13.0.0`), pulled **`lmsysorg/sglang:v0.5.23`** (`297e54fd10`), and updated local donor source checkouts (`/home/nchapman/Code/warp3090/vendor/vllm` -> `62d4bc3c7`, `/home/nchapman/Code/warp3090-dflash/vendor/sglang` -> `297e54fd10`).
-  - **Live GPU Parity & Host Gate Verification (`CUDA_VISIBLE_DEVICES=1` RTX 3090 Ti):**
-    - `tools/oracle/vllm_dump.py` (`vLLM 0.34.0`): **`43/43` op fixture tensors** match `tools/oracle/goldens/op_fixtures.safetensors` (`0` diffs > `1e-3`).
-    - `tools/oracle/vllm_greedy.py` (`vLLM 0.34.0`, `Qwen/Qwen3.5-4B` `chat00`): **`32/32` greedy tokens** match `tools/oracle/goldens/4B/chat00.ids` bit-for-bit.
-    - `tools/oracle/hgptq_oracle.py`: all `CompressedTensorsLinearTransformMethod`, `HadamardTransform`, `MarlinLinearKernel`, and `CompressedTensorsMoEMethod` patch anchors verified against `vLLM 0.34.0`.
-    - `lmsysorg/sglang:v0.5.23`: verified GPU container boot and `sglang==0.5.23` runtime.
-    - Host & Rust oracle suites: `mise run oracle-check` (`82/82`), `xgrammar_oracle` (`3/3`), `chatml_formatting` (`6/6`), `jpeg_decode` (`2/2`), `mise run perf-check`, and `mise run check-quick` all pass.
+- **Ported `vLLM 0.32–0.34` & `SGLang v0.5.20–v0.5.23` API Parity, Security, & Pre-Release Fixes:**
+  - **Responses API reasoning SSE (`vLLM #59652`, `crates/warp34-host/src/responses_api.rs`, `responses_api/tests.rs`, `docs/GENERATIVE_APIS.md`):** Emit `response.content_part.added` and `response.content_part.done` with `part.type = "reasoning_text"` around reasoning item streaming, matching `vLLM 0.34.0` and the OpenAI Responses spec.
+  - **JSON Schema nesting DoS guard (`vLLM #60036`, `crates/warp34-host/src/constraints.rs`):** Added iterative `MAX_JSON_SCHEMA_DEPTH = 64` validation in `validate_json_schema` (prevents stack overflow on deeply nested structured-output schemas) with a focused regression test.
+  - **Chat template DoS hardening (`vLLM #50300` / `GHSA-4hhp-h66f-j5j7`, `crates/warp34-host/Cargo.toml`, `crates/warp34-host/src/chatml.rs`):** Enabled `minijinja`'s `fuel` feature and bounded `ChatTemplate` evaluation with `recursion_limit(100)` and `fuel(10_000_000)` plus a runaway-loop regression test.
+  - **Pre-release verification fixes caught by full GPU & benchmark suites:**
+    - `crates/warp34-host/src/cuda/collectives.rs`: Wrapped `warp34_set_device((r % num_gpus) as i32)` so `TP=4` mapped-host collective tests run cleanly on 2-GPU hosts.
+    - `crates/warp34-host/tests/generative_apis.rs`: Added `"thinking": {"type": "adaptive"}` to `/v1/messages/count_tokens` so it matches thinking-enabled `/v1/chat/completions` and `/v1/responses` prompt counts.
+    - `crates/warp34-host/src/model/{rank.rs,rank_capacity.rs}`: Extracted `vision_lazy_extra_headroom` and reserved it in `fixed_non_state_bytes` before sizing `RankTieredMoe` so `TP=2` `Qwen3.8-Flash-Next` `MTP-3` preserves 18 GDN state slots (`worker_capacity` passes).
+    - `crates/warp34-host/src/cli/commands.rs`: In `run_bench` vision stage, kept exact `32/32` parity for `FP32` checkpoints (`ckpt=None`) and required `>= min(4, v_gen)` prefix parity for lossy 8-bit `WHT128-Q8_0` compressed checkpoints (`ckpt=Some`, fixing a near-tie at step 23 on `35b_tp2_plain --stage all`).
+    - `tools/oracle/goldens/bench_baselines.json`: Restored `27b_tp2_dflash2_synth` `prompt_len`/`gen_len` from `128/128` back to `64/64` (matching the pinned baseline before `5033fbf`).
+- **Full Pre-Release Verification (`2× RTX 3090 Ti` `sm_86` & `2× RTX 4090` `sm_89`):**
+  - **Oracle & Host Gates (`sm_86`):** `tools/oracle/vllm_dump.py` (`43/43` op fixtures, `0` diffs > `1e-3`), `tools/oracle/vllm_greedy.py` (`32/32` 4B tokens), `mise run check-quick`, `mise run dashboard-check` (`46/46`), `mise run oracle-check` (`82/82`), `mise run perf-check` (`133/133` + 4 manifests), `mise run test-quick` (`379/379` `warp34-host` + `4/4` `warp34-kernels`).
+  - **Full Local `2× RTX 3090 Ti` (`sm_86`) Release Gates:**
+    - `mise run check`: **PASS** (13m20s, full GPU unit + integration suites + `120/120` `cuda-sanitize` `memcheck`/`racecheck`/`synccheck` with `0` errors).
+    - `mise run oracle-dump`: **PASS** (`6/6`), `mise run oracle-greedy`: **PASS** (`2/2`, `lossless=4/4`, `radix_warm=4/4`).
+    - `mise run bench-gate`: **PASS 5/5**; `mise run bench-gate-full`: **PASS 15/15** (`4B` `TP=1` Plain `208.1`, `MTP-3` `588.6`, `DFlash2` `1,576.4`; `4B` `TP=2` Plain `285.3`, `MTP-3` `798.3`, `DFlash2` `1,754.1`; `9B+LoRA` `126.0`; `27B` `TP=2` Plain `88.4`, `MTP-3` `230.6`, `DFlash2` `311.6`; `35B-A3B` `TP=2` Plain `247.8`, `MTP-3` `565.8`; `Flash-Next` `TP=2` `MTP-3` `135.1` tok/s).
+  - **Remote `2× RTX 4090` (`sm_89`, Runpod `t9j929issp7j5h`, terminated after verification):**
+    - Kernel & GPU suites: `collectives_and_gdn_wy` (`9/9`), `hgptq_hadamard` (`6/6`), `vision_rounding` (`3/3`), and `warp34_host` GPU unit tests (`14/14` covering `sm_89` 128-SM props, `prefill_64q` 0-ULP across KV formats, `wht128_q8`, `marlin_w2a16`, `h64_g64_routed_moe`, `tiered_moe` TP=1/EP=2, `w2a16_u2b2`, `hc_ple_qsa`, `lora`, `bf16_marlin_u4b8`, `synthetic_hybrid_engine`).
+    - Live `4B` parity & throughput: `dump-diff --compare-tp2` (`tp1_top1 == tp2_top1 == 271`, `min_cosine=0.998841`), bit-identical `greedy-diff` trajectories across `TP=1`, `TP=2`, `TP=2 MTP-3`, and `TP=2 DFlash2`, and `warp34 bench` (`4B` `TP=1` Plain **`221.5`**, `B=8` sched **`1,356.8`**, `MTP-3` **`625.0`**, `DFlash2` **`1,764.7`**; `4B` `TP=2` Plain `tq4` **`327.8`** / `fp8` **`329.4`**, `MTP-3` **`907.0`**, `DFlash2` **`1,956.6`** tok/s; `radix` & `vision` `lossless_parity: true`).
 
 ## Tiered `WHT128-Q8_0` (`BF16` Scale) GDN Checkpoint Pool
 

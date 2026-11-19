@@ -116,10 +116,14 @@ impl Tp2Collectives {
                 )?));
             }
         } else {
+            let num_gpus = super::CudaDevice::count()?.max(1) as usize;
             for r in 0..tp_size {
+                let dev_id = (r % num_gpus) as i32;
                 check_rc(
-                    // SAFETY: binds calling thread to `r` before allocating mapped host memory for rank `r`.
-                    unsafe { ffi::warp34_set_device(r as i32) },
+                    // SAFETY: binds calling thread to a valid visible device before allocating
+                    // portable mapped host memory for rank `r` (wraps modulo `num_gpus` so
+                    // TP=4 mapped-host simulation tests work on 1- or 2-GPU hosts).
+                    unsafe { ffi::warp34_set_device(dev_id) },
                     "warp34_set_device",
                 )?;
                 let sig = MappedHostBuffer::alloc(sig_bytes)?;

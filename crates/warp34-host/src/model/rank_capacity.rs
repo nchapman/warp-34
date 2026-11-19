@@ -67,10 +67,19 @@ pub(super) const STANDARD_DEFAULT_STATE_SLOTS: usize = 24;
 /// [`crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES`].
 pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 
-/// Dedicated VRAM reserve (`1.5 GiB`) set aside on rank 0 for lazy `Qwen3VisionEncoder`
-/// loading when serving multimodal checkpoints with sufficient free VRAM.
+/// Dedicated VRAM reserve (`1.5 GiB`) set aside symmetrically across serving ranks for
+/// lazy `Qwen3VisionEncoder` loading when serving multimodal checkpoints.
 #[cfg(feature = "cuda")]
 pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
+
+#[cfg(feature = "cuda")]
+pub(super) fn vision_lazy_extra_headroom(has_vision: bool, base_headroom: usize) -> usize {
+    if has_vision {
+        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+    } else {
+        0
+    }
+}
 
 /// Layer-count threshold (`64` layers) for applying [`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`].
 pub const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
@@ -943,6 +952,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
             tp_size,
             post_weight_available,
             base_headroom
+                .saturating_add(vision_extra)
                 .saturating_add(req_kv_bytes)
                 .saturating_add(lora_reserve.device_bytes_per_rank),
             state_bytes.saturating_mul(min_state_slots_for_moe),

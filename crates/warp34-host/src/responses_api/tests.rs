@@ -776,3 +776,41 @@ fn namespace_and_web_search_tools_roundtrip_for_codex() {
     assert_eq!(done.1["item"]["name"], "spawn_agent");
     assert_eq!(done.1["item"]["namespace"], "multi_agent_v1");
 }
+
+#[test]
+fn streaming_reasoning_uses_content_part_events_matching_vllm_034() {
+    let body = json!({
+        "model": "qwen3.8-27b",
+        "input": "hello",
+        "stream": true
+    });
+    let store = ResponseStore::with_capacity(16);
+    let (_, meta) = translate_responses_to_chat(&body, "qwen3.8-27b", &store, None, 1).unwrap();
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let _ = sse.start();
+    let mut all = sse.push_delta(crate::parser::StreamParseDelta {
+        reasoning_delta: Some("thinking".into()),
+        ..Default::default()
+    });
+    all.extend(sse.push_delta(crate::parser::StreamParseDelta {
+        content_delta: Some("done".into()),
+        ..Default::default()
+    }));
+    let names: Vec<&str> = all.iter().map(|(ev, _)| ev.as_str()).collect();
+    assert!(!names.contains(&"response.reasoning_part.added"));
+    assert!(!names.contains(&"response.reasoning_part.done"));
+    let added = all
+        .iter()
+        .find(|(ev, data)| {
+            ev == "response.content_part.added" && data["part"]["type"] == "reasoning_text"
+        })
+        .expect("reasoning content_part.added");
+    assert_eq!(added.1["part"]["text"], "");
+    let done = all
+        .iter()
+        .find(|(ev, data)| {
+            ev == "response.content_part.done" && data["part"]["type"] == "reasoning_text"
+        })
+        .expect("reasoning content_part.done");
+    assert_eq!(done.1["part"]["text"], "thinking");
+}

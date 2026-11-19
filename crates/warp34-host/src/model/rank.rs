@@ -1880,11 +1880,16 @@ impl PrePoolModelRank {
         let (tiered_moe, tiered_moe_hot_per_layer, actual_tiered_moe_bytes, post_pool_moe_reserve) =
             if cfg.uses_tiered_moe() {
                 let post_weight_available = device.mem_info()?.0;
+                let moe_vision_extra = vision_lazy_extra_headroom(
+                    capacity.state_slots.is_some() && has_vision_weights(&cfg, archive),
+                    base_headroom,
+                );
                 let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
                     &cfg,
                     tp_size,
                     post_weight_available,
                     base_headroom
+                        .saturating_add(moe_vision_extra)
                         .saturating_add(req_kv_bytes)
                         .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
                         .saturating_add(rank0_extra_headroom),
@@ -2000,15 +2005,11 @@ impl PrePoolModelRank {
                     MIN_ACTIVE_STATE_SLOTS
                 };
                 let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
-                let vision_reserve = if has_vision_weights(&cfg, archive) {
-                    let desired_vision_extra =
-                        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom);
-                    available_for_pools
-                        .saturating_sub(base_reserved.saturating_add(min_state_bytes))
-                        .min(desired_vision_extra)
-                } else {
-                    0
-                };
+                let desired_vision_extra =
+                    vision_lazy_extra_headroom(has_vision_weights(&cfg, archive), base_headroom);
+                let vision_reserve = available_for_pools
+                    .saturating_sub(base_reserved.saturating_add(min_state_bytes))
+                    .min(desired_vision_extra);
                 let reserved = base_reserved.saturating_add(vision_reserve);
                 if available_for_pools
                     < reserved

@@ -154,10 +154,10 @@ Every SSE frame sets `event: <type>` and carries `"type": "<type>"` plus a stric
 2. `response.in_progress` (`sequence_number: 1`, `response.status = "in_progress"`)
 3. **Reasoning item** (opened lazily on first non-empty `reasoning_content` delta):
    - `response.output_item.added` (`output_index`, `item: { id: "rs_...", type: "reasoning", status: "in_progress", summary: [], content: [] }`)
-   - `response.reasoning_part.added` (`item_id`, `output_index`, `content_index: 0`, `part: { type: "reasoning_text", text: "" }`)
+   - `response.content_part.added` (`item_id`, `output_index`, `content_index: 0`, `part: { type: "reasoning_text", text: "" }`)
    - `response.reasoning_text.delta` (`item_id`, `output_index`, `content_index: 0`, `delta`) — repeated per chunk
    - `response.reasoning_text.done` (`item_id`, `output_index`, `content_index: 0`, `text: full_reasoning`)
-   - `response.reasoning_part.done` (`item_id`, `output_index`, `content_index: 0`, `part: { type: "reasoning_text", text: full_reasoning }`)
+   - `response.content_part.done` (`item_id`, `output_index`, `content_index: 0`, `part: { type: "reasoning_text", text: full_reasoning }`)
    - `response.output_item.done` (`output_index`, `item: { ..., status: "completed", content: [...] }`)
 4. **Assistant text message item** (opened lazily on first non-empty `content` delta, closing any open reasoning item first):
    - `response.output_item.added` (`output_index`, `item: { id: "msg_...", type: "message", status: "in_progress", role: "assistant", content: [] }`)

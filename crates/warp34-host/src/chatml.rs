@@ -183,6 +183,10 @@ impl ChatTemplate {
         let mut env = minijinja::Environment::new();
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Bound template recursion and instruction count against pathological chat
+        // templates (matches vLLM #50300 / GHSA-4hhp-h66f-j5j7 resource-exhaustion fix).
+        env.set_recursion_limit(100);
+        env.set_fuel(Some(10_000_000));
         env.add_filter("tojson", tojson_filter);
         env.add_function(
             "raise_exception",
@@ -842,5 +846,23 @@ mod tests {
         assert!(rendered.contains("<think>\nThinking...\n</think>"));
         assert!(rendered.contains("# Tools"));
         assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn chat_template_fuel_bounds_runaway_loops() {
+        let tmpl = ChatTemplate::from_source_with_tokens(
+            "{% for i in range(100000) %}{% for j in range(100000) %}{{ i }}{% endfor %}{% endfor %}",
+            "runaway",
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        let err = tmpl
+            .render(&[], None, false, &Map::new())
+            .expect_err("runaway template must fail on fuel exhaustion");
+        assert!(
+            err.to_lowercase().contains("fuel"),
+            "expected fuel exhaustion error, got: {err}"
+        );
     }
 }
