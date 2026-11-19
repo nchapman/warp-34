@@ -800,6 +800,8 @@ pub fn translate_anthropic_to_chat(
         "stop_token_ids",
         "min_tokens",
         "ignore_eos",
+        "reasoning_budget_message",
+        "thinking_budget_message",
     ] {
         if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
             chat_req.insert(key.into(), val.clone());

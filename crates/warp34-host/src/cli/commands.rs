@@ -129,7 +129,10 @@ pub(crate) fn run_generate(
                 reasoning_content: None,
             },
         ];
-        crate::server::format_chatml_prompt(&msgs, None, false)
+        let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+        let mut template_kwargs = serde_json::Map::new();
+        template_kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        chat_template.render(&msgs, None, true, &template_kwargs)?
     } else {
         expanded_prompt
     };
@@ -1250,6 +1253,7 @@ fn run_chat_repl(
          Commands: /help  /clear  /system <text>  /think [on|off]  /temp <0..2>  /stats  /exit",
         if enable_thinking { "on" } else { "off" }
     );
+    let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
     let mut history: Vec<crate::server::ChatMessage> = Vec::new();
     let mut last_stats: Option<(usize, usize, usize, f64, f64)> = None;
     let stdin = std::io::stdin();
@@ -1362,7 +1366,6 @@ fn run_chat_repl(
                 content: Some(input.to_string()),
                 reasoning_content: None,
             });
-            let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
             let mut template_kwargs = serde_json::Map::new();
             template_kwargs.insert(
                 "enable_thinking".into(),
@@ -1441,7 +1444,7 @@ fn run_chat_repl(
             tool_calls: Vec::new(),
             role: "assistant".to_string(),
             content: Some(assistant_reply),
-            reasoning_content: None,
+            reasoning_content: parsed.reasoning_content,
         });
     }
     Ok(ExitCode::SUCCESS)

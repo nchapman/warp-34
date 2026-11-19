@@ -19,6 +19,10 @@ pub struct ThinkingBudgetConfig {
     pub start_token_ids: Vec<i32>,
     pub end_token_ids: Vec<i32>,
     pub forced_token_ids: Vec<i32>,
+    /// Optional additional stop sequences (e.g., `<tool_call>` when tools are active)
+    /// that implicitly terminate reasoning even without an explicit `</think>`.
+    #[serde(default)]
+    pub extra_end_token_ids: Vec<Vec<i32>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,8 +50,13 @@ fn find_last_subseq(haystack: &[i32], needle: &[i32]) -> Option<usize> {
 
 impl ThinkingBudgetTracker {
     fn new(cfg: &ThinkingBudgetConfig, prompt_tokens: &[i32]) -> Self {
-        let last_start = find_last_subseq(prompt_tokens, &cfg.start_token_ids);
-        let last_end = find_last_subseq(prompt_tokens, &cfg.end_token_ids);
+        // Scope prompt detection to the trailing assistant generation header so literal
+        // `<think>` tokens inside user content cannot falsely arm the tracker on templates
+        // that do not open `<think>` in the assistant header.
+        let tail_window = 16.max(cfg.start_token_ids.len() + cfg.end_token_ids.len() + 4);
+        let tail = &prompt_tokens[prompt_tokens.len().saturating_sub(tail_window)..];
+        let last_start = find_last_subseq(tail, &cfg.start_token_ids);
+        let last_end = find_last_subseq(tail, &cfg.end_token_ids);
         let in_think = match (last_start, last_end) {
             (Some(s), Some(e)) => s > e,
             (Some(_), None) => true,
@@ -79,7 +88,12 @@ impl ThinkingBudgetTracker {
         }
     }
 
-    fn advance(&mut self, cfg: &ThinkingBudgetConfig, output_history: &[i32]) {
+    fn advance(
+        &mut self,
+        cfg: &ThinkingBudgetConfig,
+        output_history: &[i32],
+        exited_reasoning_gate: bool,
+    ) {
         self.history.push(self.phase);
         if cfg.forced_token_ids.is_empty() {
             self.phase = ThinkingBudgetPhase::Done;
@@ -87,11 +101,18 @@ impl ThinkingBudgetTracker {
         }
         let ends_with_start =
             !cfg.start_token_ids.is_empty() && output_history.ends_with(&cfg.start_token_ids);
-        let ends_with_end =
-            !cfg.end_token_ids.is_empty() && output_history.ends_with(&cfg.end_token_ids);
+        let ends_with_end = (!cfg.end_token_ids.is_empty()
+            && output_history.ends_with(&cfg.end_token_ids))
+            || cfg
+                .extra_end_token_ids
+                .iter()
+                .any(|seq| !seq.is_empty() && output_history.ends_with(seq));
         self.phase = match self.phase {
-            ThinkingBudgetPhase::Idle | ThinkingBudgetPhase::Done => {
-                if ends_with_start {
+            ThinkingBudgetPhase::Done => ThinkingBudgetPhase::Done,
+            ThinkingBudgetPhase::Idle => {
+                if exited_reasoning_gate {
+                    ThinkingBudgetPhase::Done
+                } else if ends_with_start {
                     if cfg.budget == 0 {
                         ThinkingBudgetPhase::Forcing { pos: 0 }
                     } else {
@@ -100,11 +121,11 @@ impl ThinkingBudgetTracker {
                         }
                     }
                 } else {
-                    self.phase
+                    ThinkingBudgetPhase::Idle
                 }
             }
             ThinkingBudgetPhase::Counting { remaining } => {
-                if ends_with_end {
+                if exited_reasoning_gate || ends_with_end {
                     ThinkingBudgetPhase::Done
                 } else if remaining <= 1 {
                     ThinkingBudgetPhase::Forcing { pos: 0 }
@@ -115,7 +136,7 @@ impl ThinkingBudgetTracker {
                 }
             }
             ThinkingBudgetPhase::Forcing { pos } => {
-                if pos + 1 >= cfg.forced_token_ids.len() {
+                if exited_reasoning_gate || pos + 1 >= cfg.forced_token_ids.len() {
                     ThinkingBudgetPhase::Done
                 } else {
                     ThinkingBudgetPhase::Forcing { pos: pos + 1 }
@@ -383,7 +404,14 @@ impl SamplerV1 {
     #[inline]
     pub fn forced_thinking_token(&self) -> Option<i32> {
         let cfg = self.params.thinking_budget.as_ref()?;
-        self.thinking_tracker.as_ref()?.forced_token(cfg)
+        let tracker = self.thinking_tracker.as_ref()?;
+        let forced = tracker.forced_token(cfg)?;
+        if let Some(ref c) = self.constraint
+            && !c.is_token_allowed(forced)
+        {
+            return None;
+        }
+        Some(forced)
     }
 
     /// Deterministic SplitMix64 uniform float in `[0.0, 1.0)` keyed by `(seed, step_pos)`.
@@ -825,11 +853,15 @@ impl SamplerV1 {
         }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;
+        let exited_gate = self
+            .constraint
+            .as_ref()
+            .is_some_and(|c| !c.in_reasoning_gate());
         if let (Some(cfg), Some(tracker)) = (
             self.params.thinking_budget.as_ref(),
             self.thinking_tracker.as_mut(),
         ) {
-            tracker.advance(cfg, &self.output_history);
+            tracker.advance(cfg, &self.output_history, exited_gate);
         }
         Ok(())
     }
@@ -842,11 +874,15 @@ impl SamplerV1 {
         }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;
+        let exited_gate = self
+            .constraint
+            .as_ref()
+            .is_some_and(|c| !c.in_reasoning_gate());
         if let (Some(cfg), Some(tracker)) = (
             self.params.thinking_budget.as_ref(),
             self.thinking_tracker.as_mut(),
         ) {
-            tracker.advance(cfg, &self.output_history);
+            tracker.advance(cfg, &self.output_history, exited_gate);
         }
         Ok(())
     }
@@ -3190,12 +3226,13 @@ mod tests {
 
     #[test]
     fn test_thinking_budget_forcing_and_speculative_rollback() {
-        // Token IDs: 1 = <think>, 2 = </think>, 3 = \n, 5 = normal thought/answer token
+        // Token IDs: 1 = <think>, 2 = </think>, 3 = \n, 5 = normal thought/answer token, 9 = <tool_call>
         let cfg = ThinkingBudgetConfig {
             budget: 2,
             start_token_ids: vec![1],
             end_token_ids: vec![2],
             forced_token_ids: vec![2, 3],
+            extra_end_token_ids: vec![vec![9]],
         };
         let params = SamplingParams {
             temperature: 0.0,
@@ -3237,13 +3274,33 @@ mod tests {
         assert_eq!(sampler.forced_thinking_token(), None);
         assert_eq!(sampler.sample_from_logits(&logits), 5);
 
-        // Natural </think> before budget exhaustion deactivates forcing
-        let mut natural = SamplerV1::new(params, &[10, 1], None);
+        // Natural </think> before budget exhaustion deactivates forcing permanently
+        // (literal <think> in the subsequent answer must NOT re-arm Done).
+        let mut natural = SamplerV1::new(params.clone(), &[10, 1], None);
         natural.commit_token(5);
         natural.commit_token(2); // natural </think>
         assert_eq!(natural.forced_thinking_token(), None);
+        natural.commit_token(1); // literal <think> in answer
+        natural.commit_token(5);
         natural.commit_token(5);
         assert_eq!(natural.forced_thinking_token(), None);
+
+        // Implicit <tool_call> (extra_end_token_ids) terminates Counting cleanly.
+        let mut implicit_tool = SamplerV1::new(params.clone(), &[10, 1], None);
+        implicit_tool.commit_token(5);
+        implicit_tool.commit_token(9); // <tool_call>
+        implicit_tool.commit_token(5);
+        implicit_tool.commit_token(5);
+        assert_eq!(implicit_tool.forced_thinking_token(), None);
+
+        // Literal <think> far earlier in user prompt does not falsely arm when template
+        // ends without <think> in the trailing assistant header.
+        let mut far_prompt = vec![10; 24];
+        far_prompt[2] = 1; // literal <think> in user text
+        let mut user_only = SamplerV1::new(params, &far_prompt, None);
+        user_only.commit_token(5);
+        user_only.commit_token(5);
+        assert_eq!(user_only.forced_thinking_token(), None);
 
         // budget == 0 forces immediately when prompt ends with <think>
         let immediate = SamplerV1::new(

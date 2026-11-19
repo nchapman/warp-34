@@ -1160,3 +1160,52 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
     assert!(banner.contains("99 WHT128-Q8_0 ckpts (2 VRAM + 97 Host, 41.1 MiB/slot)"));
     assert!(banner.contains("host-mapped"));
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn serve_cli_parses_reasoning_budget_and_effort_flags() {
+    let parse = |extra: &[&str]| -> crate::server::ServeOptions {
+        let mut args: Vec<String> = vec!["serve".into(), "model".into()];
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        let mut cfg = ServeCliConfig::default();
+        let mut i = 2;
+        while i < args.len() {
+            assert!(cfg.parse(&args, &mut i).unwrap(), "unparsed {}", args[i]);
+            i += 1;
+        }
+        cfg.validate("serve").unwrap();
+        cfg.options
+    };
+
+    let default_opts = parse(&[]);
+    assert!(default_opts.reasoning_effort_budget);
+    assert_eq!(default_opts.reasoning_budget, None);
+    assert_eq!(default_opts.reasoning_budget_message, None);
+
+    let unlimited = parse(&["--reasoning-budget", "-1"]);
+    assert_eq!(unlimited.reasoning_budget, None);
+    assert!(!unlimited.reasoning_effort_budget);
+
+    let empty_msg = parse(&[
+        "--reasoning-budget",
+        "0",
+        "--reasoning-budget-message",
+        "",
+        "--reasoning-effort",
+        "low",
+    ]);
+    assert_eq!(empty_msg.reasoning_budget, Some(0));
+    assert_eq!(empty_msg.reasoning_budget_message.as_deref(), Some(""));
+    assert_eq!(empty_msg.reasoning_effort.as_deref(), Some("low"));
+
+    let dash_msg = parse(&[
+        "--reasoning-budget-message",
+        "- time up -",
+        "--no-reasoning-effort-budget",
+    ]);
+    assert_eq!(
+        dash_msg.reasoning_budget_message.as_deref(),
+        Some("- time up -")
+    );
+    assert!(!dash_msg.reasoning_effort_budget);
+}

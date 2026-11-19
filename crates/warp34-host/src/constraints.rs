@@ -614,6 +614,22 @@ impl TokenBitmaskConstraint {
     pub fn has_pending(&self) -> bool {
         self.pending_token.is_some()
     }
+    /// Returns `true` if the constraint is currently inside its `<think>` reasoning gate
+    /// (accounting for any pending deferred token).
+    pub fn in_reasoning_gate(&self) -> bool {
+        let Some(prefix) = &self.gate else {
+            return false;
+        };
+        if let Some(pending_id) = self.pending_token
+            && let Some(bytes) = usize::try_from(pending_id)
+                .ok()
+                .and_then(|idx| self.bytes.get(idx))
+        {
+            let (_, answer) = gate_token(prefix, bytes, self.implicit_tool);
+            return answer.is_none();
+        }
+        true
+    }
     pub fn is_terminal_eos(&self) -> bool {
         self.terminal
             || self

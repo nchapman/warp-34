@@ -833,3 +833,73 @@ fn claude_code_style_tool_schemas_sanitize_and_compile() {
         json!({"collection": "boards/b1/columns", "data": {"title": "hello"}})
     );
 }
+
+#[test]
+fn thinking_budget_and_xgrammar_named_tool_and_implicit_tool_call() {
+    use warp34_host::tool_constraints::ToolChoice;
+    let tok = tokenizer();
+    let factory = ConstraintFactory::new(&tok, tok.get_vocab_size(true), &[EOS as u32]).unwrap();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "ping",
+            "parameters": {
+                "type": "object",
+                "properties": { "host": { "type": "string" } },
+                "required": ["host"]
+            }
+        }
+    }]);
+
+    let think_id = tok.token_to_id("<think>").unwrap() as i32;
+    let end_think_id = tok.token_to_id("</think>").unwrap() as i32;
+    let tool_call_id = tok.token_to_id("<tool_call>").unwrap() as i32;
+    let a_id = tok.encode("a", false).unwrap().get_ids()[0] as i32;
+    let b_id = tok.encode("b", false).unwrap().get_ids()[0] as i32;
+
+    // 1. Named tool choice + ThinkingBudgetConfig (forcing stops at `</think>` with no trailing `\n`):
+    //    forcing `</think>` must transition cleanly into byte 0 of `<tool_call>` without grammar error.
+    let named_c = factory
+        .tools(&tools, &ToolChoice::Named("ping".into()), true)
+        .unwrap();
+    let cfg = warp34_host::parser::ThinkingBudgetConfig {
+        budget: 1,
+        start_token_ids: vec![think_id],
+        end_token_ids: vec![end_think_id],
+        forced_token_ids: vec![b_id, end_think_id],
+        extra_end_token_ids: vec![vec![tool_call_id]],
+    };
+    let mut sampler = warp34_host::parser::SamplerV1::new(
+        warp34_host::parser::SamplingParams {
+            temperature: 0.0,
+            thinking_budget: Some(cfg.clone()),
+            ..Default::default()
+        },
+        &[think_id],
+        Some(named_c),
+    );
+    sampler.try_commit_token(a_id).unwrap(); // exhausts budget=1
+    assert_eq!(sampler.forced_thinking_token(), Some(b_id));
+    sampler.try_commit_token(b_id).unwrap();
+    assert_eq!(sampler.forced_thinking_token(), Some(end_think_id));
+    sampler.try_commit_token(end_think_id).unwrap(); // exits reasoning gate into ToolChoice::Named
+    assert_eq!(sampler.forced_thinking_token(), None);
+    // Byte 0 of ToolChoice::Named requires `<tool_call>` (must succeed, not crash).
+    sampler.try_commit_token(tool_call_id).unwrap();
+
+    // 2. Implicit `<tool_call>` inside `<think>` exits the reasoning gate & ThinkingBudgetTracker
+    //    so remaining budget never injects cutoff tokens mid-tool-call.
+    let auto_c = factory.tools(&tools, &ToolChoice::Auto, true).unwrap();
+    let mut auto_sampler = warp34_host::parser::SamplerV1::new(
+        warp34_host::parser::SamplingParams {
+            temperature: 0.0,
+            thinking_budget: Some(warp34_host::parser::ThinkingBudgetConfig { budget: 2, ..cfg }),
+            ..Default::default()
+        },
+        &[think_id],
+        Some(auto_c),
+    );
+    auto_sampler.try_commit_token(a_id).unwrap();
+    auto_sampler.try_commit_token(tool_call_id).unwrap(); // implicit </think>
+    assert_eq!(auto_sampler.forced_thinking_token(), None);
+}

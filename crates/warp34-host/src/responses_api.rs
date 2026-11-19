@@ -625,7 +625,10 @@ fn parse_input_items(
                                     text.push_str(t);
                                 }
                             }
-                        } else if let Some(arr) = obj.get("summary").and_then(Value::as_array) {
+                        }
+                        if text.is_empty()
+                            && let Some(arr) = obj.get("summary").and_then(Value::as_array)
+                        {
                             for p in arr {
                                 if let Some(t) = p.get("text").and_then(Value::as_str) {
                                     text.push_str(t);
@@ -633,13 +636,7 @@ fn parse_input_items(
                             }
                         }
                         if !text.is_empty() {
-                            if let Some(last) = turns.last_mut().filter(|m| {
-                                m.get("role").and_then(Value::as_str) == Some("assistant")
-                            }) {
-                                last["reasoning_content"] = json!(text);
-                            } else {
-                                pending_reasoning = Some(text);
-                            }
+                            pending_reasoning = Some(text);
                         }
                     }
                     "function_call" => {
@@ -749,11 +746,45 @@ fn parse_input_items(
                     }
                 }
             }
+            if let Some(r) = pending_reasoning.take() {
+                if let Some(last) = turns
+                    .last_mut()
+                    .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                    && last.get("reasoning_content").is_none()
+                {
+                    last["reasoning_content"] = json!(r);
+                } else {
+                    turns.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": r,
+                    }));
+                }
+            }
             Ok(())
         }
         _ => Err(ResponsesApiError::bad_request(
             "'input' must be a string or non-empty array of input items",
         )),
+    }
+}
+
+fn forward_optional_reasoning_budget_fields(
+    chat_req: &mut Map<String, Value>,
+    obj: &Map<String, Value>,
+) {
+    for key in [
+        "thinking_token_budget",
+        "reasoning_budget_tokens",
+        "thinking_budget_tokens",
+        "reasoning_budget_message",
+        "thinking_budget_message",
+    ] {
+        if !chat_req.contains_key(key)
+            && let Some(val) = obj.get(key).filter(|v| !v.is_null())
+        {
+            chat_req.insert(key.into(), val.clone());
+        }
     }
 }
 
@@ -764,7 +795,7 @@ fn parse_reasoning_and_text_config(
     (
         Option<bool>,
         Option<String>,
-        Option<usize>,
+        Option<i64>,
         Value,
         Option<Value>,
         Value,
@@ -773,7 +804,7 @@ fn parse_reasoning_and_text_config(
 > {
     let mut enable_thinking: Option<bool> = None;
     let mut reasoning_effort: Option<String> = None;
-    let mut reasoning_budget: Option<usize> = None;
+    let mut reasoning_budget: Option<i64> = None;
     let reasoning_echo = if let Some(r_val) = obj.get("reasoning").filter(|v| !v.is_null()) {
         let r_obj = r_val
             .as_object()
@@ -799,17 +830,14 @@ fn parse_reasoning_and_text_config(
             }
         }
         if let Some(max_tok) = r_obj.get("max_tokens").filter(|v| !v.is_null()) {
-            let n = max_tok
-                .as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or_else(|| {
-                    ResponsesApiError::bad_request(
-                        "'reasoning.max_tokens' must be a non-negative integer",
-                    )
-                })?;
+            let n = max_tok.as_i64().filter(|&n| n >= -1).ok_or_else(|| {
+                ResponsesApiError::bad_request(
+                    "'reasoning.max_tokens' must be an integer >= -1 (-1 for unlimited)",
+                )
+            })?;
             reasoning_budget = Some(n);
             if enable_thinking.is_none() {
-                enable_thinking = Some(n > 0);
+                enable_thinking = Some(n != 0);
             }
         }
         json!({
@@ -1118,6 +1146,7 @@ pub fn translate_responses_to_chat(
     if let Some(budget) = reasoning_budget {
         chat_req.insert("thinking_token_budget".into(), json!(budget));
     }
+    forward_optional_reasoning_budget_fields(&mut chat_req, obj);
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),
         Some(v) => v.as_object().cloned().ok_or_else(|| {

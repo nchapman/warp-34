@@ -255,7 +255,7 @@ impl ServeCliConfig {
         })
     }
 
-    fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
+    pub(super) fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
         let flag = args[*i].as_str();
         if flag == "--no-webui" {
             self.used = true;
@@ -272,6 +272,38 @@ impl ServeCliConfig {
             self.options.reasoning_effort_budget = true;
             return Ok(true);
         }
+        if flag == "--reasoning-budget" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .ok_or_else(|| "missing --reasoning-budget value".to_string())?;
+            let parsed: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| "invalid --reasoning-budget".to_string())?;
+            if parsed < -1 {
+                return Err("--reasoning-budget must be >= -1 (-1 for unlimited)".into());
+            }
+            if parsed == -1 {
+                self.options.reasoning_budget = None;
+                self.options.reasoning_effort_budget = false;
+            } else {
+                self.options.reasoning_budget =
+                    Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
+            }
+            return Ok(true);
+        }
+        if flag == "--reasoning-budget-message" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| "missing --reasoning-budget-message value".to_string())?;
+            self.options.reasoning_budget_message = Some(value);
+            return Ok(true);
+        }
         if !matches!(
             flag,
             "--api-key"
@@ -285,8 +317,6 @@ impl ServeCliConfig {
                 | "-np"
                 | "--max-model-len"
                 | "--reasoning-effort"
-                | "--reasoning-budget"
-                | "--reasoning-budget-message"
         ) {
             if matches!(
                 flag,
@@ -354,28 +384,12 @@ impl ServeCliConfig {
                 crate::server::validate_reasoning_effort(&value)?;
                 self.options.reasoning_effort = Some(value);
             }
-            "--reasoning-budget" => {
-                let parsed: i64 = value.parse().map_err(|_| "invalid --reasoning-budget")?;
-                if parsed < -1 {
-                    return Err("--reasoning-budget must be >= -1 (-1 for unlimited)".into());
-                }
-                if parsed == -1 {
-                    self.options.reasoning_budget = None;
-                    self.options.reasoning_effort_budget = false;
-                } else {
-                    self.options.reasoning_budget =
-                        Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
-                }
-            }
-            "--reasoning-budget-message" => {
-                self.options.reasoning_budget_message = Some(value);
-            }
             _ => unreachable!(),
         }
         Ok(true)
     }
 
-    fn validate(&self, sub: &str) -> Result<(), String> {
+    pub(super) fn validate(&self, sub: &str) -> Result<(), String> {
         if sub != "serve" && self.used {
             return Err(
                 "API key, webui, served model name and admission options require serve".into(),

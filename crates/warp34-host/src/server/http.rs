@@ -106,9 +106,20 @@ impl OpenAiServerState {
         worker: EngineWorker,
         allow_remote_images: bool,
     ) -> Arc<Self> {
-        let eos: Vec<_> = worker.eos_token_ids.iter().map(|&id| id as u32).collect();
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
-            crate::constraints::ConstraintFactory::new(t, worker.vocab_size, &eos).ok()
+            let eos: Vec<u32> = worker
+                .eos_token_ids
+                .iter()
+                .filter_map(|&id| u32::try_from(id).ok())
+                .filter(|&id| t.id_to_token(id).is_some())
+                .collect();
+            match crate::constraints::ConstraintFactory::new(t, worker.vocab_size, &eos) {
+                Ok(factory) => Some(factory),
+                Err(err) => {
+                    eprintln!("warning: structured output constraints disabled: {err}");
+                    None
+                }
+            }
         });
         let decoded_vocab = if worker.tokenizer.is_some() {
             (0..worker.vocab_size)
@@ -596,6 +607,113 @@ impl Prepared {
     }
 }
 
+fn build_thinking_budget_config(
+    s: &OpenAiServerState,
+    request: &Value,
+    tokenizer: &tokenizers::Tokenizer,
+    per_request_effort: Option<&str>,
+    resolved_effort: Option<&str>,
+    max_tokens: usize,
+    has_tools: bool,
+) -> Result<Option<crate::parser::ThinkingBudgetConfig>, PrepareError> {
+    let (budget_kind, budget_msg) = super::resolve_chat_reasoning_budget(
+        request,
+        s.default_reasoning_budget,
+        s.default_reasoning_budget_message.as_deref(),
+    )?;
+    let (effective_budget, is_effort_derived) = match budget_kind {
+        super::ResolvedReasoningBudget::PerRequestExplicit(n) => (Some(n), false),
+        super::ResolvedReasoningBudget::Unlimited => (None, false),
+        super::ResolvedReasoningBudget::ServerDefault(_)
+            if per_request_effort.is_some() && s.reasoning_effort_budget =>
+        {
+            (
+                super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+                true,
+            )
+        }
+        super::ResolvedReasoningBudget::ServerDefault(n) => (Some(n), false),
+        super::ResolvedReasoningBudget::Default if s.reasoning_effort_budget => (
+            super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+            true,
+        ),
+        super::ResolvedReasoningBudget::Default => (None, false),
+    };
+    let Some(mut budget) = effective_budget else {
+        return Ok(None);
+    };
+    let enc = |text: &str| -> Result<Vec<i32>, String> {
+        Ok(tokenizer
+            .encode(text, false)
+            .map_err(|e| e.to_string())?
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect())
+    };
+    let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
+        if let Some(id) = tokenizer.token_to_id(tag) {
+            Ok(vec![id as i32])
+        } else {
+            enc(tag)
+        }
+    };
+    let start_token_ids = tag_ids("<think>")?;
+    let end_token_ids = tag_ids("</think>")?;
+    let explicit_custom_msg = budget_msg.is_some();
+    let mut forced_token_ids = Vec::new();
+    // Skip the default transition line when budget == 0 (immediate close) unless
+    // the caller explicitly configured a custom message.
+    let effective_msg = match budget_msg.as_deref() {
+        Some(m) => m,
+        None if budget == 0 => "",
+        None => super::DEFAULT_REASONING_BUDGET_MESSAGE,
+    };
+    if !effective_msg.is_empty() {
+        forced_token_ids.extend(enc(effective_msg)?);
+    }
+    // Stop forcing at `</think>` (do not append `\n`) so XGrammar structured
+    // outputs and tool grammars control byte 0 of the answer cleanly.
+    forced_token_ids.extend_from_slice(&end_token_ids);
+    if start_token_ids.is_empty() || end_token_ids.is_empty() || forced_token_ids.is_empty() {
+        return Err(
+            "tokenizer cannot encode <think>/</think> tags required for thinking budget".into(),
+        );
+    }
+    // Reserve headroom for forced closing tokens + at least 1 answer token so
+    // small `max_tokens` requests never truncate mid-transition before `</think>`.
+    if budget
+        .saturating_add(forced_token_ids.len())
+        .saturating_add(1)
+        > max_tokens
+    {
+        if is_effort_derived {
+            if max_tokens > forced_token_ids.len() + 1 {
+                budget = max_tokens - forced_token_ids.len() - 1;
+            } else {
+                forced_token_ids.clone_from(&end_token_ids);
+                budget = max_tokens.saturating_sub(forced_token_ids.len() + 1);
+            }
+        } else if !explicit_custom_msg {
+            forced_token_ids.clone_from(&end_token_ids);
+        }
+    }
+    let mut extra_end_token_ids = Vec::new();
+    if has_tools
+        && let Ok(tool_ids) = tag_ids("<tool_call>")
+        && !tool_ids.is_empty()
+    {
+        extra_end_token_ids.push(tool_ids);
+    }
+    Ok(Some(crate::parser::ThinkingBudgetConfig {
+        budget,
+        start_token_ids,
+        end_token_ids,
+        forced_token_ids,
+        extra_end_token_ids,
+    }))
+}
+
 fn prepare(
     s: &OpenAiServerState,
     request: Value,
@@ -654,12 +772,16 @@ fn prepare(
     {
         return Err("stop_token_ids/logit_bias token outside model vocabulary".into());
     }
+    let per_request_effort = if chat {
+        super::request_explicit_reasoning_effort(&request)?
+    } else {
+        None
+    };
     let (thinking, resolved_effort) = if chat {
         super::resolve_chat_reasoning_config(&request, s.default_reasoning_effort.as_deref())?
     } else {
         (false, None)
     };
-    params.enable_thinking = thinking;
     let (prompt, images, messages_count, tools_count, enable_thinking) = if chat {
         let (messages, images) = super::parse_openai_messages_with_vision_config(
             request.get("messages").ok_or("missing messages")?,
@@ -677,6 +799,8 @@ fn prepare(
         template_kwargs.insert("enable_thinking".into(), Value::Bool(thinking));
         if let Some(ref effort) = resolved_effort {
             template_kwargs.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        } else {
+            template_kwargs.remove("reasoning_effort");
         }
         let active_tools = request
             .get("tools")
@@ -687,12 +811,13 @@ fn prepare(
             s.worker
                 .chat_template
                 .render(&messages, active_tools, true, &template_kwargs)?;
+        let effective_thinking = thinking && !rendered.trim_end().ends_with("</think>");
         (
             rendered,
             images,
             Some(msg_cnt),
             Some(tool_cnt),
-            Some(thinking),
+            Some(effective_thinking),
         )
     } else {
         (
@@ -707,6 +832,8 @@ fn prepare(
             None,
         )
     };
+    let thinking = enable_thinking.unwrap_or(false);
+    params.enable_thinking = thinking;
     let tokenizer = s.worker.tokenizer.as_ref().ok_or("tokenizer unavailable")?;
     let prompt: Vec<i32> = tokenizer
         .encode(prompt, false)
@@ -744,66 +871,15 @@ fn prepare(
             return Err("min_tokens exceeds max_tokens".into());
         }
         if chat && thinking {
-            let (budget_kind, budget_msg) = super::resolve_chat_reasoning_budget(
+            params.thinking_budget = build_thinking_budget_config(
+                s,
                 &request,
-                s.default_reasoning_budget,
-                s.default_reasoning_budget_message.as_deref(),
+                tokenizer,
+                per_request_effort.as_deref(),
+                resolved_effort.as_deref(),
+                params.max_tokens,
+                tools_count.unwrap_or(0) > 0,
             )?;
-            let effective_budget = match budget_kind {
-                super::ResolvedReasoningBudget::Explicit(n) => Some(n),
-                super::ResolvedReasoningBudget::Unlimited => None,
-                super::ResolvedReasoningBudget::Default if s.reasoning_effort_budget => {
-                    super::compute_effort_reasoning_budget(
-                        resolved_effort.as_deref(),
-                        params.max_tokens,
-                    )
-                }
-                super::ResolvedReasoningBudget::Default => None,
-            };
-            if let Some(budget) = effective_budget {
-                let enc = |text: &str| -> Result<Vec<i32>, String> {
-                    Ok(tokenizer
-                        .encode(text, false)
-                        .map_err(|e| e.to_string())?
-                        .get_ids()
-                        .iter()
-                        .map(|&id| id as i32)
-                        .collect())
-                };
-                let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
-                    if let Some(id) = tokenizer.token_to_id(tag) {
-                        Ok(vec![id as i32])
-                    } else {
-                        enc(tag)
-                    }
-                };
-                let start_token_ids = tag_ids("<think>")?;
-                let end_token_ids = tag_ids("</think>")?;
-                let mut forced_token_ids = Vec::new();
-                let effective_msg = budget_msg
-                    .as_deref()
-                    .unwrap_or(super::DEFAULT_REASONING_BUDGET_MESSAGE);
-                if !effective_msg.is_empty() {
-                    forced_token_ids.extend(enc(effective_msg)?);
-                }
-                forced_token_ids.extend_from_slice(&end_token_ids);
-                forced_token_ids.extend(enc("\n")?);
-                if start_token_ids.is_empty()
-                    || end_token_ids.is_empty()
-                    || forced_token_ids.is_empty()
-                {
-                    return Err(
-                        "tokenizer cannot encode <think>/</think> tags required for thinking budget"
-                            .into(),
-                    );
-                }
-                params.thinking_budget = Some(crate::parser::ThinkingBudgetConfig {
-                    budget,
-                    start_token_ids,
-                    end_token_ids,
-                    forced_token_ids,
-                });
-            }
         }
     }
     let constraint = if mode == PrepareMode::Generate {

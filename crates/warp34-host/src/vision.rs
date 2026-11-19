@@ -163,9 +163,12 @@ impl VisionPreprocessorConfig {
             .or_else(|| obj.get("max_pixels"))
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
-            .filter(|&n| n >= self.min_pixels)
+            .filter(|&n| n > 0)
         {
             self.max_pixels = max_p;
+            if self.min_pixels > max_p {
+                self.min_pixels = max_p;
+            }
         }
         if let Some(ps) = obj
             .get("patch_size")

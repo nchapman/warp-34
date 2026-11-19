@@ -39,6 +39,9 @@ impl PreparedSpecSamplerRows {
                     .constraint
                     .as_ref()
                     .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(draft_id))
+                || hypothetical
+                    .forced_thinking_token()
+                    .is_some_and(|forced| forced != draft_id)
             {
                 break;
             }

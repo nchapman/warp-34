@@ -54,10 +54,10 @@ impl Default for ServeOptions {
 /// percentages so omitted `max_tokens` on 262K contexts stays bounded and effort levels remain distinct.
 pub const DEFAULT_MAX_REASONING_BUDGET_TOKENS: usize = 32_768;
 
-/// Default transition line injected right before `</think>\n` when a thinking budget is exhausted
-/// (Qwen3/3.5/3.8 native budget-forcing prompt). Overridable via `--reasoning-budget-message`
-/// (pass `""` for bare `</think>\n`).
-pub const DEFAULT_REASONING_BUDGET_MESSAGE: &str = "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
+/// Default transition line injected right before `</think>` when a thinking budget is exhausted.
+/// Overridable via `--reasoning-budget-message` (pass `""` for bare `</think>`).
+pub const DEFAULT_REASONING_BUDGET_MESSAGE: &str =
+    "\nI've hit my thinking limit. I'll move forward with the solution now.\n";
 
 /// OpenRouter-compatible `reasoning_effort` -> thinking budget fraction of `max_tokens`.
 pub fn reasoning_effort_budget_ratio(effort: &str) -> Option<f64> {
@@ -88,8 +88,10 @@ pub fn compute_effort_reasoning_budget(effort: Option<&str>, max_tokens: usize) 
 /// Explicit vs default thinking-budget resolution for a chat request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedReasoningBudget {
-    /// Explicit token limit from per-request field or `--reasoning-budget`.
-    Explicit(usize),
+    /// Explicit token limit from a per-request field (`thinking.budget_tokens`, `thinking_token_budget`, etc.).
+    PerRequestExplicit(usize),
+    /// Explicit server-default token limit from `--reasoning-budget <n>`.
+    ServerDefault(usize),
     /// Request explicitly opted out of any thinking cap (`-1`).
     Unlimited,
     /// Neither request nor server specified an explicit token limit; caller may apply
@@ -487,37 +489,52 @@ pub fn native_sampling_params_with_defaults(
     Ok(params)
 }
 
-/// Resolves `(enable_thinking, reasoning_effort)` for chat requests from
-/// `chat_template_kwargs`, top-level `reasoning_effort`, OpenRouter-style `reasoning.effort`,
-/// and an optional server default (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
-pub fn resolve_chat_reasoning_config(
+/// Extracts a per-request `reasoning_effort` if explicitly supplied by the caller
+/// (`reasoning_effort`, `reasoning.effort`, or `chat_template_kwargs.reasoning_effort`).
+pub fn request_explicit_reasoning_effort(
     req: &serde_json::Value,
-    default_effort: Option<&str>,
-) -> Result<(bool, Option<String>), String> {
-    let raw_effort = if let Some(v) = req.get("reasoning_effort").filter(|v| !v.is_null()) {
-        Some(
+) -> Result<Option<String>, String> {
+    if let Some(v) = req.get("reasoning_effort").filter(|v| !v.is_null()) {
+        Ok(Some(
             v.as_str()
                 .ok_or("reasoning_effort must be a string")?
                 .to_owned(),
-        )
+        ))
     } else if let Some(v) = req.pointer("/reasoning/effort").filter(|v| !v.is_null()) {
-        Some(
+        Ok(Some(
             v.as_str()
                 .ok_or("reasoning.effort must be a string")?
                 .to_owned(),
-        )
+        ))
     } else if let Some(v) = req
         .pointer("/chat_template_kwargs/reasoning_effort")
         .filter(|v| !v.is_null())
     {
-        Some(
+        Ok(Some(
             v.as_str()
                 .ok_or("chat_template_kwargs.reasoning_effort must be a string")?
                 .to_owned(),
-        )
+        ))
     } else {
-        default_effort.map(str::to_owned)
-    };
+        Ok(None)
+    }
+}
+
+/// Resolves `(enable_thinking, reasoning_effort)` for chat requests from
+/// `chat_template_kwargs`, top-level `reasoning_effort`, OpenRouter-style `reasoning.effort`,
+/// and an optional server default (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+///
+/// Guarantees template/parser consistency: when `enable_thinking` is explicitly `true` while
+/// effort resolved to `"none"` (e.g., server `--reasoning-effort none` + Anthropic
+/// `thinking: {"type": "adaptive"}`), `reasoning_effort` is cleared to `None` so Jinja does not
+/// close `<think>` while the parser expects open thinking; conversely, when `enable_thinking` is
+/// `false`, any non-`"none"` effort is cleared so custom templates cannot re-enable thinking.
+pub fn resolve_chat_reasoning_config(
+    req: &serde_json::Value,
+    default_effort: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
+    let mut raw_effort =
+        request_explicit_reasoning_effort(req)?.or_else(|| default_effort.map(str::to_owned));
 
     if let Some(ref eff) = raw_effort {
         validate_reasoning_effort(eff)?;
@@ -533,6 +550,12 @@ pub fn resolve_chat_reasoning_config(
         raw_effort.as_deref() != Some("none")
     };
 
+    if (enable_thinking && raw_effort.as_deref() == Some("none"))
+        || (!enable_thinking && raw_effort.as_deref() != Some("none"))
+    {
+        raw_effort = None;
+    }
+
     Ok((enable_thinking, raw_effort))
 }
 
@@ -546,9 +569,9 @@ pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, Str
 /// OpenAI (`thinking_token_budget`, `reasoning_budget_tokens`, `thinking_budget_tokens`,
 /// `reasoning.max_tokens`) with fallback to server defaults.
 ///
-/// When `budget` resolves to `ResolvedReasoningBudget::Default`, the caller may derive a
-/// percentage-based cap via [`compute_effort_reasoning_budget`] if `reasoning_effort_budget`
-/// is enabled. When `message` is `None`, callers fall back to [`DEFAULT_REASONING_BUDGET_MESSAGE`].
+/// Precedence is handled cleanly by returning `PerRequestExplicit` vs `ServerDefault` vs
+/// `Unlimited` vs `Default`. When `message` is `None`, callers fall back to
+/// [`DEFAULT_REASONING_BUDGET_MESSAGE`] (except when `budget == 0` or headroom is too tight).
 pub fn resolve_chat_reasoning_budget(
     req: &serde_json::Value,
     default_budget: Option<usize>,
@@ -563,7 +586,7 @@ pub fn resolve_chat_reasoning_budget(
 
     let budget = match budget_val {
         None => match default_budget {
-            Some(n) => ResolvedReasoningBudget::Explicit(n),
+            Some(n) => ResolvedReasoningBudget::ServerDefault(n),
             None => ResolvedReasoningBudget::Default,
         },
         Some(v) => {
@@ -576,7 +599,7 @@ pub fn resolve_chat_reasoning_budget(
             if n == -1 {
                 ResolvedReasoningBudget::Unlimited
             } else {
-                ResolvedReasoningBudget::Explicit(
+                ResolvedReasoningBudget::PerRequestExplicit(
                     usize::try_from(n).map_err(|_| "thinking_token_budget out of range")?,
                 )
             }
@@ -841,9 +864,13 @@ mod tests {
             )
             .unwrap(),
             (
-                ResolvedReasoningBudget::Explicit(2048),
+                ResolvedReasoningBudget::PerRequestExplicit(2048),
                 Some("Time is up.".to_string())
             )
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(&serde_json::json!({}), Some(4096), None).unwrap(),
+            (ResolvedReasoningBudget::ServerDefault(4096), None)
         );
         assert_eq!(
             resolve_chat_reasoning_budget(
@@ -858,12 +885,33 @@ mod tests {
             resolve_chat_reasoning_budget(&serde_json::json!({}), None, None).unwrap(),
             (ResolvedReasoningBudget::Default, None)
         );
-        assert!(
-            resolve_chat_enable_thinking(&serde_json::json!({
-                "reasoning_effort": "none",
-                "chat_template_kwargs": {"enable_thinking": true}
-            }))
-            .unwrap()
+        // enable_thinking=true + effort="none" clears effort to None so Jinja & parser stay synced
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({
+                    "reasoning_effort": "none",
+                    "chat_template_kwargs": {"enable_thinking": true}
+                }),
+                None
+            )
+            .unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}),
+                Some("none")
+            )
+            .unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                Some("high")
+            )
+            .unwrap(),
+            (false, None)
         );
         assert!(
             resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "bogus"}))

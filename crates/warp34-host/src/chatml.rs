@@ -278,6 +278,8 @@ impl ChatTemplate {
             .or_insert_with(|| Value::String(self.eos_token.clone()));
         if let Some(t) = tools.filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
             ctx.insert("tools".into(), t.clone());
+        } else {
+            ctx.remove("tools");
         }
         let tmpl = self
             .env
