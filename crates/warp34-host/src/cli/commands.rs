@@ -961,13 +961,15 @@ pub(crate) fn run_serve(
                     .and_then(|n| n.to_str())
                     .and_then(|n| n.strip_prefix("models--"))
                     .and_then(|s| s.split_once("--"))
-                    .map(|(org, name)| format!("{org}/{name}"))
-                    .unwrap_or_else(|| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(draft)
-                            .to_string()
-                    });
+                    .map_or_else(
+                        || {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(draft)
+                                .to_string()
+                        },
+                        |(org, name)| format!("{org}/{name}"),
+                    );
                 format!("dflash2 ({draft_short})")
             } else {
                 "dflash2".to_string()
