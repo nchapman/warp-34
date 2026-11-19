@@ -1119,6 +1119,7 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         post_load_free_vram_bytes: 467 * 1024 * 1024,
         kv_policy: KvFormatPolicy::Tq4All,
         supports_fp8_kv: false,
+        kv_compression_ratio: 3.88,
         kv_policy_explicit: false,
         kv_policy_auto_adjusted: true,
         kv_pages: 16_384,
@@ -1150,6 +1151,7 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         sampling_from_generation_config: true,
         chat_template_source: "chat_template.jinja".to_string(),
         preserve_thinking: true,
+        default_reasoning_effort: None,
         reasoning_effort_budget: true,
         default_reasoning_budget: None,
         default_reasoning_budget_message: None,
@@ -1192,6 +1194,7 @@ fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
         post_load_free_vram_bytes: 1024 * 1024 * 1024,
         kv_policy: KvFormatPolicy::Tq4,
         supports_fp8_kv: false,
+        kv_compression_ratio: 2.53,
         kv_policy_explicit: false,
         kv_policy_auto_adjusted: false,
         kv_pages: 16_384,
@@ -1218,6 +1221,7 @@ fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
         sampling_from_generation_config: false,
         chat_template_source: "tokenizer_config.json".to_string(),
         preserve_thinking: false,
+        default_reasoning_effort: Some("high".to_string()),
         reasoning_effort_budget: true,
         default_reasoning_budget: None,
         default_reasoning_budget_message: None,
@@ -1226,13 +1230,23 @@ fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
     };
     let banner_sm86 = super::commands::format_serve_boot_banner(&summary);
     assert!(banner_sm86.contains("  LoRA         : sql-expert\n"));
-    assert!(banner_sm86.contains("tq4 (3.07x, rotated TQ4 + Q8_0 tail) [auto]"));
+    assert!(banner_sm86.contains("Thinking     : effort=high [configured], effort-budget=on"));
+    assert!(banner_sm86.contains("tq4 (2.53x, rotated TQ4 + Q8_0 tail) [auto]"));
 
     summary.supports_fp8_kv = true;
+    summary.kv_compression_ratio = 3.10;
     summary.lora_adapters.push("code-review".to_string());
     let banner_sm89 = super::commands::format_serve_boot_banner(&summary);
     assert!(banner_sm89.contains("  LoRA         : sql-expert, code-review (2 adapters)\n"));
     assert!(banner_sm89.contains("tq4 (3.10x, rotated TQ4 + FP8 tail) [auto]"));
+
+    summary.kv_policy = KvFormatPolicy::Fp16;
+    summary.kv_policy_auto_adjusted = true;
+    let banner_fp16_fallback = super::commands::format_serve_boot_banner(&summary);
+    assert!(
+        banner_fp16_fallback
+            .contains("fp16 (1.00x, 512B/row) [auto: fp16 fallback for non-256 head_dim]")
+    );
 }
 
 #[cfg(feature = "cuda")]

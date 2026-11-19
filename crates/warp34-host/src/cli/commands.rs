@@ -733,6 +733,7 @@ pub(crate) struct ServeBootSummary {
     pub(crate) post_load_free_vram_bytes: usize,
     pub(crate) kv_policy: KvFormatPolicy,
     pub(crate) supports_fp8_kv: bool,
+    pub(crate) kv_compression_ratio: f64,
     pub(crate) kv_policy_explicit: bool,
     pub(crate) kv_policy_auto_adjusted: bool,
     pub(crate) kv_pages: usize,
@@ -759,6 +760,7 @@ pub(crate) struct ServeBootSummary {
     pub(crate) sampling_from_generation_config: bool,
     pub(crate) chat_template_source: String,
     pub(crate) preserve_thinking: bool,
+    pub(crate) default_reasoning_effort: Option<String>,
     pub(crate) reasoning_effort_budget: bool,
     pub(crate) default_reasoning_budget: Option<usize>,
     pub(crate) default_reasoning_budget_message: Option<String>,
@@ -768,10 +770,12 @@ pub(crate) struct ServeBootSummary {
 
 #[cfg(feature = "cuda")]
 fn format_thinking_banner_line(
+    default_effort: Option<&str>,
     effort_budget: bool,
     default_budget: Option<usize>,
     default_message: Option<&str>,
 ) -> String {
+    let effort_prefix = default_effort.map(|e| format!("effort={e} [configured], "));
     let effort = if effort_budget {
         format!(
             "effort-budget=on (ceil={})",
@@ -805,7 +809,10 @@ fn format_thinking_banner_line(
         }
         None => "cutoff=none".to_string(),
     };
-    format!("{effort}, {budget}, {cutoff}")
+    format!(
+        "{}{effort}, {budget}, {cutoff}",
+        effort_prefix.unwrap_or_default()
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -848,16 +855,30 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
     let gib = 1024.0 * 1024.0 * 1024.0;
     let mib = 1024.0 * 1024.0;
     let kv_desc = match s.kv_policy {
-        KvFormatPolicy::Tq4 if s.supports_fp8_kv => "tq4 (3.10x, rotated TQ4 + FP8 tail)",
-        KvFormatPolicy::Tq4 => "tq4 (3.07x, rotated TQ4 + Q8_0 tail)",
-        KvFormatPolicy::Tq4All => "tq4_all (3.88x, 132B/row TQ4 all attention layers)",
-        KvFormatPolicy::Fp8 => "fp8 (1.94x, 264B/row hardware E4M3)",
-        KvFormatPolicy::Q8_0 => "q8_0 (1.88x, 272B/row)",
-        KvFormatPolicy::Fp16 => "fp16 (1.00x, 512B/row)",
-        KvFormatPolicy::Bf16 => "bf16 (1.00x, 512B/row)",
+        KvFormatPolicy::Tq4 if s.supports_fp8_kv => {
+            format!(
+                "tq4 ({:.2}x, rotated TQ4 + FP8 tail)",
+                s.kv_compression_ratio
+            )
+        }
+        KvFormatPolicy::Tq4 => {
+            format!(
+                "tq4 ({:.2}x, rotated TQ4 + Q8_0 tail)",
+                s.kv_compression_ratio
+            )
+        }
+        KvFormatPolicy::Tq4All => "tq4_all (3.88x, 132B/row TQ4 all attention layers)".to_string(),
+        KvFormatPolicy::Fp8 => "fp8 (1.94x, 264B/row hardware E4M3)".to_string(),
+        KvFormatPolicy::Q8_0 => "q8_0 (1.88x, 272B/row)".to_string(),
+        KvFormatPolicy::Fp16 => "fp16 (1.00x, 512B/row)".to_string(),
+        KvFormatPolicy::Bf16 => "bf16 (1.00x, 512B/row)".to_string(),
     };
     let kv_mode_tag = if s.kv_policy_auto_adjusted {
-        "[auto: stepped down from tq4 to fit full context]"
+        if s.kv_policy == KvFormatPolicy::Fp16 {
+            "[auto: fp16 fallback for non-256 head_dim]"
+        } else {
+            "[auto: stepped down from tq4 to fit full context]"
+        }
     } else if s.kv_policy_explicit {
         "[configured]"
     } else {
@@ -905,6 +926,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.sampling_from_generation_config,
     );
     let thinking_line = format_thinking_banner_line(
+        s.default_reasoning_effort.as_deref(),
         s.reasoning_effort_budget,
         s.default_reasoning_budget,
         s.default_reasoning_budget_message.as_deref(),
@@ -1106,6 +1128,17 @@ pub(crate) fn run_serve(
                     selected_kv_policy,
                     supports_fp8,
                 );
+                let (fp16_page_bytes, _) = crate::model::Qwen3_5ModelRank::pool_geometry(
+                    &engine.cfg,
+                    tp,
+                    KvFormatPolicy::Fp16,
+                    false,
+                );
+                let kv_compression_ratio = if page_bytes > 0 {
+                    fp16_page_bytes as f64 / page_bytes as f64
+                } else {
+                    1.0
+                };
                 let max_model_ctx = fit.map_or_else(
                     || engine.cfg.max_position_embeddings.unwrap_or(262_144),
                     |f| f.max_model_context_tokens,
@@ -1126,6 +1159,7 @@ pub(crate) fn run_serve(
                         post_load_free_vram_bytes: post_free,
                         kv_policy: selected_kv_policy,
                         supports_fp8_kv: supports_fp8,
+                        kv_compression_ratio,
                         kv_policy_explicit: explicit_kv_format,
                         kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
                         kv_pages: r0.kv_pool.num_pages,
@@ -1167,6 +1201,7 @@ pub(crate) fn run_serve(
                             .is_file(),
                         chat_template_source: String::new(),
                         preserve_thinking: false,
+                        default_reasoning_effort: None,
                         reasoning_effort_budget: false,
                         default_reasoning_budget: None,
                         default_reasoning_budget_message: None,
@@ -1197,6 +1232,9 @@ pub(crate) fn run_serve(
         summary.default_sampling_params = state.worker.default_sampling_params.clone();
         summary.chat_template_source = state.worker.chat_template.source_name().to_string();
         summary.preserve_thinking = state.worker.default_preserve_thinking;
+        summary
+            .default_reasoning_effort
+            .clone_from(&state.default_reasoning_effort);
         summary.reasoning_effort_budget = state.reasoning_effort_budget;
         summary.default_reasoning_budget = state.default_reasoning_budget;
         summary
