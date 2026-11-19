@@ -79,7 +79,7 @@ fn system_and_tools_include_native_qwen_instructions() {
     let prompt = format_chatml_prompt(&messages, Some(&tools), false);
     assert!(prompt.starts_with("<|im_start|>system\n# Tools\n\n"));
     assert!(prompt.contains("<function=example_function_name>"));
-    assert!(prompt.contains("Required parameters MUST be specified"));
+    assert!(prompt.contains("Function calls MUST follow the specified format"));
     assert!(prompt.contains("</IMPORTANT>\n\nBe precise.<|im_end|>\n"));
     assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
 }

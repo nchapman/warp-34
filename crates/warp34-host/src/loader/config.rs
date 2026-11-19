@@ -214,6 +214,7 @@ pub struct ModelConfig {
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
     pub output_gate_type: String,
+    pub vision_preprocessor: crate::vision::VisionPreprocessorConfig,
 }
 
 impl ModelConfig {
@@ -225,6 +226,45 @@ impl ModelConfig {
         // This is the target-model loader. Drafter callers explicitly opt into
         // windowed attention through from_drafter_json, never artifact metadata.
         let mut cfg = Self::from_json(&root)?;
+        let gen_path = dir.join("generation_config.json");
+        if gen_path.is_file() {
+            let gen_text = fs::read_to_string(&gen_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read {}: {e}", gen_path.display()),
+                )
+            })?;
+            let gen_json: Json = serde_json::from_str(&gen_text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad {}: {e}", gen_path.display()),
+                )
+            })?;
+            if let Some(eos) = gen_json.get("eos_token_id") {
+                let mut push_eos = |id: i64| {
+                    if let Ok(tid) = i32::try_from(id)
+                        && tid >= 0
+                        && (tid as usize) < cfg.vocab_size
+                        && !cfg.eos_token_ids.contains(&tid)
+                    {
+                        cfg.eos_token_ids.push(tid);
+                    }
+                };
+                if let Some(id) = eos.as_i64() {
+                    push_eos(id);
+                } else if let Some(arr) = eos.as_array() {
+                    for x in arr {
+                        if let Some(id) = x.as_i64() {
+                            push_eos(id);
+                        }
+                    }
+                }
+            }
+        }
+        cfg.vision_preprocessor = crate::vision::VisionPreprocessorConfig::from_model_dir(
+            dir,
+            cfg.vision_config.as_ref(),
+        );
         let tc = root.get("text_config").unwrap_or(&root);
         if root.get("quantization_config").is_none_or(Json::is_null)
             && tc.get("quantization_config").is_none_or(Json::is_null)
@@ -1039,6 +1079,7 @@ impl ModelConfig {
             indexer_budget,
             indexer_compress_ratio,
             output_gate_type,
+            vision_preprocessor: crate::vision::VisionPreprocessorConfig::default(),
         })
     }
 

@@ -64,6 +64,137 @@ pub struct VisionConfig {
     pub vision_end_token_id: i32,
 }
 
+/// Image preprocessing parameters loaded from `preprocessor_config.json` or
+/// `processor_config.json["image_processor"]`, with Qwen3-VL defaults as fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionPreprocessorConfig {
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub rescale_factor: f32,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub patch_size: usize,
+    pub temporal_patch_size: usize,
+    pub spatial_merge_size: usize,
+}
+
+impl Default for VisionPreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            rescale_factor: 1.0 / 255.0,
+            min_pixels: 65_536,
+            max_pixels: 16_777_216,
+            patch_size: default_patch_size(),
+            temporal_patch_size: default_temporal_patch_size(),
+            spatial_merge_size: default_spatial_merge_size(),
+        }
+    }
+}
+
+impl VisionPreprocessorConfig {
+    /// Loads vision preprocessing parameters from a model directory (`preprocessor_config.json`,
+    /// falling back to `processor_config.json["image_processor"]`, then `vision_cfg` / Qwen defaults).
+    pub fn from_model_dir(model_dir: &std::path::Path, vision_cfg: Option<&VisionConfig>) -> Self {
+        let mut cfg = Self::default();
+        if let Some(vc) = vision_cfg {
+            cfg.patch_size = vc.patch_size;
+            cfg.temporal_patch_size = vc.temporal_patch_size;
+            cfg.spatial_merge_size = vc.spatial_merge_size;
+        }
+        let doc = std::fs::read_to_string(model_dir.join("preprocessor_config.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .or_else(|| {
+                let text = std::fs::read_to_string(model_dir.join("processor_config.json")).ok()?;
+                let root = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+                root.get("image_processor").cloned()
+            });
+        if let Some(obj) = doc.as_ref().and_then(serde_json::Value::as_object) {
+            cfg.apply_json_object(obj);
+        }
+        cfg
+    }
+
+    fn apply_json_object(&mut self, obj: &serde_json::Map<String, serde_json::Value>) {
+        let parse_rgb = |key: &str| -> Option<[f32; 3]> {
+            let arr = obj.get(key)?.as_array()?;
+            if arr.len() != 3 {
+                return None;
+            }
+            let out = [
+                arr[0].as_f64()? as f32,
+                arr[1].as_f64()? as f32,
+                arr[2].as_f64()? as f32,
+            ];
+            out.iter().all(|v| v.is_finite()).then_some(out)
+        };
+        if let Some(mean) = parse_rgb("image_mean") {
+            self.image_mean = mean;
+        }
+        if let Some(std) = parse_rgb("image_std")
+            && std.iter().all(|&s| s > 0.0)
+        {
+            self.image_std = std;
+        }
+        if let Some(rf) = obj
+            .get("rescale_factor")
+            .and_then(serde_json::Value::as_f64)
+        {
+            let rf = rf as f32;
+            if rf.is_finite() && rf > 0.0 {
+                self.rescale_factor = rf;
+            }
+        }
+        if let Some(min_p) = obj
+            .get("size")
+            .and_then(|s| s.get("shortest_edge"))
+            .or_else(|| obj.get("min_pixels"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        {
+            self.min_pixels = min_p;
+        }
+        if let Some(max_p) = obj
+            .get("size")
+            .and_then(|s| s.get("longest_edge"))
+            .or_else(|| obj.get("max_pixels"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n >= self.min_pixels)
+        {
+            self.max_pixels = max_p;
+        }
+        if let Some(ps) = obj
+            .get("patch_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        {
+            self.patch_size = ps;
+        }
+        if let Some(tps) = obj
+            .get("temporal_patch_size")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        {
+            self.temporal_patch_size = tps;
+        }
+        if let Some(ms) = obj
+            .get("merge_size")
+            .or_else(|| obj.get("spatial_merge_size"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+        {
+            self.spatial_merge_size = ms;
+        }
+    }
+}
+
 fn default_depth() -> usize {
     24
 }
@@ -230,6 +361,30 @@ fn fnv1a_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// Resizes an `[H, W, 3]` RGB `u8` image via `smart_resize` + bicubic interpolation,
+/// normalizes with `cfg.image_mean` / `cfg.image_std` / `cfg.rescale_factor`, duplicates across
+/// `cfg.temporal_patch_size`, and extracts `[N_patches, patch_dim]` in merge-grouped order.
+pub fn preprocess_rgb_image_with_config(
+    rgb: &[u8],
+    height: usize,
+    width: usize,
+    cfg: &VisionPreprocessorConfig,
+) -> PreprocessedImage {
+    preprocess_rgb_image_inner(
+        rgb,
+        height,
+        width,
+        cfg.patch_size,
+        cfg.temporal_patch_size,
+        cfg.spatial_merge_size,
+        cfg.min_pixels,
+        cfg.max_pixels,
+        cfg.image_mean,
+        cfg.image_std,
+        cfg.rescale_factor,
+    )
+}
+
+/// Resizes an `[H, W, 3]` RGB `u8` image via `smart_resize` + bicubic interpolation,
 /// normalizes with `mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5]`, duplicates across
 /// `temporal_patch_size = 2`, and extracts `[N_patches, 1536]` in `2x2` merge-grouped order.
 #[allow(clippy::too_many_arguments)]
@@ -242,6 +397,35 @@ pub fn preprocess_rgb_image(
     spatial_merge_size: usize,
     min_pixels: usize,
     max_pixels: usize,
+) -> PreprocessedImage {
+    preprocess_rgb_image_inner(
+        rgb,
+        height,
+        width,
+        patch_size,
+        temporal_patch_size,
+        spatial_merge_size,
+        min_pixels,
+        max_pixels,
+        [0.5, 0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        1.0 / 255.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preprocess_rgb_image_inner(
+    rgb: &[u8],
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    temporal_patch_size: usize,
+    spatial_merge_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+    image_mean: [f32; 3],
+    image_std: [f32; 3],
+    rescale_factor: f32,
 ) -> PreprocessedImage {
     assert!(
         height >= 1 && width >= 1,
@@ -309,7 +493,8 @@ pub fn preprocess_rgb_image(
                     }
                 }
                 let val = (acc / w_sum).clamp(0.0, 255.0);
-                norm_chw[(c * out_h + oy) * out_w + ox] = val / 127.5 - 1.0;
+                norm_chw[(c * out_h + oy) * out_w + ox] =
+                    (val * rescale_factor - image_mean[c]) / image_std[c];
             }
         }
     }
@@ -1902,5 +2087,43 @@ mod tests {
 
         let (h_large, w_large) = smart_resize(32, 70_000, 32, 1024, 1024 * 1024);
         assert!(h_large.max(w_large) <= h_large.min(w_large) * MAX_IMAGE_ASPECT_RATIO);
+    }
+
+    #[test]
+    fn test_vision_preprocessor_config_loading_and_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        // Default fallback when no files exist
+        let def = VisionPreprocessorConfig::from_model_dir(dir.path(), None);
+        assert_eq!(def.image_mean, [0.5, 0.5, 0.5]);
+        assert_eq!(def.image_std, [0.5, 0.5, 0.5]);
+        assert_eq!(def.min_pixels, 65_536);
+
+        // Fallback to processor_config.json["image_processor"]
+        std::fs::write(
+            dir.path().join("processor_config.json"),
+            r#"{"image_processor":{"image_mean":[0.4,0.4,0.4],"image_std":[0.2,0.2,0.2],"size":{"shortest_edge":4096,"longest_edge":65536},"patch_size":14,"merge_size":2}}"#,
+        )
+        .unwrap();
+        let from_proc = VisionPreprocessorConfig::from_model_dir(dir.path(), None);
+        assert_eq!(from_proc.image_mean, [0.4, 0.4, 0.4]);
+        assert_eq!(from_proc.image_std, [0.2, 0.2, 0.2]);
+        assert_eq!(from_proc.min_pixels, 4096);
+        assert_eq!(from_proc.max_pixels, 65536);
+        assert_eq!(from_proc.patch_size, 14);
+
+        // preprocessor_config.json takes precedence over processor_config.json
+        std::fs::write(
+            dir.path().join("preprocessor_config.json"),
+            r#"{"image_mean":[0.0,0.0,0.0],"image_std":[1.0,1.0,1.0],"size":{"shortest_edge":1024,"longest_edge":4096},"patch_size":16,"temporal_patch_size":2,"merge_size":2}"#,
+        )
+        .unwrap();
+        let from_prep = VisionPreprocessorConfig::from_model_dir(dir.path(), None);
+        assert_eq!(from_prep.image_mean, [0.0, 0.0, 0.0]);
+        assert_eq!(from_prep.image_std, [1.0, 1.0, 1.0]);
+        assert_eq!(from_prep.min_pixels, 1024);
+        // Solid white (255) with mean=0, std=1, rescale=1/255 -> 1.0 everywhere
+        let rgb = vec![255u8; 32 * 32 * 3];
+        let prep = preprocess_rgb_image_with_config(&rgb, 32, 32, &from_prep);
+        assert!((prep.patches_f32[0] - 1.0).abs() < 1e-4);
     }
 }

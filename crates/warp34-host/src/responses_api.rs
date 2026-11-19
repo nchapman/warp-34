@@ -757,10 +757,23 @@ fn parse_input_items(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_reasoning_and_text_config(
     obj: &Map<String, Value>,
-) -> Result<(Option<bool>, Value, Option<Value>, Value), ResponsesApiError> {
+) -> Result<
+    (
+        Option<bool>,
+        Option<String>,
+        Option<usize>,
+        Value,
+        Option<Value>,
+        Value,
+    ),
+    ResponsesApiError,
+> {
     let mut enable_thinking: Option<bool> = None;
+    let mut reasoning_effort: Option<String> = None;
+    let mut reasoning_budget: Option<usize> = None;
     let reasoning_echo = if let Some(r_val) = obj.get("reasoning").filter(|v| !v.is_null()) {
         let r_obj = r_val
             .as_object()
@@ -770,13 +783,33 @@ fn parse_reasoning_and_text_config(
                 ResponsesApiError::bad_request("'reasoning.effort' must be a string")
             })?;
             match eff {
-                "none" | "minimal" => enable_thinking = Some(false),
-                "low" | "medium" | "high" | "xhigh" | "max" => enable_thinking = Some(true),
+                "none" => {
+                    enable_thinking = Some(false);
+                    reasoning_effort = Some("none".to_string());
+                }
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+                    enable_thinking = Some(true);
+                    reasoning_effort = Some(eff.to_string());
+                }
                 other => {
                     return Err(ResponsesApiError::bad_request(format!(
                         "unsupported reasoning.effort '{other}'"
                     )));
                 }
+            }
+        }
+        if let Some(max_tok) = r_obj.get("max_tokens").filter(|v| !v.is_null()) {
+            let n = max_tok
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    ResponsesApiError::bad_request(
+                        "'reasoning.max_tokens' must be a non-negative integer",
+                    )
+                })?;
+            reasoning_budget = Some(n);
+            if enable_thinking.is_none() {
+                enable_thinking = Some(n > 0);
             }
         }
         json!({
@@ -836,7 +869,14 @@ fn parse_reasoning_and_text_config(
     } else {
         json!({"format": {"type": "text"}})
     };
-    Ok((enable_thinking, reasoning_echo, response_format, text_echo))
+    Ok((
+        enable_thinking,
+        reasoning_effort,
+        reasoning_budget,
+        reasoning_echo,
+        response_format,
+        text_echo,
+    ))
 }
 
 /// Translates an OpenAI Responses API request body into `(canonical_chat_request, meta)`.
@@ -926,8 +966,14 @@ pub fn translate_responses_to_chat(
         }
     }
     let (chat_tool_choice, tool_choice_echo) = normalize_tool_choice(obj.get("tool_choice"))?;
-    let (enable_thinking, reasoning_echo, response_format, text_echo) =
-        parse_reasoning_and_text_config(obj)?;
+    let (
+        enable_thinking,
+        reasoning_effort,
+        reasoning_budget,
+        reasoning_echo,
+        response_format,
+        text_echo,
+    ) = parse_reasoning_and_text_config(obj)?;
 
     let explicit_max_output_tokens = match obj
         .get("max_output_tokens")
@@ -1065,6 +1111,12 @@ pub fn translate_responses_to_chat(
     }
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
+    }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = reasoning_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
     }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),

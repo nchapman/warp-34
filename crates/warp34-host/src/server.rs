@@ -22,6 +22,13 @@ pub struct ServeOptions {
     pub max_num_seqs: usize,
     /// Optional total prompt + output admission ceiling, not a KV allocation size.
     pub max_model_len: Option<usize>,
+    /// Optional server-default `reasoning_effort` passed to the chat template when the
+    /// request omits `reasoning_effort` / `reasoning.effort` / `output_config.effort`.
+    pub reasoning_effort: Option<String>,
+    /// Optional server-default thinking token budget (`None` = unlimited, `Some(0)` = immediate close).
+    pub reasoning_budget: Option<usize>,
+    /// Optional transition message injected before `</think>` when the thinking budget is exhausted.
+    pub reasoning_budget_message: Option<String>,
 }
 
 impl Default for ServeOptions {
@@ -31,7 +38,20 @@ impl Default for ServeOptions {
             webui: true,
             max_num_seqs: crate::scheduler::SchedulerConfig::default().max_num_seqs,
             max_model_len: None,
+            reasoning_effort: None,
+            reasoning_budget: None,
+            reasoning_budget_message: None,
         }
+    }
+}
+
+/// Validates a normalized `reasoning_effort` level shared across OpenAI, Anthropic, `vLLM`, and `llama.cpp`.
+pub fn validate_reasoning_effort(effort: &str) -> Result<(), String> {
+    match effort {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(()),
+        other => Err(format!(
+            "unsupported reasoning_effort '{other}' (expected none|minimal|low|medium|high|xhigh|max)"
+        )),
     }
 }
 
@@ -43,6 +63,9 @@ impl ServeOptions {
         }
         if self.max_model_len == Some(0) {
             return Err("--max-model-len must be positive".into());
+        }
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            validate_reasoning_effort(effort)?;
         }
         Ok(())
     }
@@ -412,26 +435,107 @@ pub fn native_sampling_params_with_defaults(
     Ok(params)
 }
 
-/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
-/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
-pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
-    let effort_thinking = match req.get("reasoning_effort").filter(|v| !v.is_null()) {
-        None => None,
-        Some(v) => match v.as_str().ok_or("reasoning_effort must be a string")? {
-            "none" | "minimal" => Some(false),
-            "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
-            other => return Err(format!("unsupported reasoning_effort '{other}'")),
-        },
+/// Resolves `(enable_thinking, reasoning_effort)` for chat requests from
+/// `chat_template_kwargs`, top-level `reasoning_effort`, OpenRouter-style `reasoning.effort`,
+/// and an optional server default (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+pub fn resolve_chat_reasoning_config(
+    req: &serde_json::Value,
+    default_effort: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
+    let raw_effort = if let Some(v) = req.get("reasoning_effort").filter(|v| !v.is_null()) {
+        Some(
+            v.as_str()
+                .ok_or("reasoning_effort must be a string")?
+                .to_owned(),
+        )
+    } else if let Some(v) = req.pointer("/reasoning/effort").filter(|v| !v.is_null()) {
+        Some(
+            v.as_str()
+                .ok_or("reasoning.effort must be a string")?
+                .to_owned(),
+        )
+    } else if let Some(v) = req
+        .pointer("/chat_template_kwargs/reasoning_effort")
+        .filter(|v| !v.is_null())
+    {
+        Some(
+            v.as_str()
+                .ok_or("chat_template_kwargs.reasoning_effort must be a string")?
+                .to_owned(),
+        )
+    } else {
+        default_effort.map(str::to_owned)
     };
-    if let Some(kw) = req
+
+    if let Some(ref eff) = raw_effort {
+        validate_reasoning_effort(eff)?;
+    }
+
+    let enable_thinking = if let Some(kw) = req
         .pointer("/chat_template_kwargs/enable_thinking")
         .filter(|v| !v.is_null())
     {
-        return kw
-            .as_bool()
-            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".into());
-    }
-    Ok(effort_thinking.unwrap_or(true))
+        kw.as_bool()
+            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".to_string())?
+    } else {
+        raw_effort.as_deref() != Some("none")
+    };
+
+    Ok((enable_thinking, raw_effort))
+}
+
+/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
+/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
+    Ok(resolve_chat_reasoning_config(req, None)?.0)
+}
+
+/// Resolves an optional per-request thinking token budget and budget exhaustion message from
+/// OpenAI (`thinking_token_budget`, `reasoning_budget_tokens`, `thinking_budget_tokens`,
+/// `reasoning.max_tokens`) with fallback to server defaults.
+pub fn resolve_chat_reasoning_budget(
+    req: &serde_json::Value,
+    default_budget: Option<usize>,
+    default_message: Option<&str>,
+) -> Result<(Option<usize>, Option<String>), String> {
+    let budget_val = req
+        .get("thinking_token_budget")
+        .or_else(|| req.get("reasoning_budget_tokens"))
+        .or_else(|| req.get("thinking_budget_tokens"))
+        .or_else(|| req.pointer("/reasoning/max_tokens"))
+        .filter(|v| !v.is_null());
+
+    let budget = match budget_val {
+        None => default_budget,
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or("thinking_token_budget must be an integer")?;
+            if n < -1 {
+                return Err("thinking_token_budget must be >= -1".into());
+            }
+            if n == -1 {
+                None
+            } else {
+                Some(usize::try_from(n).map_err(|_| "thinking_token_budget out of range")?)
+            }
+        }
+    };
+
+    let msg_val = req
+        .get("reasoning_budget_message")
+        .or_else(|| req.get("thinking_budget_message"))
+        .filter(|v| !v.is_null());
+    let message = match msg_val {
+        None => default_message.map(str::to_owned),
+        Some(v) => Some(
+            v.as_str()
+                .ok_or("reasoning_budget_message must be a string")?
+                .to_owned(),
+        ),
+    };
+
+    Ok((budget, message))
 }
 
 pub fn parse_openai_messages_multimodal(
@@ -443,6 +547,18 @@ pub fn parse_openai_messages_multimodal(
 pub fn parse_openai_messages_with_image_policy(
     messages: &serde_json::Value,
     allow_remote_images: bool,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    parse_openai_messages_with_vision_config(
+        messages,
+        allow_remote_images,
+        &crate::vision::VisionPreprocessorConfig::default(),
+    )
+}
+
+pub fn parse_openai_messages_with_vision_config(
+    messages: &serde_json::Value,
+    allow_remote_images: bool,
+    vision_preprocessor: &crate::vision::VisionPreprocessorConfig,
 ) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
     let arr = messages.as_array().ok_or("'messages' must be an array")?;
     if arr.is_empty() {
@@ -512,18 +628,16 @@ pub fn parse_openai_messages_with_image_policy(
                             .map_err(|e| format!("invalid image_url: {e}"))?;
                             crate::vision::validate_image_aspect_ratio(h, w)
                                 .map_err(|e| format!("invalid image_url: {e}"))?;
-                            let prep = crate::vision::preprocess_rgb_image(
+                            let prep = crate::vision::preprocess_rgb_image_with_config(
                                 &rgb,
                                 h,
                                 w,
-                                16,
-                                2,
-                                2,
-                                32 * 32,
-                                1024 * 1024,
+                                vision_preprocessor,
                             );
                             text.push_str("<|vision_start|>");
-                            for _ in 0..prep.num_merged_tokens(2) {
+                            for _ in
+                                0..prep.num_merged_tokens(vision_preprocessor.spatial_merge_size)
+                            {
                                 text.push_str("<|image_pad|>");
                             }
                             text.push_str("<|vision_end|>");
@@ -642,16 +756,40 @@ mod tests {
             !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "none"}))
                 .unwrap()
         );
-        assert!(
-            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "minimal"}))
-                .unwrap()
-        );
-        for eff in ["low", "medium", "high", "xhigh", "max"] {
+        for eff in ["minimal", "low", "medium", "high", "xhigh", "max"] {
             assert!(
                 resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": eff}))
-                    .unwrap()
+                    .unwrap(),
+                "expected thinking enabled for effort={eff}"
             );
+            let (thinking, resolved_eff) =
+                resolve_chat_reasoning_config(&serde_json::json!({"reasoning_effort": eff}), None)
+                    .unwrap();
+            assert!(thinking);
+            assert_eq!(resolved_eff.as_deref(), Some(eff));
         }
+        assert_eq!(
+            resolve_chat_reasoning_config(&serde_json::json!({}), Some("low")).unwrap(),
+            (true, Some("low".to_string()))
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(
+                &serde_json::json!({"thinking_token_budget": 2048}),
+                Some(4096),
+                Some("Time is up.")
+            )
+            .unwrap(),
+            (Some(2048), Some("Time is up.".to_string()))
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(
+                &serde_json::json!({"reasoning_budget_tokens": -1}),
+                Some(4096),
+                None
+            )
+            .unwrap(),
+            (None, None)
+        );
         assert!(
             resolve_chat_enable_thinking(&serde_json::json!({
                 "reasoning_effort": "none",

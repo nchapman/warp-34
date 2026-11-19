@@ -36,6 +36,9 @@ pub struct OpenAiServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
     webui: bool,
+    pub default_reasoning_effort: Option<String>,
+    pub default_reasoning_budget: Option<usize>,
+    pub default_reasoning_budget_message: Option<String>,
     pub worker: EngineWorker,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
@@ -91,6 +94,9 @@ impl OpenAiServerState {
         let unshared = Arc::get_mut(&mut state).expect("unshared server state");
         unshared.api_key = options.api_key;
         unshared.webui = options.webui;
+        unshared.default_reasoning_effort = options.reasoning_effort;
+        unshared.default_reasoning_budget = options.reasoning_budget;
+        unshared.default_reasoning_budget_message = options.reasoning_budget_message;
         Ok(state)
     }
     fn with_worker(
@@ -115,6 +121,9 @@ impl OpenAiServerState {
             model_name,
             api_key: None,
             webui: true,
+            default_reasoning_effort: None,
+            default_reasoning_budget: None,
+            default_reasoning_budget_message: None,
             worker,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
@@ -642,33 +651,41 @@ fn prepare(
     {
         return Err("stop_token_ids/logit_bias token outside model vocabulary".into());
     }
-    let thinking = if chat {
-        super::resolve_chat_enable_thinking(&request)?
+    let (thinking, resolved_effort) = if chat {
+        super::resolve_chat_reasoning_config(&request, s.default_reasoning_effort.as_deref())?
     } else {
-        false
+        (false, None)
     };
     params.enable_thinking = thinking;
     let (prompt, images, messages_count, tools_count, enable_thinking) = if chat {
-        let (messages, images) = super::parse_openai_messages_with_image_policy(
+        let (messages, images) = super::parse_openai_messages_with_vision_config(
             request.get("messages").ok_or("missing messages")?,
             s.allow_remote_images,
+            &s.worker.vision_preprocessor,
         )?;
-        let preserve = request
-            .pointer("/chat_template_kwargs/preserve_reasoning")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                request
-                    .pointer("/chat_template_kwargs/preserve_thinking")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(s.worker.default_preserve_thinking);
+        let mut template_kwargs = match request.get("chat_template_kwargs").filter(|v| !v.is_null())
+        {
+            None => serde_json::Map::new(),
+            Some(v) => v
+                .as_object()
+                .cloned()
+                .ok_or("chat_template_kwargs must be an object")?,
+        };
+        template_kwargs.insert("enable_thinking".into(), Value::Bool(thinking));
+        if let Some(ref effort) = resolved_effort {
+            template_kwargs.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        }
         let active_tools = request
             .get("tools")
             .filter(|v| !v.is_null() && request["tool_choice"] != "none");
         let msg_cnt = messages.len();
         let tool_cnt = active_tools.and_then(Value::as_array).map_or(0, Vec::len);
+        let rendered =
+            s.worker
+                .chat_template
+                .render(&messages, active_tools, true, &template_kwargs)?;
         (
-            super::format_chatml_prompt_with_options(&messages, active_tools, thinking, preserve),
+            rendered,
             images,
             Some(msg_cnt),
             Some(tool_cnt),
@@ -688,6 +705,52 @@ fn prepare(
         )
     };
     let tokenizer = s.worker.tokenizer.as_ref().ok_or("tokenizer unavailable")?;
+    if chat && thinking {
+        let (budget, budget_msg) = super::resolve_chat_reasoning_budget(
+            &request,
+            s.default_reasoning_budget,
+            s.default_reasoning_budget_message.as_deref(),
+        )?;
+        if let Some(budget) = budget {
+            let enc = |text: &str| -> Result<Vec<i32>, String> {
+                Ok(tokenizer
+                    .encode(text, false)
+                    .map_err(|e| e.to_string())?
+                    .get_ids()
+                    .iter()
+                    .map(|&id| id as i32)
+                    .collect())
+            };
+            let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
+                if let Some(id) = tokenizer.token_to_id(tag) {
+                    Ok(vec![id as i32])
+                } else {
+                    enc(tag)
+                }
+            };
+            let start_token_ids = tag_ids("<think>")?;
+            let end_token_ids = tag_ids("</think>")?;
+            let mut forced_token_ids = Vec::new();
+            if let Some(msg) = budget_msg.as_deref().filter(|m| !m.is_empty()) {
+                forced_token_ids.extend(enc(msg)?);
+            }
+            forced_token_ids.extend_from_slice(&end_token_ids);
+            forced_token_ids.extend(enc("\n")?);
+            if start_token_ids.is_empty() || end_token_ids.is_empty() || forced_token_ids.is_empty()
+            {
+                return Err(
+                    "tokenizer cannot encode <think>/</think> tags required for thinking budget"
+                        .into(),
+                );
+            }
+            params.thinking_budget = Some(crate::parser::ThinkingBudgetConfig {
+                budget,
+                start_token_ids,
+                end_token_ids,
+                forced_token_ids,
+            });
+        }
+    }
     let prompt: Vec<i32> = tokenizer
         .encode(prompt, false)
         .map_err(|e| e.to_string())?

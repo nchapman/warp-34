@@ -11,6 +11,128 @@ type ToolGrammars = BTreeMap<String, ParameterGrammars>;
 
 use serde::{Deserialize, Serialize};
 
+/// Per-request sampler-level thinking token budget (`vLLM` `ThinkingBudgetStateHolder` /
+/// `llama.cpp` `common/reasoning-budget.cpp` parity).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingBudgetConfig {
+    pub budget: usize,
+    pub start_token_ids: Vec<i32>,
+    pub end_token_ids: Vec<i32>,
+    pub forced_token_ids: Vec<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkingBudgetPhase {
+    Idle,
+    Counting { remaining: usize },
+    Forcing { pos: usize },
+    Done,
+}
+
+#[derive(Clone, Debug)]
+struct ThinkingBudgetTracker {
+    phase: ThinkingBudgetPhase,
+    history: Vec<ThinkingBudgetPhase>,
+}
+
+fn find_last_subseq(haystack: &[i32], needle: &[i32]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+impl ThinkingBudgetTracker {
+    fn new(cfg: &ThinkingBudgetConfig, prompt_tokens: &[i32]) -> Self {
+        let last_start = find_last_subseq(prompt_tokens, &cfg.start_token_ids);
+        let last_end = find_last_subseq(prompt_tokens, &cfg.end_token_ids);
+        let in_think = match (last_start, last_end) {
+            (Some(s), Some(e)) => s > e,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        let phase = if cfg.forced_token_ids.is_empty() {
+            ThinkingBudgetPhase::Done
+        } else if in_think {
+            if cfg.budget == 0 {
+                ThinkingBudgetPhase::Forcing { pos: 0 }
+            } else {
+                ThinkingBudgetPhase::Counting {
+                    remaining: cfg.budget,
+                }
+            }
+        } else {
+            ThinkingBudgetPhase::Idle
+        };
+        Self {
+            phase,
+            history: Vec::new(),
+        }
+    }
+
+    fn forced_token(&self, cfg: &ThinkingBudgetConfig) -> Option<i32> {
+        match self.phase {
+            ThinkingBudgetPhase::Forcing { pos } => cfg.forced_token_ids.get(pos).copied(),
+            _ => None,
+        }
+    }
+
+    fn advance(&mut self, cfg: &ThinkingBudgetConfig, output_history: &[i32]) {
+        self.history.push(self.phase);
+        if cfg.forced_token_ids.is_empty() {
+            self.phase = ThinkingBudgetPhase::Done;
+            return;
+        }
+        let ends_with_start =
+            !cfg.start_token_ids.is_empty() && output_history.ends_with(&cfg.start_token_ids);
+        let ends_with_end =
+            !cfg.end_token_ids.is_empty() && output_history.ends_with(&cfg.end_token_ids);
+        self.phase = match self.phase {
+            ThinkingBudgetPhase::Idle | ThinkingBudgetPhase::Done => {
+                if ends_with_start {
+                    if cfg.budget == 0 {
+                        ThinkingBudgetPhase::Forcing { pos: 0 }
+                    } else {
+                        ThinkingBudgetPhase::Counting {
+                            remaining: cfg.budget,
+                        }
+                    }
+                } else {
+                    self.phase
+                }
+            }
+            ThinkingBudgetPhase::Counting { remaining } => {
+                if ends_with_end {
+                    ThinkingBudgetPhase::Done
+                } else if remaining <= 1 {
+                    ThinkingBudgetPhase::Forcing { pos: 0 }
+                } else {
+                    ThinkingBudgetPhase::Counting {
+                        remaining: remaining - 1,
+                    }
+                }
+            }
+            ThinkingBudgetPhase::Forcing { pos } => {
+                if pos + 1 >= cfg.forced_token_ids.len() {
+                    ThinkingBudgetPhase::Done
+                } else {
+                    ThinkingBudgetPhase::Forcing { pos: pos + 1 }
+                }
+            }
+        };
+    }
+
+    fn rollback(&mut self, num_rejected: usize) {
+        for _ in 0..num_rejected {
+            if let Some(prev) = self.history.pop() {
+                self.phase = prev;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -37,6 +159,8 @@ pub struct SamplingParams {
     pub top_logprobs: usize,
     #[serde(default)]
     pub eos_token_ids: Vec<i32>,
+    #[serde(default)]
+    pub thinking_budget: Option<ThinkingBudgetConfig>,
 }
 
 impl Default for SamplingParams {
@@ -60,6 +184,7 @@ impl Default for SamplingParams {
             logprobs: false,
             top_logprobs: 0,
             eos_token_ids: vec![151643, 151645, 248044, 248046],
+            thinking_budget: None,
         }
     }
 }
@@ -68,6 +193,7 @@ impl SamplingParams {
     #[inline]
     pub fn is_plain_greedy(&self, has_constraint: bool) -> bool {
         !has_constraint
+            && self.thinking_budget.is_none()
             && (self.temperature <= 1e-6 || self.top_k == 1)
             && (self.repetition_penalty - 1.0).abs() <= 1e-6
             && self.frequency_penalty.abs() <= 1e-6
@@ -227,6 +353,7 @@ pub struct SamplerV1 {
     pub output_counts: BTreeMap<i32, u32>,
     pub output_history: Vec<i32>,
     pub constraint: Option<TokenBitmaskConstraint>,
+    thinking_tracker: Option<ThinkingBudgetTracker>,
 }
 
 impl SamplerV1 {
@@ -239,13 +366,24 @@ impl SamplerV1 {
         for &t in prompt_tokens {
             *prompt_counts.entry(t).or_insert(0) += 1;
         }
+        let thinking_tracker = params
+            .thinking_budget
+            .as_ref()
+            .map(|cfg| ThinkingBudgetTracker::new(cfg, prompt_tokens));
         Self {
             params,
             prompt_counts,
             output_counts: BTreeMap::new(),
             output_history: Vec::new(),
             constraint,
+            thinking_tracker,
         }
+    }
+
+    #[inline]
+    pub fn forced_thinking_token(&self) -> Option<i32> {
+        let cfg = self.params.thinking_budget.as_ref()?;
+        self.thinking_tracker.as_ref()?.forced_token(cfg)
     }
 
     /// Deterministic SplitMix64 uniform float in `[0.0, 1.0)` keyed by `(seed, step_pos)`.
@@ -279,6 +417,12 @@ impl SamplerV1 {
         self.params.validate()?;
         if logits.is_empty() || logits.len() > i32::MAX as usize {
             return Err("empty or oversized vocabulary".into());
+        }
+        if let Some(forced_tid) = self.forced_thinking_token()
+            && forced_tid >= 0
+            && (forced_tid as usize) < logits.len()
+        {
+            return Ok(vec![(forced_tid, 1.0)]);
         }
         let honor_bans = (self.params.ignore_eos
             || self.output_history.len() < self.params.min_tokens)
@@ -469,6 +613,7 @@ impl SamplerV1 {
                 0
             };
         self.constraint.is_none()
+            && self.thinking_tracker.is_none()
             && is_greedy
             && lp_at_most_zero
             && no_penalties
@@ -493,7 +638,19 @@ impl SamplerV1 {
     ) -> Result<warp34_kernels::ffi::Warp34SamplerRowCfg, String> {
         self.params.validate()?;
         let mask_words_per_row = vocab_size.div_ceil(32);
-        let (has_bitmask, row_bitmask_word_offset) = if let Some(ref c) = self.constraint {
+        let (has_bitmask, row_bitmask_word_offset) = if let Some(forced_tid) =
+            self.forced_thinking_token()
+            && forced_tid >= 0
+            && (forced_tid as usize) < vocab_size
+        {
+            let off = i32::try_from(bitmask_words_out.len())
+                .map_err(|_| "bitmask buffer overflow".to_string())?;
+            let start = bitmask_words_out.len();
+            bitmask_words_out.resize(start + mask_words_per_row, 0u32);
+            let tid_u = forced_tid as usize;
+            bitmask_words_out[start + (tid_u / 32)] = 1u32 << (tid_u % 32);
+            (1, off)
+        } else if let Some(ref c) = self.constraint {
             if c.has_pending() {
                 return Err("unmaterialized token constraint before append_gpu_row".to_string());
             }
@@ -668,6 +825,12 @@ impl SamplerV1 {
         }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;
+        if let (Some(cfg), Some(tracker)) = (
+            self.params.thinking_budget.as_ref(),
+            self.thinking_tracker.as_mut(),
+        ) {
+            tracker.advance(cfg, &self.output_history);
+        }
         Ok(())
     }
 
@@ -679,11 +842,17 @@ impl SamplerV1 {
         }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;
+        if let (Some(cfg), Some(tracker)) = (
+            self.params.thinking_budget.as_ref(),
+            self.thinking_tracker.as_mut(),
+        ) {
+            tracker.advance(cfg, &self.output_history);
+        }
         Ok(())
     }
 
     /// Rolls back `num_rejected` speculative tokens from `output_history`, `output_counts`,
-    /// and `constraint`.
+    /// `thinking_tracker`, and `constraint`.
     pub fn rollback_tokens(&mut self, num_rejected: usize) {
         self.try_rollback_tokens(num_rejected)
             .expect("invalid sampler rollback");
@@ -695,6 +864,9 @@ impl SamplerV1 {
         }
         if let Some(ref mut c) = self.constraint {
             c.rollback(num_rejected)?;
+        }
+        if let Some(ref mut tracker) = self.thinking_tracker {
+            tracker.rollback(num_rejected);
         }
         for _ in 0..num_rejected {
             if let Some(tid) = self.output_history.pop()
@@ -3014,5 +3186,74 @@ mod tests {
         // Token 10 had logit 4.0 / 2.0 = 2.0; token 20 had logit 4.0.
         // Therefore prob[20] should be strictly greater than prob[10].
         assert!(probs[20] > probs[10]);
+    }
+
+    #[test]
+    fn test_thinking_budget_forcing_and_speculative_rollback() {
+        // Token IDs: 1 = <think>, 2 = </think>, 3 = \n, 5 = normal thought/answer token
+        let cfg = ThinkingBudgetConfig {
+            budget: 2,
+            start_token_ids: vec![1],
+            end_token_ids: vec![2],
+            forced_token_ids: vec![2, 3],
+        };
+        let params = SamplingParams {
+            temperature: 0.0,
+            thinking_budget: Some(cfg.clone()),
+            ..Default::default()
+        };
+        // Prompt ends with `<think>` -> starts counting immediately
+        let mut sampler = SamplerV1::new(params.clone(), &[10, 1], None);
+        assert!(!sampler.is_fast_greedy_stateless(0));
+        assert_eq!(sampler.forced_thinking_token(), None);
+
+        // Logits favor token 5 strongly
+        let mut logits = vec![0.0f32; 16];
+        logits[5] = 10.0;
+
+        // 2 thinking tokens allowed before forcing
+        assert_eq!(sampler.sample_from_logits(&logits), 5);
+        assert_eq!(sampler.forced_thinking_token(), None);
+        assert_eq!(sampler.sample_from_logits(&logits), 5);
+        assert_eq!(sampler.forced_thinking_token(), Some(2));
+
+        // GPU row bitmask forces ONLY token 2
+        let mut bitmask = Vec::new();
+        let mut sparse = Vec::new();
+        let row = sampler
+            .append_gpu_row(16, &[], 0.5, 0.5, -1, false, &mut bitmask, &mut sparse)
+            .unwrap();
+        assert_eq!(row.has_bitmask, 1);
+        assert_eq!(bitmask, vec![1u32 << 2]);
+
+        // Speculative rollback of 1 token restores counting phase (unforced)
+        sampler.rollback_tokens(1);
+        assert_eq!(sampler.forced_thinking_token(), None);
+
+        // Re-commit token 5 -> forces token 2, then token 3, then returns to normal token 5
+        assert_eq!(sampler.sample_from_logits(&logits), 5);
+        assert_eq!(sampler.sample_from_logits(&logits), 2);
+        assert_eq!(sampler.sample_from_logits(&logits), 3);
+        assert_eq!(sampler.forced_thinking_token(), None);
+        assert_eq!(sampler.sample_from_logits(&logits), 5);
+
+        // Natural </think> before budget exhaustion deactivates forcing
+        let mut natural = SamplerV1::new(params, &[10, 1], None);
+        natural.commit_token(5);
+        natural.commit_token(2); // natural </think>
+        assert_eq!(natural.forced_thinking_token(), None);
+        natural.commit_token(5);
+        assert_eq!(natural.forced_thinking_token(), None);
+
+        // budget == 0 forces immediately when prompt ends with <think>
+        let immediate = SamplerV1::new(
+            SamplingParams {
+                thinking_budget: Some(ThinkingBudgetConfig { budget: 0, ..cfg }),
+                ..Default::default()
+            },
+            &[10, 1],
+            None,
+        );
+        assert_eq!(immediate.forced_thinking_token(), Some(2));
     }
 }

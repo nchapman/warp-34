@@ -501,6 +501,129 @@ fn convert_messages(
     Ok(out)
 }
 
+#[allow(clippy::type_complexity)]
+fn parse_anthropic_thinking_config(
+    obj: &Map<String, Value>,
+    is_forced_tool_choice: bool,
+    require_max_tokens: bool,
+    max_tokens: usize,
+) -> Result<(Option<bool>, Option<usize>, Option<String>, Option<Value>), AnthropicApiError> {
+    let mut enable_thinking: Option<bool> = None;
+    let mut thinking_budget: Option<usize> = None;
+    let mut reasoning_effort: Option<String> = None;
+    if let Some(th_val) = obj.get("thinking").filter(|v| !v.is_null()) {
+        let th_obj = th_val
+            .as_object()
+            .ok_or_else(|| AnthropicApiError::bad_request("'thinking' must be an object"))?;
+        let th_type = th_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AnthropicApiError::bad_request("thinking missing string 'type'"))?;
+        match th_type {
+            "enabled" => {
+                if is_forced_tool_choice {
+                    return Err(AnthropicApiError::bad_request(
+                        "thinking cannot be enabled when tool_choice forces tool use ('any' or 'tool')",
+                    ));
+                }
+                let budget = th_obj
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| {
+                        AnthropicApiError::bad_request(
+                            "thinking.type 'enabled' requires integer 'budget_tokens'",
+                        )
+                    })?;
+                if budget < 1024 {
+                    return Err(AnthropicApiError::bad_request(
+                        "'thinking.budget_tokens' must be >= 1024",
+                    ));
+                }
+                if require_max_tokens && budget >= max_tokens {
+                    return Err(AnthropicApiError::bad_request(
+                        "'thinking.budget_tokens' must be strictly less than 'max_tokens'",
+                    ));
+                }
+                enable_thinking = Some(true);
+                thinking_budget = Some(budget);
+            }
+            "disabled" => {
+                enable_thinking = Some(false);
+                reasoning_effort = Some("none".to_string());
+            }
+            "adaptive" => {
+                enable_thinking = Some(!is_forced_tool_choice);
+            }
+            other => {
+                return Err(AnthropicApiError::bad_request(format!(
+                    "unsupported thinking.type '{other}'"
+                )));
+            }
+        }
+    } else if is_forced_tool_choice {
+        enable_thinking = Some(false);
+    }
+    let mut response_format: Option<Value> = None;
+    if let Some(oc_val) = obj.get("output_config").filter(|v| !v.is_null()) {
+        let oc_obj = oc_val
+            .as_object()
+            .ok_or_else(|| AnthropicApiError::bad_request("'output_config' must be an object"))?;
+        if let Some(effort_val) = oc_obj.get("effort").filter(|v| !v.is_null()) {
+            let eff = effort_val.as_str().ok_or_else(|| {
+                AnthropicApiError::bad_request("'output_config.effort' must be a string")
+            })?;
+            match eff {
+                "low" | "medium" | "high" | "xhigh" | "max" => {
+                    if enable_thinking != Some(false) {
+                        reasoning_effort = Some(eff.to_string());
+                    }
+                    if enable_thinking.is_none() && !is_forced_tool_choice {
+                        enable_thinking = Some(true);
+                    }
+                }
+                _ => {
+                    return Err(AnthropicApiError::bad_request(format!(
+                        "unsupported output_config.effort '{eff}'"
+                    )));
+                }
+            }
+        }
+        if let Some(fmt_val) = oc_obj.get("format").filter(|v| !v.is_null()) {
+            let fmt_obj = fmt_val.as_object().ok_or_else(|| {
+                AnthropicApiError::bad_request("'output_config.format' must be an object")
+            })?;
+            match fmt_obj.get("type").and_then(Value::as_str) {
+                Some("json_schema") => {
+                    let schema = fmt_obj.get("schema").ok_or_else(|| {
+                        AnthropicApiError::bad_request("output_config.format missing 'schema'")
+                    })?;
+                    response_format = Some(json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "anthropic_output_schema",
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    }));
+                }
+                Some("text") | None => {}
+                Some(other) => {
+                    return Err(AnthropicApiError::bad_request(format!(
+                        "unsupported output_config.format.type '{other}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok((
+        enable_thinking,
+        thinking_budget,
+        reasoning_effort,
+        response_format,
+    ))
+}
+
 /// Translates an Anthropic Messages API request body into `(canonical_chat_request, meta)`.
 pub fn translate_anthropic_to_chat(
     req: &Value,
@@ -632,110 +755,14 @@ pub fn translate_anthropic_to_chat(
         None
     };
 
-    // Thinking config
-    let mut enable_thinking: Option<bool> = None;
-    if let Some(th_val) = obj.get("thinking").filter(|v| !v.is_null()) {
-        let th_obj = th_val
-            .as_object()
-            .ok_or_else(|| AnthropicApiError::bad_request("'thinking' must be an object"))?;
-        let th_type = th_obj
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AnthropicApiError::bad_request("thinking missing string 'type'"))?;
-        match th_type {
-            "enabled" => {
-                if is_forced_tool_choice {
-                    return Err(AnthropicApiError::bad_request(
-                        "thinking cannot be enabled when tool_choice forces tool use ('any' or 'tool')",
-                    ));
-                }
-                let budget = th_obj
-                    .get("budget_tokens")
-                    .and_then(Value::as_u64)
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| {
-                        AnthropicApiError::bad_request(
-                            "thinking.type 'enabled' requires integer 'budget_tokens'",
-                        )
-                    })?;
-                if budget < 1024 {
-                    return Err(AnthropicApiError::bad_request(
-                        "'thinking.budget_tokens' must be >= 1024",
-                    ));
-                }
-                if require_max_tokens && budget >= max_tokens {
-                    return Err(AnthropicApiError::bad_request(
-                        "'thinking.budget_tokens' must be strictly less than 'max_tokens'",
-                    ));
-                }
-                enable_thinking = Some(true);
-            }
-            "disabled" => {
-                enable_thinking = Some(false);
-            }
-            "adaptive" => {
-                enable_thinking = Some(!is_forced_tool_choice);
-            }
-            other => {
-                return Err(AnthropicApiError::bad_request(format!(
-                    "unsupported thinking.type '{other}'"
-                )));
-            }
-        }
-    } else if is_forced_tool_choice {
-        enable_thinking = Some(false);
-    }
-
-    // output_config.effort & output_config.format -> response_format
-    let mut response_format: Option<Value> = None;
-    if let Some(oc_val) = obj.get("output_config").filter(|v| !v.is_null()) {
-        let oc_obj = oc_val
-            .as_object()
-            .ok_or_else(|| AnthropicApiError::bad_request("'output_config' must be an object"))?;
-        if let Some(effort_val) = oc_obj.get("effort").filter(|v| !v.is_null()) {
-            let eff = effort_val.as_str().ok_or_else(|| {
-                AnthropicApiError::bad_request("'output_config.effort' must be a string")
-            })?;
-            match eff {
-                "low" | "medium" | "high" | "xhigh" | "max" => {
-                    if enable_thinking.is_none() && !is_forced_tool_choice {
-                        enable_thinking = Some(true);
-                    }
-                }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(format!(
-                        "unsupported output_config.effort '{eff}'"
-                    )));
-                }
-            }
-        }
-        if let Some(fmt_val) = oc_obj.get("format").filter(|v| !v.is_null()) {
-            let fmt_obj = fmt_val.as_object().ok_or_else(|| {
-                AnthropicApiError::bad_request("'output_config.format' must be an object")
-            })?;
-            match fmt_obj.get("type").and_then(Value::as_str) {
-                Some("json_schema") => {
-                    let schema = fmt_obj.get("schema").ok_or_else(|| {
-                        AnthropicApiError::bad_request("output_config.format missing 'schema'")
-                    })?;
-                    response_format = Some(json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "anthropic_output_schema",
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }));
-                }
-                Some("text") | None => {}
-                Some(other) => {
-                    return Err(AnthropicApiError::bad_request(format!(
-                        "unsupported output_config.format.type '{other}'"
-                    )));
-                }
-            }
-        }
-    }
+    // Thinking & output_config
+    let (enable_thinking, thinking_budget, reasoning_effort, response_format) =
+        parse_anthropic_thinking_config(
+            obj,
+            is_forced_tool_choice,
+            require_max_tokens,
+            max_tokens,
+        )?;
 
     let stream = obj
         .get("stream")
@@ -786,6 +813,12 @@ pub fn translate_anthropic_to_chat(
     }
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
+    }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = thinking_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
     }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),

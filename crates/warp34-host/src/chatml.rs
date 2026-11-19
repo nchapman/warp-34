@@ -3,8 +3,15 @@
 //! Mirrors the checkpoints' `chat_template.jinja` text branch. Images are expanded
 //! into model-specific patch tokens by the request parser before reaching here.
 
+use std::sync::{Arc, OnceLock};
+
+use minijinja::value::Kwargs;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+
+/// Embedded fallback Qwen ChatML Jinja2 template used when a checkpoint omits
+/// both `chat_template.jinja` and `tokenizer_config.json["chat_template"]`.
+pub const DEFAULT_QWEN_CHAT_TEMPLATE: &str = include_str!("default_qwen_chat_template.jinja");
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -103,9 +110,201 @@ fn template_json(value: &Value) -> String {
     }
 }
 
-const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+fn tojson_filter(value: minijinja::Value, kwargs: Kwargs) -> Result<String, minijinja::Error> {
+    let indent: Option<usize> = kwargs.get("indent").ok().flatten();
+    let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii").ok().flatten();
+    let _sort_keys: Option<bool> = kwargs.get("sort_keys").ok().flatten();
+    let json_val = serde_json::to_value(&value).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson serialization failed: {e}"),
+        )
+    })?;
+    if indent.is_some() {
+        serde_json::to_string_pretty(&json_val).map_err(|e| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("tojson pretty serialization failed: {e}"),
+            )
+        })
+    } else {
+        Ok(template_json(&json_val))
+    }
+}
 
-/// Formats a list of chat messages into a ChatML prompt string.
+/// Compiled Jinja2 chat template loaded from a model checkpoint (`chat_template.jinja`
+/// or `tokenizer_config.json`), with an embedded Qwen ChatML template as fallback.
+#[derive(Clone)]
+pub struct ChatTemplate {
+    env: Arc<minijinja::Environment<'static>>,
+    source_name: String,
+    bos_token: String,
+    eos_token: String,
+}
+
+impl std::fmt::Debug for ChatTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatTemplate")
+            .field("source_name", &self.source_name)
+            .field("bos_token", &self.bos_token)
+            .field("eos_token", &self.eos_token)
+            .finish()
+    }
+}
+
+impl ChatTemplate {
+    /// Returns the shared embedded default Qwen ChatML Jinja2 template.
+    pub fn default_qwen() -> Self {
+        static DEFAULT: OnceLock<ChatTemplate> = OnceLock::new();
+        DEFAULT
+            .get_or_init(|| {
+                Self::from_source_with_tokens(
+                    DEFAULT_QWEN_CHAT_TEMPLATE,
+                    "default-qwen",
+                    String::new(),
+                    "<|im_end|>".to_string(),
+                )
+                .expect("embedded default Qwen chat template must compile")
+            })
+            .clone()
+    }
+
+    /// Compiles an arbitrary Jinja2 chat template string.
+    pub fn from_source(source: &str, name: &str) -> Result<Self, String> {
+        Self::from_source_with_tokens(source, name, String::new(), "<|im_end|>".to_string())
+    }
+
+    fn from_source_with_tokens(
+        source: &str,
+        name: &str,
+        bos_token: String,
+        eos_token: String,
+    ) -> Result<Self, String> {
+        let mut env = minijinja::Environment::new();
+        env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_filter("tojson", tojson_filter);
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        env.add_template_owned("chat".to_string(), source.to_string())
+            .map_err(|e| format!("failed to compile chat template '{name}': {e}"))?;
+        Ok(Self {
+            env: Arc::new(env),
+            source_name: name.to_string(),
+            bos_token,
+            eos_token,
+        })
+    }
+
+    /// Loads the chat template from a HuggingFace model directory following `vLLM` precedence:
+    /// 1. `chat_template.jinja`
+    /// 2. `tokenizer_config.json` -> `chat_template`
+    /// 3. Embedded default Qwen ChatML template
+    pub fn from_model_dir(model_dir: &std::path::Path) -> Self {
+        let tc_text = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok();
+        let (bos_token, eos_token) = tc_text.as_deref().map_or_else(
+            || (String::new(), "<|im_end|>".to_string()),
+            extract_special_tokens_from_tokenizer_config,
+        );
+
+        if let Ok(source) = std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+            match Self::from_source_with_tokens(
+                &source,
+                "chat_template.jinja",
+                bos_token.clone(),
+                eos_token.clone(),
+            ) {
+                Ok(tmpl) => return tmpl,
+                Err(err) => {
+                    eprintln!(
+                        "warning: {err}; falling back to embedded default Qwen chat template"
+                    );
+                }
+            }
+        }
+        if let Some(source) = tc_text
+            .as_deref()
+            .and_then(extract_chat_template_from_tokenizer_config)
+        {
+            match Self::from_source_with_tokens(
+                &source,
+                "tokenizer_config.json",
+                bos_token,
+                eos_token,
+            ) {
+                Ok(tmpl) => return tmpl,
+                Err(err) => {
+                    eprintln!(
+                        "warning: {err}; falling back to embedded default Qwen chat template"
+                    );
+                }
+            }
+        }
+        Self::default_qwen()
+    }
+
+    /// Name of the loaded template source (`chat_template.jinja`, `tokenizer_config.json`, or `default-qwen`).
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Renders `messages` and optional `tools` with arbitrary `chat_template_kwargs`.
+    pub fn render(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&Value>,
+        add_generation_prompt: bool,
+        kwargs: &Map<String, Value>,
+    ) -> Result<String, String> {
+        let mut ctx = kwargs.clone();
+        ctx.insert(
+            "messages".into(),
+            serde_json::to_value(messages).map_err(|e| e.to_string())?,
+        );
+        ctx.insert(
+            "add_generation_prompt".into(),
+            Value::Bool(add_generation_prompt),
+        );
+        ctx.entry("bos_token".to_string())
+            .or_insert_with(|| Value::String(self.bos_token.clone()));
+        ctx.entry("eos_token".to_string())
+            .or_insert_with(|| Value::String(self.eos_token.clone()));
+        if let Some(t) = tools.filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
+            ctx.insert("tools".into(), t.clone());
+        }
+        let tmpl = self
+            .env
+            .get_template("chat")
+            .map_err(|e| format!("missing compiled chat template: {e}"))?;
+        tmpl.render(minijinja::value::Serde(&ctx))
+            .map_err(|e| format!("chat template render failed ({}): {e}", self.source_name))
+    }
+}
+
+fn extract_special_tokens_from_tokenizer_config(json_text: &str) -> (String, String) {
+    let Ok(root) = serde_json::from_str::<Value>(json_text) else {
+        return (String::new(), "<|im_end|>".to_string());
+    };
+    let token_str = |key: &str| -> Option<String> {
+        let v = root.get(key)?;
+        if let Some(s) = v.as_str() {
+            return Some(s.to_owned());
+        }
+        v.get("content").and_then(Value::as_str).map(str::to_owned)
+    };
+    let bos = token_str("bos_token").unwrap_or_default();
+    let eos = token_str("eos_token").unwrap_or_else(|| "<|im_end|>".to_string());
+    (bos, eos)
+}
+
+/// Formats a list of chat messages into a ChatML prompt string using the embedded default template.
 ///
 /// # Examples
 ///
@@ -135,124 +334,32 @@ pub fn format_chatml_prompt_with_options(
     enable_thinking: bool,
     preserve_thinking: bool,
 ) -> String {
-    let mut out = String::new();
-    let head_system_count = messages.iter().take_while(|m| m.role == "system").count();
-    let leading_system: String = messages[..head_system_count]
-        .iter()
-        .filter_map(|m| {
-            m.content
-                .as_deref()
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let tools = tools.and_then(Value::as_array).filter(|t| !t.is_empty());
-    if let Some(tools) = tools {
-        out.push_str(
-            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
-        );
-        for tool in tools {
-            out.push('\n');
-            out.push_str(&template_json(tool));
-        }
-        out.push_str("\n</tools>");
-        out.push_str(TOOL_INSTRUCTIONS);
-        if !leading_system.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&leading_system);
-        }
-        out.push_str("<|im_end|>\n");
-    } else if head_system_count > 0 {
-        out.push_str("<|im_start|>system\n");
-        out.push_str(&leading_system);
-        out.push_str("<|im_end|>\n");
-    }
-    let last_query = messages.iter().rposition(|m| {
-        let content = m.content.as_deref().unwrap_or("").trim();
-        m.role == "user"
-            && !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
-    });
-    for (index, message) in messages.iter().enumerate() {
-        let mut content = message.content.as_deref().unwrap_or("").trim();
-        match message.role.as_str() {
-            "system" if index < head_system_count => {}
-            "system" => {
-                out.push_str("<|im_start|>system\n");
-                out.push_str(content);
-                out.push_str("<|im_end|>\n");
-            }
-            "tool" => {
-                if index == 0 || messages[index - 1].role != "tool" {
-                    out.push_str("<|im_start|>user");
+    let mut kwargs = Map::new();
+    kwargs.insert("enable_thinking".into(), Value::Bool(enable_thinking));
+    kwargs.insert("preserve_thinking".into(), Value::Bool(preserve_thinking));
+    match ChatTemplate::default_qwen().render(messages, tools, true, &kwargs) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            eprintln!("warning: default chat template render failed: {err}");
+            let mut fallback = String::new();
+            for m in messages {
+                fallback.push_str("<|im_start|>");
+                fallback.push_str(&m.role);
+                fallback.push('\n');
+                if let Some(c) = m.content.as_deref() {
+                    fallback.push_str(c.trim());
                 }
-                out.push_str("\n<tool_response>\n");
-                out.push_str(content);
-                out.push_str("\n</tool_response>");
-                if messages.get(index + 1).is_none_or(|m| m.role != "tool") {
-                    out.push_str("<|im_end|>\n");
-                }
+                fallback.push_str("<|im_end|>\n");
             }
-            "assistant" => {
-                let reasoning = if let Some(reasoning) = message.reasoning_content.as_deref() {
-                    reasoning
-                } else if let Some((before, _)) = content.split_once("</think>") {
-                    let reasoning = before.rsplit("<think>").next().unwrap_or(before);
-                    content = content
-                        .rsplit("</think>")
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches('\n');
-                    reasoning
-                } else {
-                    ""
-                };
-                out.push_str("<|im_start|>assistant\n");
-                if preserve_thinking || last_query.is_some_and(|last| index > last) {
-                    out.push_str("<think>\n");
-                    out.push_str(reasoning.trim());
-                    out.push_str("\n</think>\n\n");
-                }
-                out.push_str(content);
-                for (call_index, call) in message.tool_calls.iter().enumerate() {
-                    if call_index > 0 {
-                        out.push('\n');
-                    } else if !content.trim().is_empty() {
-                        out.push_str("\n\n");
-                    }
-                    out.push_str("<tool_call>\n<function=");
-                    out.push_str(&call.function.name);
-                    out.push_str(">\n");
-                    for (name, value) in &call.function.arguments {
-                        out.push_str("<parameter=");
-                        out.push_str(name);
-                        out.push_str(">\n");
-                        match value {
-                            Value::String(text) => out.push_str(text),
-                            _ => out.push_str(&template_json(value)),
-                        }
-                        out.push_str("\n</parameter>\n");
-                    }
-                    out.push_str("</function>\n</tool_call>");
-                }
-                out.push_str("<|im_end|>\n");
+            fallback.push_str("<|im_start|>assistant\n");
+            if enable_thinking {
+                fallback.push_str("<think>\n");
+            } else {
+                fallback.push_str("<think>\n\n</think>\n\n");
             }
-            _ => {
-                out.push_str("<|im_start|>");
-                out.push_str(&message.role);
-                out.push('\n');
-                out.push_str(content);
-                out.push_str("<|im_end|>\n");
-            }
+            fallback
         }
     }
-    out.push_str("<|im_start|>assistant\n");
-    if enable_thinking {
-        out.push_str("<think>\n");
-    } else {
-        out.push_str("<think>\n\n</think>\n\n");
-    }
-    out
 }
 
 /// Inspects a checkpoint directory's `chat_template.jinja` (falling back to
@@ -409,7 +516,9 @@ mod tests {
         let prompt = format_chatml_prompt(&messages, Some(&tools), false);
         assert!(prompt.contains("# Tools"));
         assert!(prompt.contains("lookup_stock"));
-        assert!(prompt.contains(TOOL_INSTRUCTIONS));
+        assert!(prompt.contains(
+            "If you choose to call a function ONLY reply in the following format with NO suffix:"
+        ));
     }
 
     #[test]
@@ -567,5 +676,146 @@ mod tests {
             prompt_t2.starts_with(&expected_prefix),
             "Turn 2 prompt must start with exact Turn 1 prompt + output prefix!\nprompt_t2:\n{prompt_t2}\nexpected_prefix:\n{expected_prefix}"
         );
+    }
+
+    #[test]
+    fn test_chat_template_reasoning_effort_and_model_dir_precedence() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("Be helpful.".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Hi".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+        ];
+        let tmpl = ChatTemplate::default_qwen();
+
+        let mut kw_low = Map::new();
+        kw_low.insert("reasoning_effort".into(), Value::String("low".into()));
+        let p_low = tmpl.render(&msgs, None, true, &kw_low).unwrap();
+        assert!(p_low.contains("Reasoning effort is set to low."));
+        assert!(p_low.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        let mut kw_high = Map::new();
+        kw_high.insert("reasoning_effort".into(), Value::String("high".into()));
+        let p_high = tmpl.render(&msgs, None, true, &kw_high).unwrap();
+        assert!(p_high.contains("Reasoning effort is set to xhigh."));
+        assert!(p_high.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        let mut kw_med = Map::new();
+        kw_med.insert("reasoning_effort".into(), Value::String("medium".into()));
+        let p_med = tmpl.render(&msgs, None, true, &kw_med).unwrap();
+        assert!(!p_med.contains("Reasoning effort is set to"));
+        assert!(p_med.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        let mut kw_none = Map::new();
+        kw_none.insert("reasoning_effort".into(), Value::String("none".into()));
+        let p_none = tmpl.render(&msgs, None, true, &kw_none).unwrap();
+        assert!(p_none.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+
+        // Precedence: chat_template.jinja > tokenizer_config.json > default-qwen
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ChatTemplate::from_model_dir(dir.path()).source_name(),
+            "default-qwen"
+        );
+
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "TC:{{ messages[0].content }}:{{ reasoning_effort | default('unset') }}"}"#,
+        )
+        .unwrap();
+        let tc_tmpl = ChatTemplate::from_model_dir(dir.path());
+        assert_eq!(tc_tmpl.source_name(), "tokenizer_config.json");
+        assert_eq!(
+            tc_tmpl.render(&msgs, None, true, &kw_low).unwrap(),
+            "TC:Be helpful.:low"
+        );
+
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "JINJA:{{ messages[1].content }}:{{ reasoning_effort | default('unset') }}",
+        )
+        .unwrap();
+        let j_tmpl = ChatTemplate::from_model_dir(dir.path());
+        assert_eq!(j_tmpl.source_name(), "chat_template.jinja");
+        assert_eq!(
+            j_tmpl.render(&msgs, None, true, &kw_high).unwrap(),
+            "JINJA:Hi:high"
+        );
+
+        // Negative step slicing (used by Qwen3.5/3.6/3.8 chat_template.jinja: `_msgs[::-1]`)
+        let slice_tmpl = ChatTemplate::from_source(
+            "{%- for m in messages[::-1] %}{{ m.role }},{%- endfor %}",
+            "slice-test",
+        )
+        .unwrap();
+        assert_eq!(
+            slice_tmpl.render(&msgs, None, false, &Map::new()).unwrap(),
+            "user,system,"
+        );
+    }
+
+    #[test]
+    fn test_real_cached_qwen38_chat_template_if_present() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let snap = std::path::PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/cc31dcc0856d9b8b53ef4f22253f6c753f0f692e",
+        );
+        if !snap.join("chat_template.jinja").is_file() {
+            return;
+        }
+        let tmpl = ChatTemplate::from_model_dir(&snap);
+        assert_eq!(tmpl.source_name(), "chat_template.jinja");
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("You are helpful.".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Hello".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Hi there!".into()),
+                reasoning_content: Some("Thinking...".into()),
+                tool_calls: vec![],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Run a tool".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+            },
+        ];
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run shell",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}
+            }
+        }]);
+        let mut kw = Map::new();
+        kw.insert("enable_thinking".into(), Value::Bool(true));
+        kw.insert("reasoning_effort".into(), Value::String("low".into()));
+        let rendered = tmpl.render(&msgs, Some(&tools), true, &kw).unwrap();
+        assert!(rendered.contains("Reasoning effort is set to low."));
+        assert!(rendered.contains("<think>\nThinking...\n</think>"));
+        assert!(rendered.contains("# Tools"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
     }
 }

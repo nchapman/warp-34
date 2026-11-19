@@ -246,9 +246,11 @@ pub struct EngineWorker {
     pub eos_token_ids: Vec<i32>,
     pub vocab_size: usize,
     pub default_preserve_thinking: bool,
+    pub chat_template: crate::chatml::ChatTemplate,
     pub default_sampling_params: SamplingParams,
     pub decision_profile: crate::decision::DecisionModelProfile,
     pub vision_config: Option<crate::vision::VisionConfig>,
+    pub vision_preprocessor: crate::vision::VisionPreprocessorConfig,
     pub has_vision_weights: bool,
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
@@ -356,6 +358,8 @@ impl EngineWorker {
                     }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
+                    let chat_template =
+                        crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
                     let default_sampling_params =
                         SamplingParams::from_generation_config_dir(&engine.model_dir);
                     let unshareable_prefill = engine.cfg.noncausal_full_attention
@@ -365,9 +369,11 @@ impl EngineWorker {
                         engine.cfg.eos_token_ids.clone(),
                         engine.cfg.vocab_size,
                         default_preserve_thinking,
+                        chat_template,
                         default_sampling_params,
                         engine.decision_profile.clone(),
                         engine.cfg.vision_config.clone(),
+                        engine.cfg.vision_preprocessor.clone(),
                         engine.has_vision_weights,
                         engine.cfg.hidden_size,
                         kv_token_capacity,
@@ -397,9 +403,11 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            chat_template,
             default_sampling_params,
             decision_profile,
             vision_config,
+            vision_preprocessor,
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
@@ -428,9 +436,11 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            chat_template,
             default_sampling_params,
             decision_profile,
             vision_config,
+            vision_preprocessor,
             has_vision_weights,
             hidden_size,
             kv_token_capacity,

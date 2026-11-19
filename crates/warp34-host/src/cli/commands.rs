@@ -10,25 +10,14 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
     if image_urls.is_empty() {
         return Ok((raw_prompt.to_string(), Vec::new()));
     }
-    let (patch_size, temporal_patch_size, merge_size) =
-        cfg.vision_config.as_ref().map_or((16, 2, 2), |v| {
-            (v.patch_size, v.temporal_patch_size, v.spatial_merge_size)
-        });
+    let merge_size = cfg.vision_preprocessor.spatial_merge_size;
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
         let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)?;
         crate::vision::validate_image_aspect_ratio(h, w)?;
-        let pre = crate::vision::preprocess_rgb_image(
-            &rgb,
-            h,
-            w,
-            patch_size,
-            temporal_patch_size,
-            merge_size,
-            64 * 32 * 32,
-            2048 * 32 * 32,
-        );
+        let pre =
+            crate::vision::preprocess_rgb_image_with_config(&rgb, h, w, &cfg.vision_preprocessor);
         if !raw_prompt.contains("<|image_pad|>") {
             let n_pads = pre.num_merged_tokens(merge_size);
             prefix.push_str("<|vision_start|>");
@@ -1180,7 +1169,13 @@ pub(crate) fn run_chat(
         content: Some(expanded_prompt),
         reasoning_content: None,
     });
-    let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
+    let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+    let mut template_kwargs = serde_json::Map::new();
+    template_kwargs.insert(
+        "enable_thinking".into(),
+        serde_json::Value::Bool(enable_thinking),
+    );
+    let formatted = chat_template.render(&msgs, None, true, &template_kwargs)?;
     let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
     let metrics = if sampling.is_custom() {
         let params = sampling.to_sampling_params(max_tokens, &engine.cfg.eos_token_ids);
@@ -1367,7 +1362,13 @@ fn run_chat_repl(
                 content: Some(input.to_string()),
                 reasoning_content: None,
             });
-            let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
+            let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+            let mut template_kwargs = serde_json::Map::new();
+            template_kwargs.insert(
+                "enable_thinking".into(),
+                serde_json::Value::Bool(enable_thinking),
+            );
+            let formatted = chat_template.render(&msgs, None, true, &template_kwargs)?;
             let ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
             if kv_tokens > 0
                 && ids.len().saturating_add(max_tokens) > kv_tokens

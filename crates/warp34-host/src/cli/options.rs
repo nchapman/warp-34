@@ -269,6 +269,9 @@ impl ServeCliConfig {
                 | "--parallel"
                 | "-np"
                 | "--max-model-len"
+                | "--reasoning-effort"
+                | "--reasoning-budget"
+                | "--reasoning-budget-message"
         ) {
             if matches!(
                 flag,
@@ -331,6 +334,24 @@ impl ServeCliConfig {
             }
             "--max-model-len" => {
                 self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?);
+            }
+            "--reasoning-effort" => {
+                crate::server::validate_reasoning_effort(&value)?;
+                self.options.reasoning_effort = Some(value);
+            }
+            "--reasoning-budget" => {
+                let parsed: i64 = value.parse().map_err(|_| "invalid --reasoning-budget")?;
+                if parsed < -1 {
+                    return Err("--reasoning-budget must be >= -1 (-1 for unlimited)".into());
+                }
+                self.options.reasoning_budget = if parsed == -1 {
+                    None
+                } else {
+                    Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?)
+                };
+            }
+            "--reasoning-budget-message" => {
+                self.options.reasoning_budget_message = Some(value);
             }
             _ => unreachable!(),
         }
