@@ -34,6 +34,7 @@ import {
 
 interface PlaygroundProps {
   model: string | null;
+  loraAdapters?: string[];
   maxContextTokens?: number | null;
   decisionMode?: boolean;
 }
@@ -126,6 +127,7 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
 
 export function Playground({
   model,
+  loraAdapters = [],
   maxContextTokens = null,
   decisionMode = false,
 }: PlaygroundProps) {
@@ -138,7 +140,12 @@ export function Playground({
   const endpoint = ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0];
 
   const [presetId, setPresetId] = useState<string>(initial.presetId);
-  const activeModel = model ?? DEFAULT_MODEL;
+  const [selectedAdapter, setSelectedAdapter] = useState<string>("");
+  const baseModel = model ?? DEFAULT_MODEL;
+  const activeModel =
+    selectedAdapter && loraAdapters.includes(selectedAdapter)
+      ? selectedAdapter
+      : baseModel;
   const maxTokensLimit =
     maxContextTokens && maxContextTokens > 0 ? maxContextTokens : 1_048_576;
 
@@ -781,6 +788,31 @@ export function Playground({
                 {endpoint.presets.find((p) => p.id === presetId)?.description}
               </FieldDescription>
             </Field>
+
+            {loraAdapters.length > 0 && endpoint.method !== "GET" && (
+              <Field className="pg-field gap-2">
+                <FieldLabel htmlFor="pg-model" className="eyebrow text-[11px]">
+                  MODEL / LORA
+                </FieldLabel>
+                <NativeSelect
+                  disabled={inFlight}
+                  id="pg-model"
+                  value={
+                    selectedAdapter && loraAdapters.includes(selectedAdapter)
+                      ? selectedAdapter
+                      : ""
+                  }
+                  onChange={(e) => setSelectedAdapter(e.target.value)}
+                >
+                  <option value="">{baseModel} (base)</option>
+                  {loraAdapters.map((adapter) => (
+                    <option key={adapter} value={adapter}>
+                      {adapter} (LoRA)
+                    </option>
+                  ))}
+                </NativeSelect>
+              </Field>
+            )}
 
             <div className="pg-actions">
               <Button

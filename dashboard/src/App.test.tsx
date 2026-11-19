@@ -260,4 +260,46 @@ describe("dashboard states", () => {
       /Paused.*Read-only/,
     );
   });
+  it("shows subtle LoRA adapter indicators on Overview when adapters are loaded", () => {
+    const { rerender } = render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("LoRA: sql-expert")).toBeVisible();
+
+    rerender(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert", "code-review"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("2 LoRAs")).toBeVisible();
+    expect(screen.getByText("LoRA: sql-expert, code-review")).toBeVisible();
+  });
 });

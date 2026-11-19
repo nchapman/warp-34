@@ -123,6 +123,8 @@ pub struct Config {
     pub speculation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lora_adapters: Vec<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Snapshot {
@@ -171,6 +173,7 @@ impl Default for Telemetry {
             kv_format: "unknown".into(),
             speculation: "none".into(),
             max_model_len: None,
+            lora_adapters: Vec::new(),
         }))
         .ok()
         .unwrap()
@@ -559,6 +562,12 @@ impl Snapshot {
                 .unwrap();
             }
         }
+        writeln!(
+            out,
+            "# HELP warp34_lora_adapters_loaded Number of static LoRA adapters loaded on this engine.\n# TYPE warp34_lora_adapters_loaded gauge\nwarp34_lora_adapters_loaded {}",
+            self.config.lora_adapters.len()
+        )
+        .unwrap();
         out.push_str("# HELP warp34_http_responses_total Inference HTTP response headers by bounded status class; excludes scrapes, status, token counts, and static routes.\n# TYPE warp34_http_responses_total counter\n");
         for (class, n) in [
             ("success", self.http_responses.success),
@@ -590,6 +599,7 @@ mod tests {
             kv_format: "tq4".into(),
             speculation: "none".into(),
             max_model_len: None,
+            lora_adapters: Vec::new(),
         })
     }
     #[test]
@@ -700,6 +710,7 @@ mod tests {
         t.http_response(400);
         t.http_response(503);
         let mut s = t.snapshot();
+        s.config.lora_adapters = vec!["sql-expert".into(), "code-review".into()];
         s.latency.ttft = h;
         s.pools.gdn_checkpoints = Some(CheckpointPoolStats {
             vram_capacity: 16,
@@ -711,6 +722,10 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json.as_object().unwrap().len(), 12);
         assert!(json.get("peak_running").is_none());
+        assert_eq!(
+            json["config"]["lora_adapters"],
+            serde_json::json!(["sql-expert", "code-review"])
+        );
         assert_eq!(json["latency"]["ttft"]["count"], 3);
         assert_eq!(json["speculation"]["draft_tokens"], 0);
         assert_eq!(json["pools"]["gdn_checkpoints"]["vram_capacity"], 16);
@@ -721,6 +736,7 @@ mod tests {
         assert!(p.contains("warp34_ttft_seconds_bucket{le=\"+Inf\"} 3"));
         assert!(p.contains("model=\"a\\\"b\\\\c\\nd\""));
         assert!(p.contains("# TYPE warp34_requests_total counter"));
+        assert!(p.contains("warp34_lora_adapters_loaded 2"));
         assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_vram\",state=\"capacity\"} 16"));
         assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_vram\",state=\"used\"} 12"));
         assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_host\",state=\"capacity\"} 99"));

@@ -834,4 +834,39 @@ describe("Playground UI integration", () => {
     ) as HTMLTextAreaElement;
     expect(JSON.parse(rawEditor.value).max_tokens).toBeUndefined();
   });
+
+  it("lets users select loaded LoRA adapters in Playground and updates request model", async () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-9B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert", "code-review"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
+    const modelSelect = screen.getByLabelText(
+      "MODEL / LORA",
+    ) as HTMLSelectElement;
+    expect(modelSelect.value).toBe("");
+
+    fireEvent.change(modelSelect, { target: { value: "sql-expert" } });
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    expect(JSON.parse(rawEditor.value).model).toBe("sql-expert");
+  });
 });

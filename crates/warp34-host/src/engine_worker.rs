@@ -320,6 +320,12 @@ impl EngineWorker {
                                 .map_or("none", |p| if p.is_mtp() { "mtp" } else { "dflash2" })
                                 .into(),
                             max_model_len: Some(default_max_model_len),
+                            lora_adapters: engine
+                                .lora_registry
+                                .entries()
+                                .iter()
+                                .map(|e| e.name.clone())
+                                .collect(),
                         },
                         engine
                             .model_dir

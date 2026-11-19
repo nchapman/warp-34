@@ -27,6 +27,7 @@ export interface Snapshot {
     kv_format: string;
     speculation: string;
     max_model_len?: number;
+    lora_adapters?: string[];
   };
   requests: {
     submitted: number;
@@ -125,6 +126,9 @@ export function parseSnapshot(value: unknown): Snapshot {
     typeof config.kv_format === "string" &&
     typeof config.speculation === "string" &&
     (config.max_model_len === undefined || isNumber(config.max_model_len)) &&
+    (config.lora_adapters === undefined ||
+      (Array.isArray(config.lora_adapters) &&
+        config.lora_adapters.every((a) => typeof a === "string"))) &&
     hasNumbers(requests, [
       "submitted",
       "completed",

@@ -108,6 +108,23 @@ describe("shared metric derivations", () => {
       },
     };
     expect(() => parseSnapshot(malformed)).toThrow();
+    const withLora = snapshot({
+      config: {
+        tp_size: 1,
+        kv_format: "tq4",
+        speculation: "none",
+        lora_adapters: ["sql-expert"],
+      },
+    });
+    expect(parseSnapshot(withLora).config.lora_adapters).toEqual([
+      "sql-expert",
+    ]);
+    expect(() =>
+      parseSnapshot({
+        ...withLora,
+        config: { ...withLora.config, lora_adapters: [123] },
+      }),
+    ).toThrow();
   });
   it("does not draw across unavailable samples or disconnected intervals", () => {
     const points = normalizeChartPoints([

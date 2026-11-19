@@ -215,6 +215,7 @@ function Overview({ state }: { state: MetricsState }) {
     !["none", "off", "disabled"].includes(
       latest.config.speculation.toLowerCase(),
     );
+  const loraAdapters = latest?.config.lora_adapters ?? [];
   return (
     <>
       <div className="section-heading">
@@ -260,6 +261,14 @@ function Overview({ state }: { state: MetricsState }) {
           <span className="model-name" title={latest?.model}>
             {latest?.model ?? "Waiting for engine…"}
           </span>
+          {loraAdapters.length > 1 && (
+            <span
+              className="model-adapters"
+              title={`Loaded LoRA adapters: ${loraAdapters.join(", ")}`}
+            >
+              LoRA: {loraAdapters.join(", ")}
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <Badge variant="secondary">TP {latest?.config.tp_size ?? "—"}</Badge>
@@ -273,6 +282,16 @@ function Overview({ state }: { state: MetricsState }) {
           ) : null}
           {specEnabled && (
             <Badge variant="secondary">{latest.config.speculation}</Badge>
+          )}
+          {loraAdapters.length > 0 && (
+            <Badge
+              variant="outline"
+              title={`Loaded LoRA adapters: ${loraAdapters.join(", ")}`}
+            >
+              {loraAdapters.length === 1
+                ? `LoRA: ${loraAdapters[0]}`
+                : `${loraAdapters.length} LoRAs`}
+            </Badge>
           )}
         </div>
       </section>
@@ -995,6 +1014,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
             element={
               <Playground
                 model={latest?.model ?? null}
+                loraAdapters={latest?.config.lora_adapters}
                 maxContextTokens={
                   latest?.config.max_model_len ??
                   (latest?.pools.kv.capacity
@@ -1009,6 +1029,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
             element={
               <Playground
                 model={latest?.model ?? null}
+                loraAdapters={latest?.config.lora_adapters}
                 maxContextTokens={
                   latest?.config.max_model_len ??
                   (latest?.pools.kv.capacity

@@ -61,6 +61,9 @@ are served from an embedded allowlist, never the filesystem.
 All counters reset with a process restart. Time measurements are monotonic seconds.
 Model configuration labels appear only on `warp34_model_info`; labels on other families
 have fixed, bounded values. Use Prometheus target labels to distinguish servers.
+`warp34_lora_adapters_loaded` reports the number of static LoRA adapters loaded on the
+engine (individual adapter names are listed in `/api/metrics` under
+`config.lora_adapters` and in `/v1/models`).
 
 ### Work and outcomes
 
