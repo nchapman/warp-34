@@ -660,10 +660,17 @@ fn admit_requests(
             .speculative
             .as_ref()
             .map_or(0, |p| p.batch_slot_count());
+        // Use multi-slot speculation by default whenever the server allows concurrent slots
+        // (`max_num_seqs >= 2`), even for `target_batch == 1`, so alternating sequential
+        // sessions (e.g. Claude Code main turns + background classifier calls) stay warm in
+        // separate proposer slots instead of evicting each other. `--max-num-seqs 1` and
+        // tiered-MoE keep single-slot mode for full pooled ring depth.
         let prefer_batch_mode = engine.speculative.as_ref().is_some_and(|p| {
             target_batch >= 1
                 && target_batch <= batch_slot_limit
-                && (target_batch >= 2 || p.is_mtp_batch_mode())
+                && (target_batch >= 2
+                    || p.is_mtp_batch_mode()
+                    || (sched.cfg.max_num_seqs >= 2 && !engine.cfg.uses_tiered_moe()))
                 && sched
                     .waiting
                     .iter()
