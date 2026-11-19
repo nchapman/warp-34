@@ -830,6 +830,13 @@ pub fn translate_anthropic_to_chat(
     };
     if let Some(thinking) = enable_thinking {
         template_kwargs.insert("enable_thinking".into(), json!(thinking));
+    } else if !template_kwargs.contains_key("enable_thinking") {
+        // In Anthropic's Messages API, omitting both `thinking` and `output_config.effort`
+        // disables extended thinking (e.g., Claude Code's background classifier / `</block>` calls).
+        template_kwargs.insert("enable_thinking".into(), json!(false));
+        chat_req
+            .entry("reasoning_effort")
+            .or_insert_with(|| json!("none"));
     }
     if !template_kwargs.is_empty() {
         chat_req.insert(
@@ -1837,5 +1844,43 @@ mod tests {
         .unwrap();
         assert_eq!(large_chat["max_tokens"], 16_384);
         assert_eq!(large_chat["chat_template_kwargs"]["enable_thinking"], true);
+
+        // Omitting both `thinking` and `output_config.effort` disables thinking (Anthropic spec),
+        // preventing background classifier calls from burning reasoning tokens.
+        let (no_think_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 2112,
+                "stop_sequences": ["</block>"],
+                "messages": [{"role": "user", "content": "classify"}]
+            }),
+            "q",
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            no_think_chat["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert_eq!(no_think_chat["reasoning_effort"], "none");
+
+        // Explicit chat_template_kwargs.enable_thinking is still honored when thinking is omitted.
+        let (explicit_kw_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 256,
+                "chat_template_kwargs": {"enable_thinking": true},
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "q",
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_kw_chat["chat_template_kwargs"]["enable_thinking"],
+            true
+        );
     }
 }
