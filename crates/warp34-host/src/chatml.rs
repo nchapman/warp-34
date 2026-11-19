@@ -208,25 +208,48 @@ impl ChatTemplate {
     /// 2. `tokenizer_config.json` -> `chat_template`
     /// 3. Embedded default Qwen ChatML template
     pub fn from_model_dir(model_dir: &std::path::Path) -> Self {
-        let tc_text = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok();
+        let tc_path = model_dir.join("tokenizer_config.json");
+        let tc_text = match std::fs::read_to_string(&tc_path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                eprintln!("warning: failed to read {}: {e}", tc_path.display());
+                None
+            }
+        };
+        if let Some(ref text) = tc_text
+            && let Err(e) = serde_json::from_str::<Value>(text)
+        {
+            eprintln!("warning: malformed {}: {e}", tc_path.display());
+        }
         let (bos_token, eos_token) = tc_text.as_deref().map_or_else(
             || (String::new(), "<|im_end|>".to_string()),
             extract_special_tokens_from_tokenizer_config,
         );
 
-        if let Ok(source) = std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-            match Self::from_source_with_tokens(
-                &source,
-                "chat_template.jinja",
-                bos_token.clone(),
-                eos_token.clone(),
-            ) {
-                Ok(tmpl) => return tmpl,
-                Err(err) => {
-                    eprintln!(
-                        "warning: {err}; falling back to embedded default Qwen chat template"
-                    );
+        let jinja_path = model_dir.join("chat_template.jinja");
+        match std::fs::read_to_string(&jinja_path) {
+            Ok(source) => {
+                match Self::from_source_with_tokens(
+                    &source,
+                    "chat_template.jinja",
+                    bos_token.clone(),
+                    eos_token.clone(),
+                ) {
+                    Ok(tmpl) => return tmpl,
+                    Err(err) => {
+                        eprintln!(
+                            "warning: {err}; falling back to embedded default Qwen chat template"
+                        );
+                    }
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to read {}: {e}; falling back to tokenizer_config/default",
+                    jinja_path.display()
+                );
             }
         }
         if let Some(source) = tc_text

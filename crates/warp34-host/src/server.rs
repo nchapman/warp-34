@@ -610,13 +610,20 @@ pub fn resolve_chat_reasoning_budget(
         .get("reasoning_budget_message")
         .or_else(|| req.get("thinking_budget_message"))
         .filter(|v| !v.is_null());
+    const MAX_REASONING_BUDGET_MESSAGE_BYTES: usize = 512;
     let message = match msg_val {
         None => default_message.map(str::to_owned),
-        Some(v) => Some(
-            v.as_str()
-                .ok_or("reasoning_budget_message must be a string")?
-                .to_owned(),
-        ),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or("reasoning_budget_message must be a string")?;
+            if s.len() > MAX_REASONING_BUDGET_MESSAGE_BYTES {
+                return Err(format!(
+                    "reasoning_budget_message exceeds {MAX_REASONING_BUDGET_MESSAGE_BYTES} bytes"
+                ));
+            }
+            Some(s.to_owned())
+        }
     };
 
     Ok((budget, message))

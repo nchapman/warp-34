@@ -103,14 +103,27 @@ impl VisionPreprocessorConfig {
             cfg.temporal_patch_size = vc.temporal_patch_size;
             cfg.spatial_merge_size = vc.spatial_merge_size;
         }
-        let doc = std::fs::read_to_string(model_dir.join("preprocessor_config.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .or_else(|| {
-                let text = std::fs::read_to_string(model_dir.join("processor_config.json")).ok()?;
-                let root = serde_json::from_str::<serde_json::Value>(&text).ok()?;
-                root.get("image_processor").cloned()
-            });
+        let read_json = |filename: &str| -> Option<serde_json::Value> {
+            let path = model_dir.join(filename);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(e) => {
+                    eprintln!("warning: failed to read {}: {e}", path.display());
+                    return None;
+                }
+            };
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("warning: malformed {}: {e}", path.display());
+                    None
+                }
+            }
+        };
+        let doc = read_json("preprocessor_config.json").or_else(|| {
+            read_json("processor_config.json").and_then(|r| r.get("image_processor").cloned())
+        });
         if let Some(obj) = doc.as_ref().and_then(serde_json::Value::as_object) {
             cfg.apply_json_object(obj);
         }
@@ -147,6 +160,8 @@ impl VisionPreprocessorConfig {
                 self.rescale_factor = rf;
             }
         }
+        // HuggingFace `Qwen2VLImageProcessorFast` stores pixel areas in `size.shortest_edge`
+        // and `size.longest_edge` (e.g. 65536 / 16777216), while older configs use `min_pixels` / `max_pixels`.
         if let Some(min_p) = obj
             .get("size")
             .and_then(|s| s.get("shortest_edge"))
