@@ -509,22 +509,11 @@ pub(crate) fn run_bench(
             let distinct = engine
                 .generate_multimodal_with_radix_cache(&v_prompt_ids, &mm_imgs_b, 4, 64, false)
                 .map_err(|e| e.to_string())?;
-            let exact_parity = cold.generated_token_ids == warm.generated_token_ids;
-            let prefix_match_tokens = cold
-                .generated_token_ids
-                .iter()
-                .zip(&warm.generated_token_ids)
-                .take_while(|(a, b)| a == b)
-                .count();
-            // Compressed `WHT128-Q8_0` GDN checkpoints introduce ~0.25% 8-bit state
-            // quantization noise, which can flip a downstream greedy near-tie on deep MoE
-            // models while keeping the prefill and opening decode prefix identical.
-            let min_compressed_prefix = v_gen.min(4);
-            let lossless_parity = if engine.has_checkpoint_pool() {
-                exact_parity || prefix_match_tokens >= min_compressed_prefix
-            } else {
-                exact_parity
-            };
+            let (lossless_parity, prefix_match_tokens) = vision_warm_parity_ok(
+                &cold.generated_token_ids,
+                &warm.generated_token_ids,
+                engine.has_checkpoint_pool(),
+            );
             if !lossless_parity {
                 return Err(format!(
                     "vision benchmark: warm multimodal radix hit diverged from cold reference (prefix_match={prefix_match_tokens}/{v_gen}, compressed_ckpt={}, cached_prefix={}, cold_sample={:?}, warm_sample={:?})",
@@ -1556,6 +1545,34 @@ fn run_chat_repl(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Minimum matching greedy prefix length required when comparing cold vs warm
+/// vision benchmark runs backed by lossy 8-bit `WHT128-Q8_0` GDN checkpoints.
+/// Long enough (half of the 32-token vision bench) to catch corrupted state
+/// restores or off-by-one radix prefixes while tolerating late greedy near-ties.
+const COMPRESSED_VISION_MIN_PREFIX_TOKENS: usize = 16;
+
+fn vision_warm_parity_ok(
+    cold_ids: &[i32],
+    warm_ids: &[i32],
+    compressed_checkpoint: bool,
+) -> (bool, usize) {
+    let prefix_match_tokens = cold_ids
+        .iter()
+        .zip(warm_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let exact_parity = cold_ids == warm_ids;
+    let same_len = cold_ids.len() == warm_ids.len();
+    let ok = if compressed_checkpoint {
+        exact_parity
+            || (same_len
+                && prefix_match_tokens >= cold_ids.len().min(COMPRESSED_VISION_MIN_PREFIX_TOKENS))
+    } else {
+        exact_parity
+    };
+    (ok, prefix_match_tokens)
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -1613,5 +1630,34 @@ mod tests {
 
         let missing = vec!["/nonexistent/warp34_test_image.png".to_string()];
         assert!(prepare_multimodal_prompt_and_images(&cfg, "hello", &missing, false).is_err());
+    }
+
+    #[test]
+    fn vision_warm_parity_rejects_early_divergence_and_requires_exact_fp32() {
+        let cold: Vec<i32> = (100..132).collect();
+
+        // Exact match passes in both FP32 and compressed modes.
+        assert_eq!(vision_warm_parity_ok(&cold, &cold, false), (true, 32));
+        assert_eq!(vision_warm_parity_ok(&cold, &cold, true), (true, 32));
+
+        // Early divergence at step 4 (after 4 matching tokens) must fail in BOTH modes.
+        let mut early_div = cold.clone();
+        early_div[4] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &early_div, false), (false, 4));
+        assert_eq!(vision_warm_parity_ok(&cold, &early_div, true), (false, 4));
+
+        // Divergence just before the 16-token threshold (step 15) must also fail.
+        let mut step15_div = cold.clone();
+        step15_div[15] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &step15_div, true), (false, 15));
+
+        // Late near-tie divergence (step 23/32) fails FP32 exact mode, passes compressed mode.
+        let mut late_div = cold.clone();
+        late_div[23] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &late_div, false), (false, 23));
+        assert_eq!(vision_warm_parity_ok(&cold, &late_div, true), (true, 23));
+
+        // Length mismatch always fails even when the shared prefix is >= 16 tokens.
+        assert_eq!(vision_warm_parity_ok(&cold, &cold[..24], true), (false, 24));
     }
 }
