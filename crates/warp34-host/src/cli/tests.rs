@@ -1108,7 +1108,7 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
     );
     assert!(prof_args.iter().any(|a| a == "--allow-remote-images"));
 
-    let banner = super::commands::format_serve_boot_banner(&super::commands::ServeBootSummary {
+    let summary = super::commands::ServeBootSummary {
         served_model: "qwen3.8-27b-warp34".to_string(),
         checkpoint_label: "nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64".to_string(),
         gpu_name: "NVIDIA GeForce RTX 3090 Ti".to_string(),
@@ -1118,6 +1118,7 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         total_vram_bytes: 24 * 1024 * 1024 * 1024,
         post_load_free_vram_bytes: 467 * 1024 * 1024,
         kv_policy: KvFormatPolicy::Tq4All,
+        supports_fp8_kv: false,
         kv_policy_explicit: false,
         kv_policy_auto_adjusted: true,
         kv_pages: 16_384,
@@ -1155,9 +1156,12 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         vision_banner: Some(
             "preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)".to_string(),
         ),
-    });
+        lora_adapters: Vec::new(),
+    };
+    let banner = super::commands::format_serve_boot_banner(&summary);
     assert!(banner.contains("|__/|__/\\__,_/_/  / .___/____/  /_/"));
     assert!(banner.contains("qwen3.8-27b-warp34 (nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64)"));
+    assert!(!banner.contains("LoRA         :"));
     assert!(
         banner.contains("Sampling     : temp=1, top_p=0.95, top_k=20 [generation_config.json]")
     );
@@ -1172,6 +1176,63 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
     assert!(banner.contains("13 slots"));
     assert!(banner.contains("99 WHT128-Q8_0 ckpts (2 VRAM + 97 Host, 41.1 MiB/slot)"));
     assert!(banner.contains("host-mapped"));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
+    let mut summary = super::commands::ServeBootSummary {
+        served_model: "qwen3.5-9b".to_string(),
+        checkpoint_label: "qwen3.5-9b".to_string(),
+        gpu_name: "NVIDIA GeForce RTX 3090 Ti".to_string(),
+        gpu_sm_tag: "sm_86".to_string(),
+        gpu_sm_count: 84,
+        tp_size: 1,
+        total_vram_bytes: 24 * 1024 * 1024 * 1024,
+        post_load_free_vram_bytes: 1024 * 1024 * 1024,
+        kv_policy: KvFormatPolicy::Tq4,
+        supports_fp8_kv: false,
+        kv_policy_explicit: false,
+        kv_policy_auto_adjusted: false,
+        kv_pages: 16_384,
+        context_limit: 262_144,
+        max_model_context_tokens: 262_144,
+        context_auto_fitted: true,
+        kv_pool_bytes_per_rank: 1_986_000_000,
+        state_slots: 64,
+        state_pool_bytes_per_rank: 4_500_000_000,
+        ckpt_vram_slots: 16,
+        ckpt_host_slots: 99,
+        ckpt_bytes_per_slot: 20_132_659,
+        weight_bytes_per_rank: 6_000_000_000,
+        scratch_bytes_per_rank: 512 * 1024 * 1024,
+        host_embed_offload: false,
+        embed_saved_bytes: 0,
+        speculative_label: "none".to_string(),
+        max_num_seqs: 64,
+        bind_addr: "127.0.0.1:8000".to_string(),
+        auth_enabled: false,
+        webui_enabled: true,
+        use_cuda_graph: true,
+        default_sampling_params: crate::parser::SamplingParams::default(),
+        sampling_from_generation_config: false,
+        chat_template_source: "tokenizer_config.json".to_string(),
+        preserve_thinking: false,
+        reasoning_effort_budget: true,
+        default_reasoning_budget: None,
+        default_reasoning_budget_message: None,
+        vision_banner: None,
+        lora_adapters: vec!["sql-expert".to_string()],
+    };
+    let banner_sm86 = super::commands::format_serve_boot_banner(&summary);
+    assert!(banner_sm86.contains("  LoRA         : sql-expert\n"));
+    assert!(banner_sm86.contains("tq4 (3.07x, rotated TQ4 + Q8_0 tail) [auto]"));
+
+    summary.supports_fp8_kv = true;
+    summary.lora_adapters.push("code-review".to_string());
+    let banner_sm89 = super::commands::format_serve_boot_banner(&summary);
+    assert!(banner_sm89.contains("  LoRA         : sql-expert, code-review (2 adapters)\n"));
+    assert!(banner_sm89.contains("tq4 (3.10x, rotated TQ4 + FP8 tail) [auto]"));
 }
 
 #[cfg(feature = "cuda")]

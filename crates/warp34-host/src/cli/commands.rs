@@ -732,6 +732,7 @@ pub(crate) struct ServeBootSummary {
     pub(crate) total_vram_bytes: usize,
     pub(crate) post_load_free_vram_bytes: usize,
     pub(crate) kv_policy: KvFormatPolicy,
+    pub(crate) supports_fp8_kv: bool,
     pub(crate) kv_policy_explicit: bool,
     pub(crate) kv_policy_auto_adjusted: bool,
     pub(crate) kv_pages: usize,
@@ -762,6 +763,7 @@ pub(crate) struct ServeBootSummary {
     pub(crate) default_reasoning_budget: Option<usize>,
     pub(crate) default_reasoning_budget_message: Option<String>,
     pub(crate) vision_banner: Option<String>,
+    pub(crate) lora_adapters: Vec<String>,
 }
 
 #[cfg(feature = "cuda")]
@@ -846,9 +848,10 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
     let gib = 1024.0 * 1024.0 * 1024.0;
     let mib = 1024.0 * 1024.0;
     let kv_desc = match s.kv_policy {
-        KvFormatPolicy::Tq4 => "tq4 (3.07x, rotated Q8_0 boundaries + TQ4 interior)",
+        KvFormatPolicy::Tq4 if s.supports_fp8_kv => "tq4 (3.10x, rotated TQ4 + FP8 tail)",
+        KvFormatPolicy::Tq4 => "tq4 (3.07x, rotated TQ4 + Q8_0 tail)",
         KvFormatPolicy::Tq4All => "tq4_all (3.88x, 132B/row TQ4 all attention layers)",
-        KvFormatPolicy::Fp8 => "fp8 (2.00x, hardware E4M3)",
+        KvFormatPolicy::Fp8 => "fp8 (1.94x, 264B/row hardware E4M3)",
         KvFormatPolicy::Q8_0 => "q8_0 (1.88x, 272B/row)",
         KvFormatPolicy::Fp16 => "fp16 (1.00x, 512B/row)",
         KvFormatPolicy::Bf16 => "bf16 (1.00x, 512B/row)",
@@ -906,6 +909,14 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.default_reasoning_budget,
         s.default_reasoning_budget_message.as_deref(),
     );
+    let lora_line = match s.lora_adapters.len() {
+        0 => String::new(),
+        1 => format!("  LoRA         : {}\n", s.lora_adapters[0]),
+        n => format!(
+            "  LoRA         : {} ({n} adapters)\n",
+            s.lora_adapters.join(", ")
+        ),
+    };
     let vision_line = s
         .vision_banner
         .as_deref()
@@ -922,6 +933,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "                 /_/                   Hybrid GDN + Attention + MoE CUDA Engine\n",
             "\n",
             "  Model        : {}\n",
+            "{}",
             "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
             "  Speculative  : {}\n",
             "  Sampling     : {}\n",
@@ -936,6 +948,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         ),
         env!("CARGO_PKG_VERSION"),
         model_line,
+        lora_line,
         s.tp_size,
         s.gpu_name,
         s.gpu_sm_tag,
@@ -1081,7 +1094,10 @@ pub(crate) fn run_serve(
             if let Some(r0) = engine.ranks.first() {
                 let props = r0.device.props().ok();
                 let (post_free, total_vram) = r0.device.mem_info().unwrap_or((0, 0));
-                let supports_fp8 = props.as_ref().is_some_and(|p| p.supports_fp8_kv());
+                let supports_fp8 = engine
+                    .ranks
+                    .iter()
+                    .all(|r| r.device.props().is_ok_and(|p| p.supports_fp8_kv()));
                 let fit = engine.serving_fit;
                 let selected_kv_policy = fit.map_or(policy, |f| f.kv_policy);
                 let (page_bytes, state_bytes) = crate::model::Qwen3_5ModelRank::pool_geometry(
@@ -1109,6 +1125,7 @@ pub(crate) fn run_serve(
                         total_vram_bytes: total_vram,
                         post_load_free_vram_bytes: post_free,
                         kv_policy: selected_kv_policy,
+                        supports_fp8_kv: supports_fp8,
                         kv_policy_explicit: explicit_kv_format,
                         kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
                         kv_pages: r0.kv_pool.num_pages,
@@ -1164,6 +1181,12 @@ pub(crate) fn run_serve(
                                 vp.max_pixels,
                             )
                         }),
+                        lora_adapters: engine
+                            .lora_registry
+                            .entries()
+                            .iter()
+                            .map(|e| e.name.clone())
+                            .collect(),
                     });
             }
             Ok(engine)
