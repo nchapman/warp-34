@@ -14,6 +14,12 @@
   - Diagnosed two causes of `throughput-c16` TTFT inflation: (1) pure-prefill equal-share chunking split 16 × 165-token prompts into `128 + 37` chunks (doubling GDN launches and intermediate state traffic), and (2) once any request entered decode, a flat `256`-token mixed cap serialized remaining short prompts 1-by-1 across 10+ forward passes.
   - Updated `SchedulerV1::schedule_step` to skip pure-prefill splitting for short prompts (`rem <= mixed_cap`) and scale the aggregate mixed-step prefill budget by the count of eligible short causal prefills (`rem <= mixed_cap`, while keeping single-slice and multi-bulk mixed prefills strictly capped at `mixed_cap = 256`), with regression coverage in `test_short_prompt_burst_packs_without_splitting_and_scales_mixed_wave`.
   - Verified on `1× RTX 3090 Ti`: `throughput-c16` jumped from `1,229.2` to `1,255.7–1,274.1 tok/s` and `ttft_p50` dropped from `558 ms` to `413.6 ms` (faster than both `vLLM` `456.7 ms` and `SGLang` `489.8 ms`), with `mise run check-quick`, `15/15` `scheduler::tests`, and `review` clean.
+- **9B `TP=2` Head-to-Head Campaign (`benchmarks/perf/campaigns/9b-tp2-head-to-head.toml`, `2× RTX 3090 Ti` `sm_86`, PCIe `TP=2`):**
+  - `warp34 dump-diff --compare-tp2` on 9B passed (`min_cosine=0.999221`, `tp1_top1 == tp2_top1 == 271`).
+  - Serial 3-engine run (`warp34-9b-tp2-fp16` vs `vLLM 0.34.0` vs `SGLang v0.5.23`, 11 cases × 3 reps + warmup, 100% pass; raw artifacts in `benchmarks/perf/results/9b-tp2-head-to-head-2026-11-19/`):
+    - **Decode & continuous batching:** `warp34` led `C1` (`191.1 tok/s`, `+30.1%` vs vLLM `147.0`, `+4.6%` vs SGLang `182.8`), `C4` (`662.7 tok/s`, `+34.6%` vs vLLM `492.5`, `+19.6%` vs SGLang `553.9`), and `C8` (`987.0 tok/s`, `+15.3%` vs vLLM `855.8`, `+10.0%` vs SGLang `897.3`), and at `C16` hit `1,418.4 tok/s` (`+3.6%` vs vLLM `1,368.9`, `-0.5%` vs SGLang `1,424.9`, lower TTFT `426.6 ms` vs SGLang `430.0 ms`).
+    - **Long-context coding agent:** `warp34` swept 2/2 (`64K`: `33.34 tok/s` `+2.4%/+0.8%`, warm TTFT `389 ms` vs `491`/`493 ms`; `120K`: `18.50 tok/s` `+4.6%/+5.5%`, warm TTFT `506 ms` vs `664`/`668 ms`).
+    - **Cold prompt processing (`pp`, PCIe `TP=2`):** `warp34` matched SGLang (`4.9K`: `5,399` `+1.6%`; `115K`: `3,955` `+0.1%`; `16K–60K`: `-1.0%` to `-3.9%`) and trailed vLLM by `2.7%–5.1%` on multi-MiB (`16 MiB`) `M=2048` PCIe AllReduces (`4.9K`: `5,399` vs `5,582`; `115K`: `3,955` vs `4,169`).
 
 ## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`) & Pre-Release Verification Pass
 
