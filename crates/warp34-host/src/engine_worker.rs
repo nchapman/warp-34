@@ -1043,10 +1043,19 @@ fn publish_pools(
 ) {
     // Logical allocation is replicated across ranks; summing TP would double count.
     let rank = &engine.ranks[0];
-    let (ckpt_total, ckpt_free) = rank
-        .checkpoint_pool
-        .as_ref()
-        .map_or((0, 0), |c| (c.total_slots, c.free_count()));
+    let (ckpt_total, ckpt_free, gdn_checkpoints) = match rank.checkpoint_pool.as_ref() {
+        Some(c) => (
+            c.total_slots,
+            c.free_count(),
+            Some(crate::telemetry::CheckpointPoolStats {
+                vram_capacity: c.vram_slots as u64,
+                vram_used: c.vram_used_slots() as u64,
+                host_capacity: c.host_slots as u64,
+                host_used: c.host_used_slots() as u64,
+            }),
+        ),
+        None => (0, 0, None),
+    };
     telemetry.publish_pools(Pools {
         kv: Pool::known(
             rank.kv_pool.num_pages,
@@ -1058,6 +1067,7 @@ fn publish_pools(
             rank.state_pool.free_count().saturating_add(ckpt_free),
             radix.mamba_evictable_slots(),
         ),
+        gdn_checkpoints,
     });
 }
 

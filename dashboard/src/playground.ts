@@ -1417,6 +1417,36 @@ export function applySseFrameToResult(
       typeof parsed.delta === "string"
     ) {
       next.content += parsed.delta;
+    } else if (evType === "response.output_item.added" && parsed.item) {
+      const item = parsed.item as Record<string, unknown>;
+      if (item.type === "function_call") {
+        next.toolCalls.push({
+          id:
+            typeof item.call_id === "string"
+              ? item.call_id
+              : typeof item.id === "string"
+                ? item.id
+                : `call_${next.toolCalls.length}`,
+          name: typeof item.name === "string" ? item.name : "tool",
+          arguments: typeof item.arguments === "string" ? item.arguments : "",
+        });
+      }
+    } else if (
+      evType === "response.function_call_arguments.delta" &&
+      typeof parsed.delta === "string"
+    ) {
+      const last = next.toolCalls.at(-1);
+      if (last) {
+        last.arguments += parsed.delta;
+      }
+    } else if (
+      evType === "response.function_call_arguments.done" &&
+      typeof parsed.arguments === "string"
+    ) {
+      const last = next.toolCalls.at(-1);
+      if (last && !last.arguments) {
+        last.arguments = parsed.arguments;
+      }
     } else if (
       evType === "response.completed" ||
       evType === "response.incomplete" ||

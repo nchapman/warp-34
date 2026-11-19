@@ -223,4 +223,41 @@ describe("dashboard states", () => {
       screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384/),
     ).toBeVisible();
   });
+  it("renders context badge, cached pool counts, tiered GDN checkpoint occupancy, and paused footer", () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 2,
+                kv_format: "tq4",
+                speculation: "dflash2",
+                max_model_len: 262144,
+              },
+              pools: {
+                kv: { capacity: 16384, active: 64, cached: 512, free: 15808 },
+                gdn: { capacity: 179, active: 4, cached: 46, free: 129 },
+                gdn_checkpoints: {
+                  vram_capacity: 16,
+                  vram_used: 12,
+                  host_capacity: 99,
+                  host_used: 34,
+                },
+              },
+            }),
+          ],
+          connection: "paused",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("256k ctx")).toBeVisible();
+    expect(screen.getByText("512 cached · 15,808 free")).toBeVisible();
+    expect(screen.getByText("WHT128-Q8 checkpoints")).toBeVisible();
+    expect(screen.getByText("L1 12/16 VRAM · L2 34/99 RAM")).toBeVisible();
+    expect(screen.getByRole("contentinfo")).toHaveTextContent(
+      /Paused.*Read-only/,
+    );
+  });
 });

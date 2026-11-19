@@ -88,10 +88,21 @@ impl Pool {
         }
     }
 }
+/// Tiered `WHT128-Q8_0` GDN checkpoint occupancy (L1 VRAM and L2 pinned host RAM),
+/// counted once across TP ranks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CheckpointPoolStats {
+    pub vram_capacity: u64,
+    pub vram_used: u64,
+    pub host_capacity: u64,
+    pub host_used: u64,
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Pools {
     pub kv: Pool,
     pub gdn: Pool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gdn_checkpoints: Option<CheckpointPoolStats>,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Speculation {
@@ -536,6 +547,18 @@ impl Snapshot {
                 }
             }
         }
+        if let Some(ckpt) = &self.pools.gdn_checkpoints {
+            for (name, cap, used) in [
+                ("gdn_ckpt_vram", ckpt.vram_capacity, ckpt.vram_used),
+                ("gdn_ckpt_host", ckpt.host_capacity, ckpt.host_used),
+            ] {
+                writeln!(
+                    out,
+                    "warp34_pool_units{{pool=\"{name}\",state=\"capacity\"}} {cap}\nwarp34_pool_units{{pool=\"{name}\",state=\"used\"}} {used}"
+                )
+                .unwrap();
+            }
+        }
         out.push_str("# HELP warp34_http_responses_total Inference HTTP response headers by bounded status class; excludes scrapes, status, token counts, and static routes.\n# TYPE warp34_http_responses_total counter\n");
         for (class, n) in [
             ("success", self.http_responses.success),
@@ -678,16 +701,30 @@ mod tests {
         t.http_response(503);
         let mut s = t.snapshot();
         s.latency.ttft = h;
+        s.pools.gdn_checkpoints = Some(CheckpointPoolStats {
+            vram_capacity: 16,
+            vram_used: 12,
+            host_capacity: 99,
+            host_used: 34,
+        });
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json.as_object().unwrap().len(), 12);
         assert!(json.get("peak_running").is_none());
         assert_eq!(json["latency"]["ttft"]["count"], 3);
         assert_eq!(json["speculation"]["draft_tokens"], 0);
+        assert_eq!(json["pools"]["gdn_checkpoints"]["vram_capacity"], 16);
+        assert_eq!(json["pools"]["gdn_checkpoints"]["vram_used"], 12);
+        assert_eq!(json["pools"]["gdn_checkpoints"]["host_capacity"], 99);
+        assert_eq!(json["pools"]["gdn_checkpoints"]["host_used"], 34);
         let p = s.prometheus();
         assert!(p.contains("warp34_ttft_seconds_bucket{le=\"+Inf\"} 3"));
         assert!(p.contains("model=\"a\\\"b\\\\c\\nd\""));
         assert!(p.contains("# TYPE warp34_requests_total counter"));
+        assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_vram\",state=\"capacity\"} 16"));
+        assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_vram\",state=\"used\"} 12"));
+        assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_host\",state=\"capacity\"} 99"));
+        assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_host\",state=\"used\"} 34"));
         assert_eq!(Pool::known(100, 10, 70).active, Some(20));
         assert_eq!(t.snapshot().instance_id, telemetry().snapshot().instance_id);
     }

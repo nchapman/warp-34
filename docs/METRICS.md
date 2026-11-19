@@ -112,9 +112,13 @@ explicitly named instead. It is not pure GPU kernel time either.
 
 ### Resource capacity
 
-`warp34_pool_units{pool="kv|gdn",state="capacity|active|cached|free"}`:
+`warp34_pool_units{pool="kv|gdn|gdn_ckpt_vram|gdn_ckpt_host",state="capacity|active|cached|free|used"}`:
 
 - KV units are logical **pages** (16 tokens/page); GDN units are **state slots**.
+- When the tiered `WHT128-Q8_0` GDN checkpoint pool is enabled, `gdn_ckpt_vram`
+  (L1 VRAM) and `gdn_ckpt_host` (L2 pinned host RAM) expose `capacity` and `used`
+  slot counts in Prometheus, and `/api/metrics` includes `pools.gdn_checkpoints`
+  (`vram_capacity`, `vram_used`, `host_capacity`, `host_used`).
 - Counted once across tensor-parallel ranks, not summed as if each rank served
   independent requests. These are target pools, not total device VRAM usage.
 - `active` includes protected and reserved allocations.

@@ -10,6 +10,12 @@ export interface Pool {
   cached: number;
   free: number | null;
 }
+export interface CheckpointPoolStats {
+  vram_capacity: number;
+  vram_used: number;
+  host_capacity: number;
+  host_used: number;
+}
 export interface Snapshot {
   schema_version: 1;
   instance_id: string;
@@ -42,7 +48,7 @@ export interface Snapshot {
     e2e: Histogram;
     time_per_output_token: Histogram;
   };
-  pools: { kv: Pool; gdn: Pool };
+  pools: { kv: Pool; gdn: Pool; gdn_checkpoints?: CheckpointPoolStats };
   speculation: {
     rounds: number;
     draft_tokens: number | null;
@@ -69,6 +75,14 @@ function isPool(value: unknown): boolean {
     (value.active === null || isNumber(value.active)) &&
     (value.free === null || isNumber(value.free))
   );
+}
+function isCheckpointPoolStats(value: unknown): boolean {
+  return hasNumbers(value, [
+    "vram_capacity",
+    "vram_used",
+    "host_capacity",
+    "host_used",
+  ]);
 }
 function isHistogram(value: unknown): boolean {
   if (!isRecord(value) || !hasNumbers(value, ["count", "sum"])) return false;
@@ -126,6 +140,8 @@ export function parseSnapshot(value: unknown): Snapshot {
     ) &&
     isRecord(pools) &&
     ["kv", "gdn"].every((key) => isPool(pools[key])) &&
+    (pools.gdn_checkpoints === undefined ||
+      isCheckpointPoolStats(pools.gdn_checkpoints)) &&
     hasNumbers(speculation, ["rounds", "accepted_tokens"]) &&
     isRecord(speculation) &&
     (speculation.draft_tokens === null || isNumber(speculation.draft_tokens)) &&

@@ -137,9 +137,12 @@ describe("playground wire helpers", () => {
 
     const respFrames = drainSseBuffer(
       [
+        'event: response.content_part.added\ndata: {"type":"response.content_part.added","part":{"type":"reasoning_text","text":""}}\n\n',
         'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking step "}\n\n',
+        'event: response.content_part.done\ndata: {"type":"response.content_part.done","part":{"type":"reasoning_text","text":"thinking step "}}\n\n',
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"streamed text"}\n\n',
-        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking step "}]},{"type":"message","content":[{"type":"output_text","text":"streamed text"}]}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_42","name":"query_gpu","arguments":""}}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","delta":"{\\"gpu\\":0}"}\n\n',
       ].join(""),
       0,
       15,
@@ -149,9 +152,28 @@ describe("playground wire helpers", () => {
     for (const f of respFrames) {
       respState = applySseFrameToResult("openai-responses", respState, f);
     }
+    expect(respState.reasoning).toBe("thinking step ");
+    expect(respState.content).toBe("streamed text");
+    expect(respState.toolCalls).toEqual([
+      { id: "call_42", name: "query_gpu", arguments: '{"gpu":0}' },
+    ]);
+
+    const completedFrame = drainSseBuffer(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking step "}]},{"type":"message","content":[{"type":"output_text","text":"streamed text"}]},{"type":"function_call","call_id":"call_42","name":"query_gpu","arguments":"{\\"gpu\\":0}"}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+      respFrames.length,
+      20,
+    ).frames[0];
+    respState = applySseFrameToResult(
+      "openai-responses",
+      respState,
+      completedFrame,
+    );
     expect(respState.responseId).toBe("resp_77");
     expect(respState.reasoning).toBe("thinking step ");
     expect(respState.content).toBe("streamed text");
+    expect(respState.toolCalls).toEqual([
+      { id: "call_42", name: "query_gpu", arguments: '{"gpu":0}' },
+    ]);
     expect(respState.finishReason).toBe("completed");
     expect(respState.usage.cachedTokens).toBe(32);
     expect(respState.usage.reasoningTokens).toBe(4);

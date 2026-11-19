@@ -76,6 +76,39 @@ describe("shared metric derivations", () => {
     unknown.speculation.draft_tokens = null;
     expect(parseSnapshot(unknown).speculation.draft_tokens).toBeNull();
   });
+  it("validates optional tiered GDN checkpoint pool stats", () => {
+    const tiered = snapshot({
+      pools: {
+        kv: { capacity: 100, active: 10, cached: 20, free: 70 },
+        gdn: { capacity: 179, active: 4, cached: 46, free: 129 },
+        gdn_checkpoints: {
+          vram_capacity: 16,
+          vram_used: 12,
+          host_capacity: 99,
+          host_used: 34,
+        },
+      },
+    });
+    expect(parseSnapshot(tiered).pools.gdn_checkpoints).toEqual({
+      vram_capacity: 16,
+      vram_used: 12,
+      host_capacity: 99,
+      host_used: 34,
+    });
+    const malformed = {
+      ...tiered,
+      pools: {
+        ...tiered.pools,
+        gdn_checkpoints: {
+          vram_capacity: -1,
+          vram_used: 0,
+          host_capacity: 0,
+          host_used: 0,
+        },
+      },
+    };
+    expect(() => parseSnapshot(malformed)).toThrow();
+  });
   it("does not draw across unavailable samples or disconnected intervals", () => {
     const points = normalizeChartPoints([
       { time: 100, value: 1 },

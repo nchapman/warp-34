@@ -51,6 +51,13 @@ const number = (value: number | null | undefined) =>
     ? "—"
     : value.toLocaleString(undefined, { maximumFractionDigits: 0 });
 
+const formatContextTokens = (tokens: number): string =>
+  tokens >= 1024 && tokens % 1024 === 0
+    ? `${tokens / 1024}k`
+    : tokens >= 1000
+      ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k`
+      : `${tokens}`;
+
 function PoolBar({
   name,
   pool,
@@ -85,7 +92,11 @@ function PoolBar({
         <span className="pool-cached" style={{ width: `${cached}%` }} />
       </div>
       <div className="pool-detail">
-        <span>{number(pool?.free)} free</span>
+        <span>
+          {available
+            ? `${number(pool.cached)} cached · ${number(pool.free)} free`
+            : `${number(pool?.free)} free`}
+        </span>
         <span>
           {number(pool?.capacity)} {unit}
         </span>
@@ -255,6 +266,11 @@ function Overview({ state }: { state: MetricsState }) {
           <Badge variant="secondary">
             {latest?.config.kv_format.toUpperCase() ?? "—"} KV
           </Badge>
+          {latest?.config.max_model_len ? (
+            <Badge variant="secondary">
+              {formatContextTokens(latest.config.max_model_len)} ctx
+            </Badge>
+          ) : null}
           {specEnabled && (
             <Badge variant="secondary">{latest.config.speculation}</Badge>
           )}
@@ -503,6 +519,17 @@ function Overview({ state }: { state: MetricsState }) {
           <CardContent>
             <PoolBar name="KV cache" pool={latest?.pools.kv} unit="pages" />
             <PoolBar name="GDN state" pool={latest?.pools.gdn} unit="slots" />
+            {latest?.pools.gdn_checkpoints && (
+              <div className="detail-row">
+                <span>WHT128-Q8 checkpoints</span>
+                <span className="numeric">
+                  L1 {number(latest.pools.gdn_checkpoints.vram_used)}/
+                  {number(latest.pools.gdn_checkpoints.vram_capacity)} VRAM · L2{" "}
+                  {number(latest.pools.gdn_checkpoints.host_used)}/
+                  {number(latest.pools.gdn_checkpoints.host_capacity)} RAM
+                </span>
+              </div>
+            )}
             <div className="capacity-legend">
               <span>
                 <i className="violet-dot" />
@@ -1011,9 +1038,11 @@ function DashboardShell({ state }: { state: MetricsState }) {
         <span>
           {state.connection === "live"
             ? "Updates every 2s"
-            : state.connection === "offline"
-              ? "Waiting to reconnect"
-              : "Connecting to engine"}
+            : state.connection === "paused"
+              ? "Paused"
+              : state.connection === "offline"
+                ? "Waiting to reconnect"
+                : "Connecting to engine"}
           <span className="separator">·</span>
           {isPlayground ? "Interactive console" : "Read-only"}
         </span>
