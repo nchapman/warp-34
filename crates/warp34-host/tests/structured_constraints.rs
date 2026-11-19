@@ -718,3 +718,118 @@ fn copilot_union_incomplete_json_prefix_is_raw_at_eos() {
 fn copilot_enum_grammar_owned_padding() {
     check_native_argument(json!({"enum":["true",false]}), " true ", json!("true"));
 }
+
+#[test]
+fn claude_code_style_tool_schemas_sanitize_and_compile() {
+    use warp34_host::{parser::Qwen3Parser, tool_constraints::ToolChoice};
+    let (tok, factory) = setup();
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "Artifact",
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "maxItems": 255,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 512}},
+                                        "required": ["path"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "propertyNames": {"type": "string", "minLength": 1, "maxLength": 512},
+                                    "additionalProperties": {
+                                        "anyOf": [
+                                            {"type": "string", "minLength": 1, "maxLength": 512},
+                                            {"type": "null"}
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                        "capabilities": {
+                            "type": "object",
+                            "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                            "additionalProperties": {}
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ArtifactData",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "collection": {
+                            "type": "string",
+                            "maxLength": 1000,
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}(?:\\/(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}){0,14}$"
+                        },
+                        "doc_id": {
+                            "type": "string",
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$"
+                        },
+                        "data": {
+                            "type": "object",
+                            "propertyNames": {"type": "string"},
+                            "additionalProperties": {}
+                        }
+                    },
+                    "required": ["collection"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "SendMessage",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": {
+                            "type": "string",
+                            "allOf": [
+                                {"pattern": "^[^\\n\\r]*$"},
+                                {"pattern": "^[\\s\\S]{0,300}$"}
+                            ]
+                        },
+                        "message": {"type": "string"}
+                    },
+                    "required": ["to", "message"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    ]);
+
+    let mut c = factory.tools(&tools, &ToolChoice::Auto, false).unwrap();
+    let call = "<tool_call>\n<function=ArtifactData>\n<parameter=collection>\nboards/b1/columns\n</parameter>\n<parameter=data>\n{\"title\":\"hello\"}\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c, &tok, call).unwrap();
+    assert!(c.is_token_allowed(EOS));
+
+    let mut parser = Qwen3Parser::with_tools(false, tools.as_array().unwrap()).unwrap();
+    parser.push_str(call);
+    let turn = parser.finish().1;
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].function.name, "ArtifactData");
+    let args: serde_json::Value =
+        serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args,
+        json!({"collection": "boards/b1/columns", "data": {"title": "hello"}})
+    );
+}

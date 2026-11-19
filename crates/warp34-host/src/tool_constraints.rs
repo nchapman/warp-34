@@ -68,7 +68,8 @@ pub fn tool_structural_tag_with_parallel(
         {
             continue;
         }
-        crate::constraints::validate_json_schema(schema)?;
+        let schema = crate::constraints::sanitize_tool_schema(schema)?;
+        crate::constraints::validate_json_schema(&schema)?;
         tags.push(json!({
             "type":"tag", "begin":format!("<tool_call>\n<function={name}>\n"),
             "content":{"type":"json_schema","json_schema":schema,"style":"qwen_xml","max_whitespace_cnt":1},

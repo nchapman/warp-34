@@ -340,9 +340,8 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
     if o.contains_key("propertyNames")
         && (o.contains_key("properties")
             || o.contains_key("patternProperties")
-            || o.get("additionalProperties").is_some_and(Value::is_object)
-            || o.get("unevaluatedProperties")
-                .is_some_and(|v| v != &Value::Bool(true)))
+            || o.get("additionalProperties") == Some(&Value::Bool(false))
+            || o.get("unevaluatedProperties") == Some(&Value::Bool(false)))
     {
         return Err(
             "propertyNames combined with object property constraints is unsupported".into(),
@@ -385,6 +384,159 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+const SUPPORTED_STRING_FORMATS: &[&str] = &[
+    "email",
+    "date",
+    "time",
+    "date-time",
+    "duration",
+    "ipv4",
+    "ipv6",
+    "hostname",
+    "uuid",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+];
+
+/// Normalize a client-supplied tool parameter JSON Schema for XGrammar lowering.
+///
+/// Unlike explicit `response_format: json_schema` constraints (which fail closed),
+/// real-world tool schemas (Claude Code, MCP servers, Zod, Pydantic) routinely use
+/// JSON Schema 2020-12 features that XGrammar cannot enforce exactly (such as JS
+/// lookahead regexes `(?!...)`, `pattern` + `maxLength`, `allOf`, `oneOf` over
+/// objects, `multipleOf`, or unknown `format` strings). Following `llama.cpp` and
+/// `vLLM`, drop or relax only those unsupported sub-constraints while keeping the
+/// full original schema in the prompt and rejecting unresolvable external `$ref`s.
+pub(crate) fn sanitize_tool_schema(v: &Value) -> Result<Value, String> {
+    let mut budget = 4096usize;
+    sanitize_tool_schema_inner(v, 0, &mut budget)
+}
+
+fn sanitize_tool_schema_inner(
+    v: &Value,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value, String> {
+    if depth >= 32 {
+        return Err("tool JSON schema exceeds maximum nesting depth".into());
+    }
+    if *budget == 0 {
+        return Err("tool JSON schema exceeds maximum node budget".into());
+    }
+    *budget -= 1;
+    let Some(o) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    if let Some(reference) = o.get("$ref").and_then(Value::as_str)
+        && reference != "#"
+        && !reference.starts_with("#/")
+    {
+        return Err("only local JSON schema references are supported".into());
+    }
+    let mut out = o.clone();
+    for k in [
+        "multipleOf",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependentRequired",
+    ] {
+        out.remove(k);
+    }
+    if let Some(f) = out.get("format").and_then(Value::as_str)
+        && !SUPPORTED_STRING_FORMATS.contains(&f)
+    {
+        out.remove("format");
+    }
+    if let Some(pat) = out.get("pattern").and_then(Value::as_str)
+        && xgrammar::Grammar::from_regex(pat).is_err()
+    {
+        out.remove("pattern");
+    }
+    if out.contains_key("pattern") || out.contains_key("format") {
+        out.remove("minLength");
+        out.remove("maxLength");
+    }
+    if out.contains_key("propertyNames")
+        && (out.contains_key("properties")
+            || out.contains_key("patternProperties")
+            || out.get("additionalProperties") == Some(&Value::Bool(false))
+            || out.get("unevaluatedProperties") == Some(&Value::Bool(false)))
+    {
+        out.remove("propertyNames");
+    }
+    if let Some(pp) = out.get("patternProperties").and_then(Value::as_object) {
+        let unsupported = pp.len() > 1
+            || out.contains_key("properties")
+            || pp
+                .keys()
+                .any(|pat| xgrammar::Grammar::from_regex(pat).is_err());
+        if unsupported {
+            out.remove("patternProperties");
+            // Relax additionalProperties unconditionally so dropping patternProperties
+            // never narrows an existing `additionalProperties: false` / typed schema.
+            out.insert("additionalProperties".into(), Value::Bool(true));
+        }
+    }
+    if let Some(branches) = out.get("allOf").and_then(Value::as_array)
+        && branches.len() != 1
+    {
+        out.remove("allOf");
+    }
+    if !out.contains_key("anyOf")
+        && let Some(one_of) = out.remove("oneOf")
+    {
+        out.insert("anyOf".into(), one_of);
+    }
+    for k in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(m) = out.get(k).and_then(Value::as_object).cloned() {
+            let mut next = serde_json::Map::with_capacity(m.len());
+            for (name, val) in m {
+                next.insert(name, sanitize_tool_schema_inner(&val, depth + 1, budget)?);
+            }
+            out.insert(k.into(), Value::Object(next));
+        }
+    }
+    for k in [
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+    ] {
+        if let Some(val) = out.get(k).cloned() {
+            let next = if let Some(a) = val.as_array() {
+                a.iter()
+                    .map(|item| sanitize_tool_schema_inner(item, depth + 1, budget))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array)?
+            } else {
+                sanitize_tool_schema_inner(&val, depth + 1, budget)?
+            };
+            out.insert(k.into(), next);
+        }
+    }
+    for k in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(a) = out.get(k).and_then(Value::as_array).cloned() {
+            let next = a
+                .iter()
+                .map(|item| sanitize_tool_schema_inner(item, depth + 1, budget))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.insert(k.into(), Value::Array(next));
+        }
+    }
+    Ok(Value::Object(out))
 }
 
 #[derive(Clone, Debug)]
@@ -828,5 +980,129 @@ mod tests {
             )
             .is_ok()
         );
+        // xgrammar-rs 0.2.8 natively supports propertyNames + additionalProperties schema objects.
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                "additionalProperties": {"type": "string"}
+            }))
+            .is_ok()
+        );
+        // Still reject propertyNames combined with declared properties or additionalProperties: false.
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "propertyNames": {"type": "string"}
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "propertyNames": {"type": "string"},
+                "additionalProperties": false
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_schema_relaxes_unsupported_keywords_and_preserves_external_ref_error() {
+        assert!(sanitize_tool_schema(&json!({"$ref": "https://example.invalid/schema"})).is_err());
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "type": "string",
+                    "maxLength": 1000,
+                    "pattern": "^(?!\\.\\.?)[a-z]+$"
+                },
+                "version": {
+                    "type": "string",
+                    "pattern": "^[0-9]+\\.[0-9]+$",
+                    "maxLength": 20
+                },
+                "to": {
+                    "type": "string",
+                    "allOf": [{"pattern": "^[^\\n]*$"}, {"pattern": "^.{0,300}$"}]
+                },
+                "choice": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"type": "object", "properties": {"b": {"type": "integer"}}}
+                    ]
+                },
+                "step": {"type": "integer", "multipleOf": 5},
+                "custom_fmt": {"type": "string", "format": "file-path"},
+                "map": {
+                    "type": "object",
+                    "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        });
+        let sanitized = sanitize_tool_schema(&schema).unwrap();
+        validate_json_schema(&sanitized).unwrap();
+        // Unsupported lookahead pattern dropped, maxLength preserved.
+        assert!(
+            sanitized["properties"]["collection"]
+                .get("pattern")
+                .is_none()
+        );
+        assert_eq!(sanitized["properties"]["collection"]["maxLength"], 1000);
+        // Supported pattern preserved, conflicting maxLength dropped.
+        assert_eq!(
+            sanitized["properties"]["version"]["pattern"],
+            "^[0-9]+\\.[0-9]+$"
+        );
+        assert!(
+            sanitized["properties"]["version"]
+                .get("maxLength")
+                .is_none()
+        );
+        // Multi-branch allOf dropped so type:string is preserved.
+        assert!(sanitized["properties"]["to"].get("allOf").is_none());
+        assert_eq!(sanitized["properties"]["to"]["type"], "string");
+        // oneOf rewritten to anyOf.
+        assert!(sanitized["properties"]["choice"].get("oneOf").is_none());
+        assert!(sanitized["properties"]["choice"].get("anyOf").is_some());
+        // multipleOf and unknown format dropped.
+        assert!(sanitized["properties"]["step"].get("multipleOf").is_none());
+        assert!(
+            sanitized["properties"]["custom_fmt"]
+                .get("format")
+                .is_none()
+        );
+        // propertyNames + additionalProperties preserved.
+        assert!(
+            sanitized["properties"]["map"]
+                .get("propertyNames")
+                .is_some()
+        );
+        // Unsupported patternProperties with additionalProperties: false relaxes to true.
+        let pp_relaxed = sanitize_tool_schema(&json!({
+            "type": "object",
+            "patternProperties": {"^(?!bad)[a-z]+$": {"type": "string"}},
+            "additionalProperties": false
+        }))
+        .unwrap();
+        assert!(pp_relaxed.get("patternProperties").is_none());
+        assert_eq!(pp_relaxed["additionalProperties"], json!(true));
+        // Coexisting anyOf + oneOf preserves oneOf instead of silently discarding it.
+        let both = sanitize_tool_schema(&json!({
+            "anyOf": [{"type": "string"}],
+            "oneOf": [{"type": "object"}, {"type": "object"}]
+        }))
+        .unwrap();
+        assert!(both.get("oneOf").is_some());
+        assert!(validate_json_schema(&both).is_err());
+        // Depth bound fails closed without stack overflow.
+        let mut deep = json!({"type": "string"});
+        for _ in 0..40 {
+            deep = json!({"type": "array", "items": deep});
+        }
+        assert!(sanitize_tool_schema(&deep).is_err());
     }
 }

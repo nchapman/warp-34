@@ -841,7 +841,7 @@ impl Qwen3Parser {
                 .unwrap_or("")
                 .to_owned();
             if let Some(parameters) = tool.pointer_mut("/function/parameters") {
-                let root = parameters.clone();
+                let root = crate::constraints::sanitize_tool_schema(parameters)?;
                 let mut budget = 4096;
                 *parameters = Self::resolve_local_refs(&root, &root, true, 0, &mut budget)?;
                 let mut grammars = ParameterGrammars::new();
