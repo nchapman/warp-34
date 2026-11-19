@@ -680,3 +680,99 @@ fn parallel_tool_calls_survives_responses_translation() {
         );
     }
 }
+
+#[test]
+fn namespace_and_web_search_tools_roundtrip_for_codex() {
+    let request = json!({
+        "input": [
+            {"role": "user", "content": "Spawn an agent"},
+            {
+                "type": "function_call",
+                "call_id": "call_prev",
+                "namespace": "multi_agent_v1",
+                "name": "spawn_agent",
+                "arguments": "{\"message\":\"hi\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_prev",
+                "output": "ok"
+            }
+        ],
+        "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Sub-agent tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn a sub-agent",
+                        "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}
+                    }
+                ]
+            },
+            {"type": "web_search"}
+        ]
+    });
+    let (chat, meta) =
+        translate_responses_to_chat(&request, "test", &ResponseStore::with_capacity(8), None, 1)
+            .expect("Codex namespace + web_search tools must translate cleanly");
+
+    let chat_tools = chat["tools"].as_array().unwrap();
+    assert_eq!(
+        chat_tools.len(),
+        2,
+        "web_search is skipped, namespace flattened"
+    );
+    assert_eq!(chat_tools[0]["function"]["name"], "exec_command");
+    assert_eq!(
+        chat_tools[1]["function"]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+    // Input history function_call with namespace maps to the same qualified model name.
+    assert_eq!(
+        chat["messages"][1]["tool_calls"][0]["function"]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+
+    // Non-streaming output restores wire `name` + `namespace`.
+    let turn = ParsedAssistantTurn {
+        reasoning_content: None,
+        content: None,
+        tool_calls: vec![ParsedToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::parser::ParsedFunctionCall {
+                name: "multi_agent_v1__spawn_agent".into(),
+                arguments: "{\"message\":\"go\"}".into(),
+            },
+        }],
+    };
+    let (resp, _) = build_response_object(&meta, &turn, "tool_calls", 10, 0, 5, 0);
+    assert_eq!(resp["output"][0]["type"], "function_call");
+    assert_eq!(resp["output"][0]["name"], "spawn_agent");
+    assert_eq!(resp["output"][0]["namespace"], "multi_agent_v1");
+
+    // Streaming SSE output also restores wire `name` + `namespace`.
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let _ = sse.start();
+    let evs = sse.push_delta(crate::parser::StreamParseDelta {
+        completed_tool_calls: turn.tool_calls.clone(),
+        ..Default::default()
+    });
+    let added = evs
+        .iter()
+        .find(|(ev, _)| ev == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added.1["item"]["name"], "spawn_agent");
+    assert_eq!(added.1["item"]["namespace"], "multi_agent_v1");
+    let done = evs
+        .iter()
+        .find(|(ev, _)| ev == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done.1["item"]["name"], "spawn_agent");
+    assert_eq!(done.1["item"]["namespace"], "multi_agent_v1");
+}

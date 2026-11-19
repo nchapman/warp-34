@@ -380,6 +380,46 @@ pub struct ResponsesPreparedMeta {
     pub truncation: String,
     pub metadata: Value,
     pub input_messages: Vec<Value>,
+    /// Maps flattened model-facing tool names (`"{namespace}__{name}"`) back to their
+    /// Responses API `(namespace, name)` pair for `function_call` output items.
+    pub namespaced_tools: HashMap<String, (String, String)>,
+}
+
+fn qualify_namespaced_tool(namespace: &str, name: &str) -> String {
+    format!("{namespace}__{name}")
+}
+
+fn resolve_wire_tool_name<'a>(
+    meta: &'a ResponsesPreparedMeta,
+    raw_name: &'a str,
+) -> (&'a str, Option<&'a str>) {
+    if let Some((ns, name)) = meta.namespaced_tools.get(raw_name) {
+        (name.as_str(), Some(ns.as_str()))
+    } else {
+        (raw_name, None)
+    }
+}
+
+fn build_function_call_item(
+    meta: &ResponsesPreparedMeta,
+    item_id: &str,
+    call_id: &str,
+    status: &str,
+    raw_name: &str,
+    arguments: &str,
+) -> Value {
+    let (wire_name, wire_namespace) = resolve_wire_tool_name(meta, raw_name);
+    let mut item = Map::new();
+    item.insert("id".into(), json!(item_id));
+    item.insert("type".into(), json!("function_call"));
+    item.insert("status".into(), json!(status));
+    item.insert("call_id".into(), json!(call_id));
+    item.insert("name".into(), json!(wire_name));
+    if let Some(ns) = wire_namespace {
+        item.insert("namespace".into(), json!(ns));
+    }
+    item.insert("arguments".into(), json!(arguments));
+    Value::Object(item)
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -389,19 +429,10 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError> {
-    let obj = tool
-        .as_object()
-        .ok_or_else(|| ResponsesApiError::bad_request("each tool must be a JSON object"))?;
-    let tool_type = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("function");
-    if tool_type != "function" {
-        return Err(ResponsesApiError::bad_request(format!(
-            "unsupported Responses tool type '{tool_type}': only 'function' tools are supported"
-        )));
-    }
+fn normalize_function_tool(
+    obj: &Map<String, Value>,
+    namespace: Option<&str>,
+) -> Result<(String, Value, Value), ResponsesApiError> {
     let (name, description, parameters, strict) =
         if let Some(func) = obj.get("function").and_then(Value::as_object) {
             (
@@ -425,8 +456,13 @@ fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError>
         || json!({"type": "object", "properties": {}, "additionalProperties": false}),
     );
 
+    let model_name = match namespace {
+        Some(ns) => qualify_namespaced_tool(ns, name),
+        None => name.to_string(),
+    };
+
     let mut fn_obj = Map::new();
-    fn_obj.insert("name".into(), json!(name));
+    fn_obj.insert("name".into(), json!(model_name));
     if let Some(desc) = description.clone().filter(|v| !v.is_null()) {
         fn_obj.insert("description".into(), desc);
     }
@@ -445,7 +481,80 @@ fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError>
     resp_tool.insert("description".into(), description.unwrap_or(Value::Null));
     resp_tool.insert("parameters".into(), params);
     resp_tool.insert("strict".into(), strict.unwrap_or(json!(true)));
-    Ok((chat_tool, Value::Object(resp_tool)))
+    Ok((name.to_string(), chat_tool, Value::Object(resp_tool)))
+}
+
+fn normalize_tool_def(
+    tool: &Value,
+    chat_tools: &mut Vec<Value>,
+    resp_tools: &mut Vec<Value>,
+    namespaced_tools: &mut HashMap<String, (String, String)>,
+) -> Result<(), ResponsesApiError> {
+    let obj = tool
+        .as_object()
+        .ok_or_else(|| ResponsesApiError::bad_request("each tool must be a JSON object"))?;
+    let tool_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    match tool_type {
+        "function" => {
+            let (_, ct, rt) = normalize_function_tool(obj, None)?;
+            chat_tools.push(ct);
+            resp_tools.push(rt);
+            Ok(())
+        }
+        "namespace" => {
+            let ns_name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    ResponsesApiError::bad_request("namespace tool missing non-empty 'name'")
+                })?;
+            let inner = obj.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                ResponsesApiError::bad_request("namespace tool missing 'tools' array")
+            })?;
+            let mut echoed_inner = Vec::with_capacity(inner.len());
+            for sub in inner {
+                let sub_obj = sub.as_object().ok_or_else(|| {
+                    ResponsesApiError::bad_request("each namespace sub-tool must be a JSON object")
+                })?;
+                let sub_type = sub_obj
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function");
+                if sub_type != "function" {
+                    return Err(ResponsesApiError::bad_request(format!(
+                        "unsupported tool type '{sub_type}' inside namespace '{ns_name}': only 'function' tools are supported"
+                    )));
+                }
+                let (fn_name, ct, rt) = normalize_function_tool(sub_obj, Some(ns_name))?;
+                let qualified = qualify_namespaced_tool(ns_name, &fn_name);
+                namespaced_tools.insert(qualified, (ns_name.to_string(), fn_name));
+                chat_tools.push(ct);
+                echoed_inner.push(rt);
+            }
+            let mut resp_ns = Map::new();
+            resp_ns.insert("type".into(), json!("namespace"));
+            resp_ns.insert("name".into(), json!(ns_name));
+            if let Some(desc) = obj.get("description") {
+                resp_ns.insert("description".into(), desc.clone());
+            }
+            resp_ns.insert("tools".into(), Value::Array(echoed_inner));
+            resp_tools.push(Value::Object(resp_ns));
+            Ok(())
+        }
+        // Hosted OpenAI web search tools (sent by default by Codex CLI): not executed
+        // server-side by a local engine, so preserve in echo without exposing as callable functions.
+        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" => {
+            resp_tools.push(tool.clone());
+            Ok(())
+        }
+        _ => Err(ResponsesApiError::bad_request(format!(
+            "unsupported Responses tool type '{tool_type}': only 'function' and 'namespace' tools are supported"
+        ))),
+    }
 }
 
 fn normalize_tool_choice(
@@ -473,9 +582,23 @@ fn normalize_tool_choice(
                 .ok_or_else(|| {
                     ResponsesApiError::bad_request("function tool_choice requires non-empty 'name'")
                 })?;
+            let namespace = obj
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let model_name = match namespace {
+                Some(ns) => qualify_namespaced_tool(ns, name),
+                None => name.to_string(),
+            };
+            let mut echo = Map::new();
+            echo.insert("type".into(), json!("function"));
+            echo.insert("name".into(), json!(name));
+            if let Some(ns) = namespace {
+                echo.insert("namespace".into(), json!(ns));
+            }
             return Ok((
-                Some(json!({"type": "function", "function": {"name": name}})),
-                json!({"type": "function", "name": name}),
+                Some(json!({"type": "function", "function": {"name": model_name}})),
+                Value::Object(echo),
             ));
         }
     }
@@ -649,6 +772,14 @@ fn parse_input_items(
                                     "function_call item missing non-empty 'name'",
                                 )
                             })?;
+                        let model_name = match obj
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            Some(ns) => qualify_namespaced_tool(ns, name),
+                            None => name.to_string(),
+                        };
                         let args_val = obj.get("arguments").ok_or_else(|| {
                             ResponsesApiError::bad_request("function_call item missing 'arguments'")
                         })?;
@@ -681,7 +812,7 @@ fn parse_input_items(
                             "id": call_id,
                             "type": "function",
                             "function": {
-                                "name": name,
+                                "name": model_name,
                                 "arguments": parsed_args,
                             }
                         });
@@ -983,14 +1114,13 @@ pub fn translate_responses_to_chat(
     // Tools & tool_choice
     let mut chat_tools = Vec::new();
     let mut resp_tools = Vec::new();
+    let mut namespaced_tools = HashMap::new();
     if let Some(tools_val) = obj.get("tools").filter(|v| !v.is_null()) {
         let arr = tools_val
             .as_array()
             .ok_or_else(|| ResponsesApiError::bad_request("'tools' must be an array"))?;
         for t in arr {
-            let (ct, rt) = normalize_tool_def(t)?;
-            chat_tools.push(ct);
-            resp_tools.push(rt);
+            normalize_tool_def(t, &mut chat_tools, &mut resp_tools, &mut namespaced_tools)?;
         }
     }
     let (chat_tool_choice, tool_choice_echo) = normalize_tool_choice(obj.get("tool_choice"))?;
@@ -1184,6 +1314,7 @@ pub fn translate_responses_to_chat(
         truncation,
         metadata,
         input_messages: messages,
+        namespaced_tools,
     };
     Ok((Value::Object(chat_req), meta))
 }
@@ -1310,14 +1441,14 @@ pub fn build_response_object(
         } else {
             tc.id.clone()
         };
-        output.push(json!({
-            "id": format!("fc_{suffix}_{idx}"),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": tc.function.arguments,
-        }));
+        output.push(build_function_call_item(
+            meta,
+            &format!("fc_{suffix}_{idx}"),
+            &call_id,
+            "completed",
+            &tc.function.name,
+            &tc.function.arguments,
+        ));
     }
 
     let is_incomplete = finish_reason == "length";
@@ -1533,23 +1664,28 @@ impl ResponsesSseFormatter {
                 let arguments = self.current_fc_args_accum.clone();
 
                 if fc_completed {
+                    let (wire_name, _) = resolve_wire_tool_name(&self.meta, &name);
                     let mut done_args = Map::new();
                     done_args.insert("item_id".into(), json!(item_id));
                     done_args.insert("output_index".into(), json!(output_index));
                     done_args.insert("call_id".into(), json!(call_id));
-                    done_args.insert("name".into(), json!(name));
+                    done_args.insert("name".into(), json!(wire_name));
                     done_args.insert("arguments".into(), json!(arguments));
                     out.push(self.emit("response.function_call_arguments.done", done_args));
                 }
 
-                let done_item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "status": if fc_completed { "completed" } else { "incomplete" },
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                });
+                let done_item = build_function_call_item(
+                    &self.meta,
+                    &item_id,
+                    &call_id,
+                    if fc_completed {
+                        "completed"
+                    } else {
+                        "incomplete"
+                    },
+                    &name,
+                    &arguments,
+                );
                 let mut done_ev = Map::new();
                 done_ev.insert("output_index".into(), json!(output_index));
                 done_ev.insert("item".into(), done_item.clone());
@@ -1596,14 +1732,14 @@ impl ResponsesSseFormatter {
                 self.current_fc_name.clone_from(&name);
                 self.current_fc_args_accum.clear();
 
-                let added_item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "status": "in_progress",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": "",
-                });
+                let added_item = build_function_call_item(
+                    &self.meta,
+                    &item_id,
+                    &call_id,
+                    "in_progress",
+                    &name,
+                    "",
+                );
                 let mut a = Map::new();
                 a.insert("output_index".into(), json!(output_index));
                 a.insert("item".into(), added_item);
@@ -1651,14 +1787,14 @@ impl ResponsesSseFormatter {
             tc.id.clone()
         };
 
-        let added_item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": "",
-        });
+        let added_item = build_function_call_item(
+            &self.meta,
+            &item_id,
+            &call_id,
+            "in_progress",
+            &tc.function.name,
+            "",
+        );
         let mut a = Map::new();
         a.insert("output_index".into(), json!(output_index));
         a.insert("item".into(), added_item);
@@ -1671,22 +1807,23 @@ impl ResponsesSseFormatter {
         d.insert("delta".into(), json!(tc.function.arguments));
         out.push(self.emit("response.function_call_arguments.delta", d));
 
+        let (wire_name, _) = resolve_wire_tool_name(&self.meta, &tc.function.name);
         let mut done_args = Map::new();
         done_args.insert("item_id".into(), json!(item_id));
         done_args.insert("output_index".into(), json!(output_index));
         done_args.insert("call_id".into(), json!(call_id));
-        done_args.insert("name".into(), json!(tc.function.name));
+        done_args.insert("name".into(), json!(wire_name));
         done_args.insert("arguments".into(), json!(tc.function.arguments));
         out.push(self.emit("response.function_call_arguments.done", done_args));
 
-        let done_item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": tc.function.arguments,
-        });
+        let done_item = build_function_call_item(
+            &self.meta,
+            &item_id,
+            &call_id,
+            "completed",
+            &tc.function.name,
+            &tc.function.arguments,
+        );
         let mut done_ev = Map::new();
         done_ev.insert("output_index".into(), json!(output_index));
         done_ev.insert("item".into(), done_item.clone());
