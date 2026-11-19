@@ -842,6 +842,13 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644));
+    }
     file.persist(path).map_err(|e| e.error)?;
     Ok(())
 }

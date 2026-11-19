@@ -952,10 +952,22 @@ pub(crate) fn run_serve(
         }
         Some(crate::proposer::SpeculativeKind::DFlash2) => {
             if let Some(draft) = spec_config.as_ref().and_then(|s| s.draft_model.as_deref()) {
-                let draft_short = std::path::Path::new(draft)
-                    .file_name()
+                let p = std::path::Path::new(draft);
+                let draft_short = p
+                    .parent()
+                    .filter(|par| par.file_name().and_then(|n| n.to_str()) == Some("snapshots"))
+                    .and_then(|par| par.parent())
+                    .and_then(|repo| repo.file_name())
                     .and_then(|n| n.to_str())
-                    .unwrap_or(draft);
+                    .and_then(|n| n.strip_prefix("models--"))
+                    .and_then(|s| s.split_once("--"))
+                    .map(|(org, name)| format!("{org}/{name}"))
+                    .unwrap_or_else(|| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(draft)
+                            .to_string()
+                    });
                 format!("dflash2 ({draft_short})")
             } else {
                 "dflash2".to_string()
