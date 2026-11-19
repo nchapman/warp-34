@@ -116,6 +116,11 @@ Serving Options (warp34 serve):
   --api-key <val> | --api-key-env <v> Optional bearer token auth for all API operations, including aliases (not only /v1)
                                       Metrics (/metrics and /api/metrics), minimal health, and enabled webui remain unauthenticated
   --no-webui                         Disable the web UI only; metrics and API remain available
+  --reasoning-effort <level>          Default reasoning_effort (none|minimal|low|medium|high|xhigh|max)
+  --reasoning-budget <n|-1>           Default thinking token budget (-1 = unlimited, disables effort cap)
+  --reasoning-budget-message <text>   Transition text injected before </think> on budget exhaustion ("" for none)
+  --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
+                                      medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
 
 Generation & Chat Options (warp34 chat / generate):
   -p, --prompt <text>                 Prompt text (omit in terminal with `warp34 chat` for interactive REPL)
@@ -257,6 +262,16 @@ impl ServeCliConfig {
             self.options.webui = false;
             return Ok(true);
         }
+        if flag == "--no-reasoning-effort-budget" {
+            self.used = true;
+            self.options.reasoning_effort_budget = false;
+            return Ok(true);
+        }
+        if flag == "--reasoning-effort-budget" {
+            self.used = true;
+            self.options.reasoning_effort_budget = true;
+            return Ok(true);
+        }
         if !matches!(
             flag,
             "--api-key"
@@ -344,11 +359,13 @@ impl ServeCliConfig {
                 if parsed < -1 {
                     return Err("--reasoning-budget must be >= -1 (-1 for unlimited)".into());
                 }
-                self.options.reasoning_budget = if parsed == -1 {
-                    None
+                if parsed == -1 {
+                    self.options.reasoning_budget = None;
+                    self.options.reasoning_effort_budget = false;
                 } else {
-                    Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?)
-                };
+                    self.options.reasoning_budget =
+                        Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
+                }
             }
             "--reasoning-budget-message" => {
                 self.options.reasoning_budget_message = Some(value);

@@ -39,6 +39,7 @@ pub struct OpenAiServerState {
     pub default_reasoning_effort: Option<String>,
     pub default_reasoning_budget: Option<usize>,
     pub default_reasoning_budget_message: Option<String>,
+    pub reasoning_effort_budget: bool,
     pub worker: EngineWorker,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
@@ -97,6 +98,7 @@ impl OpenAiServerState {
         unshared.default_reasoning_effort = options.reasoning_effort;
         unshared.default_reasoning_budget = options.reasoning_budget;
         unshared.default_reasoning_budget_message = options.reasoning_budget_message;
+        unshared.reasoning_effort_budget = options.reasoning_effort_budget;
         Ok(state)
     }
     fn with_worker(
@@ -124,6 +126,7 @@ impl OpenAiServerState {
             default_reasoning_effort: None,
             default_reasoning_budget: None,
             default_reasoning_budget_message: None,
+            reasoning_effort_budget: true,
             worker,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
@@ -705,52 +708,6 @@ fn prepare(
         )
     };
     let tokenizer = s.worker.tokenizer.as_ref().ok_or("tokenizer unavailable")?;
-    if chat && thinking {
-        let (budget, budget_msg) = super::resolve_chat_reasoning_budget(
-            &request,
-            s.default_reasoning_budget,
-            s.default_reasoning_budget_message.as_deref(),
-        )?;
-        if let Some(budget) = budget {
-            let enc = |text: &str| -> Result<Vec<i32>, String> {
-                Ok(tokenizer
-                    .encode(text, false)
-                    .map_err(|e| e.to_string())?
-                    .get_ids()
-                    .iter()
-                    .map(|&id| id as i32)
-                    .collect())
-            };
-            let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
-                if let Some(id) = tokenizer.token_to_id(tag) {
-                    Ok(vec![id as i32])
-                } else {
-                    enc(tag)
-                }
-            };
-            let start_token_ids = tag_ids("<think>")?;
-            let end_token_ids = tag_ids("</think>")?;
-            let mut forced_token_ids = Vec::new();
-            if let Some(msg) = budget_msg.as_deref().filter(|m| !m.is_empty()) {
-                forced_token_ids.extend(enc(msg)?);
-            }
-            forced_token_ids.extend_from_slice(&end_token_ids);
-            forced_token_ids.extend(enc("\n")?);
-            if start_token_ids.is_empty() || end_token_ids.is_empty() || forced_token_ids.is_empty()
-            {
-                return Err(
-                    "tokenizer cannot encode <think>/</think> tags required for thinking budget"
-                        .into(),
-                );
-            }
-            params.thinking_budget = Some(crate::parser::ThinkingBudgetConfig {
-                budget,
-                start_token_ids,
-                end_token_ids,
-                forced_token_ids,
-            });
-        }
-    }
     let prompt: Vec<i32> = tokenizer
         .encode(prompt, false)
         .map_err(|e| e.to_string())?
@@ -785,6 +742,68 @@ fn prepare(
         soft_output_budget = soft;
         if params.min_tokens > params.max_tokens {
             return Err("min_tokens exceeds max_tokens".into());
+        }
+        if chat && thinking {
+            let (budget_kind, budget_msg) = super::resolve_chat_reasoning_budget(
+                &request,
+                s.default_reasoning_budget,
+                s.default_reasoning_budget_message.as_deref(),
+            )?;
+            let effective_budget = match budget_kind {
+                super::ResolvedReasoningBudget::Explicit(n) => Some(n),
+                super::ResolvedReasoningBudget::Unlimited => None,
+                super::ResolvedReasoningBudget::Default if s.reasoning_effort_budget => {
+                    super::compute_effort_reasoning_budget(
+                        resolved_effort.as_deref(),
+                        params.max_tokens,
+                    )
+                }
+                super::ResolvedReasoningBudget::Default => None,
+            };
+            if let Some(budget) = effective_budget {
+                let enc = |text: &str| -> Result<Vec<i32>, String> {
+                    Ok(tokenizer
+                        .encode(text, false)
+                        .map_err(|e| e.to_string())?
+                        .get_ids()
+                        .iter()
+                        .map(|&id| id as i32)
+                        .collect())
+                };
+                let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
+                    if let Some(id) = tokenizer.token_to_id(tag) {
+                        Ok(vec![id as i32])
+                    } else {
+                        enc(tag)
+                    }
+                };
+                let start_token_ids = tag_ids("<think>")?;
+                let end_token_ids = tag_ids("</think>")?;
+                let mut forced_token_ids = Vec::new();
+                let effective_msg = budget_msg
+                    .as_deref()
+                    .unwrap_or(super::DEFAULT_REASONING_BUDGET_MESSAGE);
+                if !effective_msg.is_empty() {
+                    forced_token_ids.extend(enc(effective_msg)?);
+                }
+                forced_token_ids.extend_from_slice(&end_token_ids);
+                forced_token_ids.extend(enc("\n")?);
+                if start_token_ids.is_empty()
+                    || end_token_ids.is_empty()
+                    || forced_token_ids.is_empty()
+                {
+                    return Err(
+                        "tokenizer cannot encode <think>/</think> tags required for thinking budget"
+                            .into(),
+                    );
+                }
+                params.thinking_budget = Some(crate::parser::ThinkingBudgetConfig {
+                    budget,
+                    start_token_ids,
+                    end_token_ids,
+                    forced_token_ids,
+                });
+            }
         }
     }
     let constraint = if mode == PrepareMode::Generate {

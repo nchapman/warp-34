@@ -25,10 +25,14 @@ pub struct ServeOptions {
     /// Optional server-default `reasoning_effort` passed to the chat template when the
     /// request omits `reasoning_effort` / `reasoning.effort` / `output_config.effort`.
     pub reasoning_effort: Option<String>,
-    /// Optional server-default thinking token budget (`None` = unlimited, `Some(0)` = immediate close).
+    /// Optional server-default thinking token budget (`None` = unlimited or effort-derived, `Some(0)` = immediate close).
     pub reasoning_budget: Option<usize>,
     /// Optional transition message injected before `</think>` when the thinking budget is exhausted.
     pub reasoning_budget_message: Option<String>,
+    /// Automatically derive a percentage-based thinking budget from `reasoning_effort` (OpenRouter ratios,
+    /// capped at `DEFAULT_MAX_REASONING_BUDGET_TOKENS = 32_768`) when no explicit token budget is specified.
+    /// Enabled by default; disable with `--no-reasoning-effort-budget`.
+    pub reasoning_effort_budget: bool,
 }
 
 impl Default for ServeOptions {
@@ -41,8 +45,56 @@ impl Default for ServeOptions {
             reasoning_effort: None,
             reasoning_budget: None,
             reasoning_budget_message: None,
+            reasoning_effort_budget: true,
         }
     }
+}
+
+/// Hard ceiling (32K tokens) applied when deriving a thinking budget from `reasoning_effort`
+/// percentages so omitted `max_tokens` on 262K contexts stays bounded and effort levels remain distinct.
+pub const DEFAULT_MAX_REASONING_BUDGET_TOKENS: usize = 32_768;
+
+/// Default transition line injected right before `</think>\n` when a thinking budget is exhausted
+/// (Qwen3/3.5/3.8 native budget-forcing prompt). Overridable via `--reasoning-budget-message`
+/// (pass `""` for bare `</think>\n`).
+pub const DEFAULT_REASONING_BUDGET_MESSAGE: &str = "\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
+
+/// OpenRouter-compatible `reasoning_effort` -> thinking budget fraction of `max_tokens`.
+pub fn reasoning_effort_budget_ratio(effort: &str) -> Option<f64> {
+    match effort {
+        "max" | "xhigh" => Some(0.95),
+        "high" => Some(0.80),
+        "medium" => Some(0.50),
+        "low" => Some(0.20),
+        "minimal" => Some(0.10),
+        "none" => Some(0.0),
+        _ => None,
+    }
+}
+
+/// Computes a percentage-based thinking token budget from `reasoning_effort` (defaulting to
+/// `"medium"` = 50% when omitted) and the request's effective `max_tokens`, capping the base at
+/// `DEFAULT_MAX_REASONING_BUDGET_TOKENS` (`32_768`) and clamping to `[1, max_tokens - 1]`.
+pub fn compute_effort_reasoning_budget(effort: Option<&str>, max_tokens: usize) -> Option<usize> {
+    let ratio = reasoning_effort_budget_ratio(effort.unwrap_or("medium"))?;
+    if ratio <= 0.0 || max_tokens <= 1 {
+        return None;
+    }
+    let base = max_tokens.min(DEFAULT_MAX_REASONING_BUDGET_TOKENS);
+    let raw = ((base as f64) * ratio).floor() as usize;
+    Some(raw.clamp(1, max_tokens.saturating_sub(1)))
+}
+
+/// Explicit vs default thinking-budget resolution for a chat request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedReasoningBudget {
+    /// Explicit token limit from per-request field or `--reasoning-budget`.
+    Explicit(usize),
+    /// Request explicitly opted out of any thinking cap (`-1`).
+    Unlimited,
+    /// Neither request nor server specified an explicit token limit; caller may apply
+    /// effort-derived percentage budget when `reasoning_effort_budget` is enabled.
+    Default,
 }
 
 /// Validates a normalized `reasoning_effort` level shared across OpenAI, Anthropic, `vLLM`, and `llama.cpp`.
@@ -493,11 +545,15 @@ pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, Str
 /// Resolves an optional per-request thinking token budget and budget exhaustion message from
 /// OpenAI (`thinking_token_budget`, `reasoning_budget_tokens`, `thinking_budget_tokens`,
 /// `reasoning.max_tokens`) with fallback to server defaults.
+///
+/// When `budget` resolves to `ResolvedReasoningBudget::Default`, the caller may derive a
+/// percentage-based cap via [`compute_effort_reasoning_budget`] if `reasoning_effort_budget`
+/// is enabled. When `message` is `None`, callers fall back to [`DEFAULT_REASONING_BUDGET_MESSAGE`].
 pub fn resolve_chat_reasoning_budget(
     req: &serde_json::Value,
     default_budget: Option<usize>,
     default_message: Option<&str>,
-) -> Result<(Option<usize>, Option<String>), String> {
+) -> Result<(ResolvedReasoningBudget, Option<String>), String> {
     let budget_val = req
         .get("thinking_token_budget")
         .or_else(|| req.get("reasoning_budget_tokens"))
@@ -506,7 +562,10 @@ pub fn resolve_chat_reasoning_budget(
         .filter(|v| !v.is_null());
 
     let budget = match budget_val {
-        None => default_budget,
+        None => match default_budget {
+            Some(n) => ResolvedReasoningBudget::Explicit(n),
+            None => ResolvedReasoningBudget::Default,
+        },
         Some(v) => {
             let n = v
                 .as_i64()
@@ -515,9 +574,11 @@ pub fn resolve_chat_reasoning_budget(
                 return Err("thinking_token_budget must be >= -1".into());
             }
             if n == -1 {
-                None
+                ResolvedReasoningBudget::Unlimited
             } else {
-                Some(usize::try_from(n).map_err(|_| "thinking_token_budget out of range")?)
+                ResolvedReasoningBudget::Explicit(
+                    usize::try_from(n).map_err(|_| "thinking_token_budget out of range")?,
+                )
             }
         }
     };
@@ -779,7 +840,10 @@ mod tests {
                 Some("Time is up.")
             )
             .unwrap(),
-            (Some(2048), Some("Time is up.".to_string()))
+            (
+                ResolvedReasoningBudget::Explicit(2048),
+                Some("Time is up.".to_string())
+            )
         );
         assert_eq!(
             resolve_chat_reasoning_budget(
@@ -788,7 +852,11 @@ mod tests {
                 None
             )
             .unwrap(),
-            (None, None)
+            (ResolvedReasoningBudget::Unlimited, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(&serde_json::json!({}), None, None).unwrap(),
+            (ResolvedReasoningBudget::Default, None)
         );
         assert!(
             resolve_chat_enable_thinking(&serde_json::json!({
@@ -902,5 +970,47 @@ mod tests {
         .unwrap();
         assert_eq!(explicit_greedy.temperature, 0.0);
         assert!(explicit_greedy.is_plain_greedy(false));
+    }
+
+    #[test]
+    fn test_reasoning_effort_budget_openrouter_ratios() {
+        assert!(ServeOptions::default().reasoning_effort_budget);
+        // OpenRouter effort ratios on explicit max_tokens=4000
+        let explicit_cases = [
+            (Some("minimal"), Some(400)),
+            (Some("low"), Some(800)),
+            (Some("medium"), Some(2000)),
+            (None, Some(2000)),
+            (Some("high"), Some(3200)),
+            (Some("xhigh"), Some(3800)),
+            (Some("max"), Some(3800)),
+            (Some("none"), None),
+        ];
+        for (effort, expected) in explicit_cases {
+            assert_eq!(
+                compute_effort_reasoning_budget(effort, 4000),
+                expected,
+                "effort={effort:?}"
+            );
+        }
+        // Omitted max_tokens on 262K context caps base at 32,768 so effort levels stay distinct
+        let capped_cases = [
+            (Some("minimal"), Some(3_276)),
+            (Some("low"), Some(6_553)),
+            (Some("medium"), Some(16_384)),
+            (Some("high"), Some(26_214)),
+            (Some("xhigh"), Some(31_129)),
+            (Some("max"), Some(31_129)),
+        ];
+        for (effort, expected) in capped_cases {
+            assert_eq!(
+                compute_effort_reasoning_budget(effort, 260_000),
+                expected,
+                "capped effort={effort:?}"
+            );
+        }
+        // Small max_tokens always leaves at least 1 token for visible output
+        assert_eq!(compute_effort_reasoning_budget(Some("max"), 2), Some(1));
+        assert_eq!(compute_effort_reasoning_budget(Some("medium"), 1), None);
     }
 }
