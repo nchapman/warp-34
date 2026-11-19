@@ -829,15 +829,15 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     let resident_moe_mtp_reserve =
         resident_moe_mtp_serving_reserve(cfg, true, native_mtp, mtp_experts_w4);
     let desired_slots = requested_state_slots.max(min_state_floor);
-    let vision = if archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
-        VISION_ENCODER_LAZY_RESERVE_BYTES
+    let vision_extra = if archive_has_vision {
+        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
     } else {
         0
     };
     let desired_gpu_steady_bytes = steady_without_states
         .saturating_add(resident_moe_mtp_reserve)
         .saturating_add(state_bytes.saturating_mul(desired_slots))
-        .saturating_add(vision);
+        .saturating_add(vision_extra);
     let runtime_arena_bytes = BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes);
     let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
         cfg,
@@ -926,7 +926,13 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         (0, dflash_reserve_bytes)
     };
     let available_for_pools = post_weight_available.checked_sub(allocated_moe_bytes)?;
+    let vision_headroom = if archive_has_vision && auto_fit_mode {
+        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+    } else {
+        0
+    };
     let required_headroom = base_headroom
+        .saturating_add(vision_headroom)
         .saturating_add(mtp_dense_reserve)
         .saturating_add(resident_moe_mtp_reserve)
         .saturating_add(post_pool_spec_or_moe_reserve)

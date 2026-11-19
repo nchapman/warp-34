@@ -1266,8 +1266,9 @@ impl Qwen3_5ModelRank {
         );
         let desired_gpu_steady_bytes = capacity.state_slots.map(|req_slots| {
             let desired_slots = req_slots.max(min_state_floor);
-            let vision = if rank == 0 && archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
+            let vision = if rank == 0 && archive_has_vision {
                 VISION_ENCODER_LAZY_RESERVE_BYTES
+                    .saturating_sub(target_base_headroom(cfg, tp_size, pages, free_vram))
             } else {
                 0
             };
@@ -1955,44 +1956,51 @@ impl PrePoolModelRank {
             } else {
                 requested_state_slots
             };
-        let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
-            // Serving can request many more slots than single-request defaults.
-            // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
-            // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
-            // multimodal request (`ensure_vision_encoder_loaded`) and fits inside
-            // `MIN_HEADROOM_BYTES` (1 GiB) when needed; only reserve dedicated ViT VRAM when
-            // `vision_reserve` still leaves room for `effective_requested_state_slots`.
-            let base_reserved = required_headroom.saturating_add(req_kv_bytes);
-            let protected_state_slots = effective_requested_state_slots.max(MIN_ACTIVE_STATE_SLOTS);
-            let min_state_bytes = bytes_per_state_slot.saturating_mul(protected_state_slots);
-            let vision_reserve = if rank == 0
-                && has_vision_weights(&cfg, archive)
-                && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
-            {
-                available_for_pools
-                    .saturating_sub(base_reserved.saturating_add(min_state_bytes))
-                    .min(VISION_ENCODER_LAZY_RESERVE_BYTES)
+        let (state_budget_free, state_budget_fixed, vision_reserve) =
+            if capacity.state_slots.is_some() {
+                // Serving can request many more slots than single-request defaults.
+                // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
+                // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
+                // multimodal request (`ensure_vision_encoder_loaded`) and requires up to
+                // `VISION_ENCODER_LAZY_RESERVE_BYTES` (1.5 GiB) total free VRAM on rank 0
+                // (weights + ViT activations). Always reserve the delta above `base_headroom`
+                // ahead of optional extra GDN state slots, protecting only the minimum active
+                // state floor (`min_state_floor`).
+                let base_reserved = required_headroom.saturating_add(req_kv_bytes);
+                let min_state_floor = if capacity.dflash_reserve_bytes != 0 {
+                    capacity.dflash_min_state_slots
+                } else {
+                    MIN_ACTIVE_STATE_SLOTS
+                };
+                let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
+                let vision_reserve = if rank == 0 && has_vision_weights(&cfg, archive) {
+                    let desired_vision_extra =
+                        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom);
+                    available_for_pools
+                        .saturating_sub(base_reserved.saturating_add(min_state_bytes))
+                        .min(desired_vision_extra)
+                } else {
+                    0
+                };
+                let reserved = base_reserved.saturating_add(vision_reserve);
+                if available_for_pools
+                    < reserved
+                        .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
+                {
+                    return Err(loader_err(
+                        "insufficient VRAM for serving state pool and headroom",
+                    ));
+                }
+                (available_for_pools, reserved, vision_reserve)
+            } else if cfg.uses_tiered_moe() {
+                (
+                    available_for_pools,
+                    required_headroom.saturating_add(req_kv_bytes),
+                    0,
+                )
             } else {
-                0
+                (free_vram, base_fixed, 0)
             };
-            let reserved = base_reserved.saturating_add(vision_reserve);
-            if available_for_pools
-                < reserved
-                    .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
-            {
-                return Err(loader_err(
-                    "insufficient VRAM for serving state pool and headroom",
-                ));
-            }
-            (available_for_pools, reserved)
-        } else if cfg.uses_tiered_moe() {
-            (
-                available_for_pools,
-                required_headroom.saturating_add(req_kv_bytes),
-            )
-        } else {
-            (free_vram, base_fixed)
-        };
         let total_state_slots = clamp_state_slots(
             effective_requested_state_slots,
             state_budget_free,
@@ -2088,7 +2096,7 @@ impl PrePoolModelRank {
             &state_pool,
             !gdn_layer_ids.is_empty(),
             tp_size,
-            required_headroom,
+            required_headroom.saturating_add(vision_reserve),
             capacity,
         )?;
 

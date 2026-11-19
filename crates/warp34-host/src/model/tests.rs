@@ -713,11 +713,12 @@ mod serving_capacity_tests {
         let marlin_ws = 8 * mib;
         let free_24g = 24_148 * mib;
         let dflash_reserve = 2_150 * mib;
-        let dflash_min_slots = 11;
+        let dflash_min_slots = super::super::SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS;
 
-        // 1. On 1x 24 GiB with 27B + DFlash2, 256K (16,384 pages) does not fit in Tq4
-        //    with 11 required GDN state slots, but fits in Tq4All with >= 11 state slots
-        //    and host-mapped embed_tokens.
+        // 1. On 1x 24 GiB with 27B + DFlash2 + vision, 256K (16,384 pages) does not fit in
+        //    Tq4 with required GDN state slots + 1.5 GiB lazy ViT headroom, but fits in
+        //    Tq4All with >= SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS state slots and host-mapped
+        //    embed_tokens.
         assert_eq!(
             evaluate_serving_kv_candidate_budget(
                 &cfg,
@@ -763,14 +764,14 @@ mod serving_capacity_tests {
         assert!(slots_tq4_all >= dflash_min_slots);
         assert!(host_embed);
 
-        // 2. When --kv-format tq4 is explicitly pinned, 27B + DFlash2 still fits >= 220K
-        //    (13,760 pages) on 24 GiB.
-        let (slots_tq4_220k, host_embed_220k) = evaluate_serving_kv_candidate_budget(
+        // 2. When --kv-format tq4 is explicitly pinned, 27B + DFlash2 + vision still fits
+        //    >= 196K (12,288 pages) on 24 GiB while preserving lazy ViT headroom.
+        let (slots_tq4_196k, host_embed_196k) = evaluate_serving_kv_candidate_budget(
             &cfg,
             1,
             KvFormatPolicy::Tq4,
             false,
-            13_760,
+            12_288,
             raw_est,
             staging,
             marlin_ws,
@@ -784,9 +785,9 @@ mod serving_capacity_tests {
             LoraCapacityReserve::default(),
             true,
         )
-        .expect("27B + DFlash2 with explicit Tq4 must fit 220K on 24 GiB");
-        assert!(slots_tq4_220k >= dflash_min_slots);
-        assert!(host_embed_220k);
+        .expect("27B + DFlash2 with explicit Tq4 must fit 196K + ViT headroom on 24 GiB");
+        assert!(slots_tq4_196k >= dflash_min_slots);
+        assert!(host_embed_196k);
 
         // 3. Without DFlash2 (27B Plain), 256K (16,384 pages) fits directly in Tq4.
         let (slots_plain, _) = evaluate_serving_kv_candidate_budget(
