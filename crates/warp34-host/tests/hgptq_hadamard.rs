@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use warp34_host::cuda::{
     CudaDevice, CudaEvent, CudaGraph, CudaStream, DeviceBuffer, Tp2Collectives, f16_to_f32,
-    f32_to_f16,
+    f32_to_f16, prepare_execution_plan,
 };
 use warp34_kernels::ffi;
 
@@ -587,7 +587,9 @@ fn tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp() 
     if CudaDevice::count().unwrap_or(0) < 2 {
         return;
     }
-    let comm = Tp2Collectives::new(12288 * 2).unwrap();
+    prepare_execution_plan(0).unwrap();
+    prepare_execution_plan(1).unwrap();
+    let comm = Tp2Collectives::new(8 * 1024 * 1024).unwrap();
     let _d0 = CudaDevice::set_current(0).unwrap();
     let s0 = CudaStream::new(0).unwrap();
     let _d1 = CudaDevice::set_current(1).unwrap();
@@ -706,6 +708,416 @@ fn tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp() 
         assert_eq!(got0, ref0, "TP=2 rank 0 H64 0-ULP mismatch hidden={hidden}");
         assert_eq!(got1, ref0, "TP=2 rank 1 H64 0-ULP mismatch hidden={hidden}");
     }
+
+    // Exercise `>= 512 KiB` 8-chunk full-duplex pipelined `Tp2DmaPipe` (`num_tokens = 263`,
+    // `hidden = 4096` -> `2.104 MiB`, uneven remainder chunk `263 - 7 * 32 = 39` rows) across:
+    // 1) `all_reduce_residual_gemma_rms_norm_hadamard_f16` (with `ar_out`, `residual`, `out`,
+    //    `out_had64`, and strided `tap_dst_bf16`, plus `out == 0` H64-only mode),
+    // 2) `all_reduce_pipelined_f16` (odd-element tail + in-place `out == local_in`),
+    // 3) immediate `< 64 KiB` 1-barrier `all_reduce_f16` follow-up, and
+    // 4) 2-rank CUDA Graph capture + multi-replay of pipelined collectives (`128 * 4096 = 1 MiB`).
+    let num_tokens = 263usize;
+    let hidden = 4096usize;
+    let total = num_tokens * hidden;
+    let tap_stride = hidden * 2;
+    let tap_offset = hidden;
+
+    let in0_h: Vec<u16> = (0..total)
+        .map(|i| f32_to_f16(((i * 31 + 11) % 197) as f32 / 64.0 - 1.5))
+        .collect();
+    let in1_h: Vec<u16> = (0..total)
+        .map(|i| f32_to_f16(((i * 43 + 7) % 193) as f32 / 64.0 - 1.25))
+        .collect();
+    let res_h: Vec<u16> = (0..total)
+        .map(|i| f32_to_f16(((i * 19 + 5) % 179) as f32 / 64.0 - 1.0))
+        .collect();
+    let w_h: Vec<u16> = (0..hidden)
+        .map(|i| f32_to_f16(((i * 13 + 3) % 89) as f32 / 128.0 - 0.25))
+        .collect();
+
+    let alloc_rank = |dev: i32, s: &CudaStream, in_h: &[u16]| {
+        let _d = CudaDevice::set_current(dev).unwrap();
+        let d_in = DeviceBuffer::alloc(dev, total * 2).unwrap();
+        let d_ar = DeviceBuffer::alloc(dev, total * 2).unwrap();
+        let d_res = DeviceBuffer::alloc(dev, total * 2).unwrap();
+        let d_w = DeviceBuffer::alloc(dev, hidden * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(dev, total * 2).unwrap();
+        let d_had = DeviceBuffer::alloc(dev, total * 2).unwrap();
+        let d_tap = DeviceBuffer::alloc(dev, num_tokens * tap_stride * 2).unwrap();
+        d_in.copy_from_host(in_h, s).unwrap();
+        d_res.copy_from_host(&res_h, s).unwrap();
+        d_w.copy_from_host(&w_h, s).unwrap();
+        d_tap
+            .copy_from_host(&vec![0xdead_u16; num_tokens * tap_stride], s)
+            .unwrap();
+        s.synchronize().unwrap();
+        (d_in, d_ar, d_res, d_w, d_out, d_had, d_tap)
+    };
+
+    // Reference unpipelined run (`ffi::warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16`
+    // + `ffi::warp34_tp2_all_reduce_f16` on odd element count `total - 3`).
+    let (r0_in, r0_ar, r0_res, r0_w, r0_out, r0_had, r0_tap) = alloc_rank(0, &s0, &in0_h);
+    let (r1_in, r1_ar, r1_res, r1_w, r1_out, r1_had, r1_tap) = alloc_rank(1, &s1, &in1_h);
+    let odd_elems = (total - 3) as i32;
+    let _d0 = CudaDevice::set_current(0).unwrap();
+    let r0_pipe_ar = DeviceBuffer::alloc(0, total * 2).unwrap();
+    let _d1 = CudaDevice::set_current(1).unwrap();
+    let r1_pipe_ar = DeviceBuffer::alloc(1, total * 2).unwrap();
+
+    std::thread::scope(|scope| {
+        for (r, s, d_in, d_ar, d_res, d_w, d_out, d_had, d_tap, d_par) in [
+            (
+                0i32,
+                &s0,
+                &r0_in,
+                &r0_ar,
+                &r0_res,
+                &r0_w,
+                &r0_out,
+                &r0_had,
+                &r0_tap,
+                &r0_pipe_ar,
+            ),
+            (
+                1i32,
+                &s1,
+                &r1_in,
+                &r1_ar,
+                &r1_res,
+                &r1_w,
+                &r1_out,
+                &r1_had,
+                &r1_tap,
+                &r1_pipe_ar,
+            ),
+        ] {
+            let c = &comm;
+            scope.spawn(move || {
+                let _dev = CudaDevice::set_current(r).unwrap();
+                let ex = s.exec(0, 0);
+                // SAFETY: all pointers belong to live `DeviceBuffer`/`CommBuffer` allocations on `r`.
+                let rc = unsafe {
+                    ffi::warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                        &ex,
+                        d_in.addr() as *const c_void,
+                        d_ar.addr() as *mut c_void,
+                        d_res.addr() as *mut c_void,
+                        d_w.addr() as *const c_void,
+                        d_out.addr() as *mut c_void,
+                        d_had.addr() as *mut c_void,
+                        d_tap.addr() as *mut c_void,
+                        c.stages[0].dev_ptr(),
+                        c.stages[1].dev_ptr(),
+                        c.sigs[0].dev_ptr(),
+                        c.sigs[1].dev_ptr(),
+                        r,
+                        num_tokens as i32,
+                        hidden as i32,
+                        1e-6,
+                        tap_stride as i32,
+                        tap_offset as i32,
+                    )
+                };
+                assert_eq!(rc, 0);
+                // SAFETY: `d_in`, `d_par`, `stages`, and `sigs` are live buffers sized for `total` FP16s.
+                let rc2 = unsafe {
+                    ffi::warp34_tp2_all_reduce_f16(
+                        &ex,
+                        d_in.addr() as *const c_void,
+                        d_par.addr() as *mut c_void,
+                        c.stages[0].dev_ptr(),
+                        c.stages[1].dev_ptr(),
+                        c.sigs[0].dev_ptr(),
+                        c.sigs[1].dev_ptr(),
+                        r,
+                        odd_elems,
+                    )
+                };
+                assert_eq!(rc2, 0);
+                s.synchronize().unwrap();
+            });
+        }
+    });
+
+    // Pipelined run via `Tp2Collectives` (`>= 512 KiB` -> `Tp2DmaPipe`), plus `out == 0` H64-only
+    // and `< 64 KiB` 1-barrier transition.
+    let (p0_in, p0_ar, p0_res, p0_w, p0_out, p0_had, p0_tap) = alloc_rank(0, &s0, &in0_h);
+    let (p1_in, p1_ar, p1_res, p1_w, p1_out, p1_had, p1_tap) = alloc_rank(1, &s1, &in1_h);
+    let _d0 = CudaDevice::set_current(0).unwrap();
+    let p0_res_had_only = DeviceBuffer::alloc(0, total * 2).unwrap();
+    let p0_had_only = DeviceBuffer::alloc(0, total * 2).unwrap();
+    let p0_pipe_ar = DeviceBuffer::alloc(0, total * 2).unwrap();
+    let p0_small = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+    p0_res_had_only.copy_from_host(&res_h, &s0).unwrap();
+    p0_pipe_ar.copy_from_host(&in0_h, &s0).unwrap();
+    s0.synchronize().unwrap();
+
+    let _d1 = CudaDevice::set_current(1).unwrap();
+    let p1_res_had_only = DeviceBuffer::alloc(1, total * 2).unwrap();
+    let p1_had_only = DeviceBuffer::alloc(1, total * 2).unwrap();
+    let p1_pipe_ar = DeviceBuffer::alloc(1, total * 2).unwrap();
+    let p1_small = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+    p1_res_had_only.copy_from_host(&res_h, &s1).unwrap();
+    p1_pipe_ar.copy_from_host(&in1_h, &s1).unwrap();
+    s1.synchronize().unwrap();
+
+    std::thread::scope(|scope| {
+        for (r, s, d_in, d_ar, d_res, d_w, d_out, d_had, d_tap, d_res_ho, d_ho, d_par, d_sm) in [
+            (
+                0i32,
+                &s0,
+                &p0_in,
+                &p0_ar,
+                &p0_res,
+                &p0_w,
+                &p0_out,
+                &p0_had,
+                &p0_tap,
+                &p0_res_had_only,
+                &p0_had_only,
+                &p0_pipe_ar,
+                &p0_small,
+            ),
+            (
+                1i32,
+                &s1,
+                &p1_in,
+                &p1_ar,
+                &p1_res,
+                &p1_w,
+                &p1_out,
+                &p1_had,
+                &p1_tap,
+                &p1_res_had_only,
+                &p1_had_only,
+                &p1_pipe_ar,
+                &p1_small,
+            ),
+        ] {
+            let c = &comm;
+            scope.spawn(move || {
+                let _dev = CudaDevice::set_current(r).unwrap();
+                let ex = s.exec(0, 0);
+                c.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                    &ex,
+                    d_in.addr(),
+                    d_ar.addr(),
+                    d_res.addr(),
+                    d_w.addr(),
+                    d_out.addr(),
+                    d_had.addr(),
+                    d_tap.addr(),
+                    r,
+                    num_tokens as i32,
+                    hidden as i32,
+                    1e-6,
+                    tap_stride as i32,
+                    tap_offset as i32,
+                )
+                .unwrap();
+                // `out == 0` (`out_had64`-only mode) at `>= 512 KiB`.
+                c.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                    &ex,
+                    d_in.addr(),
+                    0,
+                    d_res_ho.addr(),
+                    d_w.addr(),
+                    0,
+                    d_ho.addr(),
+                    0,
+                    r,
+                    num_tokens as i32,
+                    hidden as i32,
+                    1e-6,
+                    0,
+                    0,
+                )
+                .unwrap();
+                // In-place `out == local_in` via `all_reduce_f16` (`>= 512 KiB` auto-routes to
+                // `all_reduce_pipelined_f16`) on odd element count, then `< 64 KiB` 1-barrier.
+                c.all_reduce_f16(&ex, d_par.addr(), d_par.addr(), r, odd_elems)
+                    .unwrap();
+                c.all_reduce_f16(&ex, d_in.addr(), d_sm.addr(), r, hidden as i32)
+                    .unwrap();
+                s.synchronize().unwrap();
+            });
+        }
+    });
+
+    for (
+        r,
+        s,
+        ref_ar,
+        ref_res,
+        ref_out,
+        ref_had,
+        ref_tap,
+        ref_par,
+        got_ar,
+        got_res,
+        got_out,
+        got_had,
+        got_tap,
+        got_ho,
+        got_par,
+        got_sm,
+    ) in [
+        (
+            0i32,
+            &s0,
+            &r0_ar,
+            &r0_res,
+            &r0_out,
+            &r0_had,
+            &r0_tap,
+            &r0_pipe_ar,
+            &p0_ar,
+            &p0_res,
+            &p0_out,
+            &p0_had,
+            &p0_tap,
+            &p0_had_only,
+            &p0_pipe_ar,
+            &p0_small,
+        ),
+        (
+            1i32,
+            &s1,
+            &r1_ar,
+            &r1_res,
+            &r1_out,
+            &r1_had,
+            &r1_tap,
+            &r1_pipe_ar,
+            &p1_ar,
+            &p1_res,
+            &p1_out,
+            &p1_had,
+            &p1_tap,
+            &p1_had_only,
+            &p1_pipe_ar,
+            &p1_small,
+        ),
+    ] {
+        let _d = CudaDevice::set_current(r).unwrap();
+        let read_vec = |buf: &DeviceBuffer, len: usize| {
+            let mut v = vec![0u16; len];
+            buf.copy_to_host(&mut v, s).unwrap();
+            s.synchronize().unwrap();
+            v
+        };
+        assert_eq!(
+            read_vec(got_ar, total),
+            read_vec(ref_ar, total),
+            "rank {r} ar_out"
+        );
+        assert_eq!(
+            read_vec(got_res, total),
+            read_vec(ref_res, total),
+            "rank {r} residual"
+        );
+        assert_eq!(
+            read_vec(got_out, total),
+            read_vec(ref_out, total),
+            "rank {r} out"
+        );
+        let expected_had = read_vec(ref_had, total);
+        assert_eq!(read_vec(got_had, total), expected_had, "rank {r} out_had64");
+        assert_eq!(
+            read_vec(got_ho, total),
+            expected_had,
+            "rank {r} out_had64 (out==0)"
+        );
+        assert_eq!(
+            read_vec(got_tap, num_tokens * tap_stride),
+            read_vec(ref_tap, num_tokens * tap_stride),
+            "rank {r} tap_dst_bf16"
+        );
+        assert_eq!(
+            read_vec(got_par, odd_elems as usize),
+            read_vec(ref_par, odd_elems as usize),
+            "rank {r} all_reduce_pipelined_f16"
+        );
+        assert_eq!(
+            read_vec(got_sm, hidden),
+            &read_vec(ref_ar, hidden)[..hidden],
+            "rank {r} trailing <64KiB 1-barrier all_reduce_f16"
+        );
+    }
+
+    // Verify 2-rank CUDA Graph capture + multi-replay of pipelined collectives (`128 * 4096 = 1 MiB`).
+    let g_tokens = 128usize;
+    let g_elems = g_tokens * hidden;
+    let _d0 = CudaDevice::set_current(0).unwrap();
+    let g0_res = DeviceBuffer::alloc(0, g_elems * 2).unwrap();
+    let g0_had = DeviceBuffer::alloc(0, g_elems * 2).unwrap();
+    let g0_ar = DeviceBuffer::alloc(0, g_elems * 2).unwrap();
+    let _d1 = CudaDevice::set_current(1).unwrap();
+    let g1_res = DeviceBuffer::alloc(1, g_elems * 2).unwrap();
+    let g1_had = DeviceBuffer::alloc(1, g_elems * 2).unwrap();
+    let g1_ar = DeviceBuffer::alloc(1, g_elems * 2).unwrap();
+
+    let barrier = std::sync::Barrier::new(2);
+    let res_slice = &res_h[..g_elems];
+    std::thread::scope(|scope| {
+        for (r, s, d_in, d_w, d_res, d_had, d_ar) in [
+            (0i32, &s0, &p0_in, &p0_w, &g0_res, &g0_had, &g0_ar),
+            (1i32, &s1, &p1_in, &p1_w, &g1_res, &g1_had, &g1_ar),
+        ] {
+            let c = &comm;
+            let bar = &barrier;
+            scope.spawn(move || {
+                let _dev = CudaDevice::set_current(r).unwrap();
+                let ex = s.exec(0, 0);
+                bar.wait();
+                let graph = CudaGraph::capture(s, || {
+                    c.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                        &ex,
+                        d_in.addr(),
+                        0,
+                        d_res.addr(),
+                        d_w.addr(),
+                        0,
+                        d_had.addr(),
+                        0,
+                        r,
+                        g_tokens as i32,
+                        hidden as i32,
+                        1e-6,
+                        0,
+                        0,
+                    )?;
+                    c.all_reduce_pipelined_f16(&ex, d_in.addr(), d_ar.addr(), r, g_elems as i32)
+                })
+                .unwrap();
+                bar.wait();
+                for _ in 0..2 {
+                    d_res.copy_from_host(res_slice, s).unwrap();
+                    graph.launch(s).unwrap();
+                }
+                s.synchronize().unwrap();
+            });
+        }
+    });
+
+    let _d0 = CudaDevice::set_current(0).unwrap();
+    let mut g_got0 = vec![0u16; g_elems];
+    let mut g_ar0 = vec![0u16; g_elems];
+    let mut ref_had0 = vec![0u16; g_elems];
+    let mut ref_ar0 = vec![0u16; g_elems];
+    g0_had.copy_to_host(&mut g_got0, &s0).unwrap();
+    g0_ar.copy_to_host(&mut g_ar0, &s0).unwrap();
+    r0_had.copy_to_host(&mut ref_had0, &s0).unwrap();
+    r0_ar.copy_to_host(&mut ref_ar0, &s0).unwrap();
+    s0.synchronize().unwrap();
+    assert_eq!(
+        g_got0, ref_had0,
+        "CUDA Graph pipelined fused norm+H64 mismatch"
+    );
+    assert_eq!(
+        g_ar0, ref_ar0,
+        "CUDA Graph pipelined all_reduce_f16 mismatch"
+    );
 }
 
 #[test]

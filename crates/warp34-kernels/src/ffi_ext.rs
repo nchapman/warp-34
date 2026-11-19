@@ -769,6 +769,31 @@ unsafe extern "C" {
         tap_col_offset: i32,
     ) -> i32;
 
+    pub fn warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16(
+        ex: *const Warp34Exec,
+        local_in: *const c_void,
+        ar_out: *mut c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+        dma_stream: usize,
+        ev_ready: usize,
+        ev_tx_done: *const usize,
+        max_chunks: i32,
+    ) -> i32;
+
     pub fn warp34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         ex: *const Warp34Exec,
         local_in: *const c_void,

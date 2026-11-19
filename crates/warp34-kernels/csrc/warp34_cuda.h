@@ -442,6 +442,10 @@ size_t warp34_tp2_signal_bytes(void);
 int warp34_tp2_all_reduce_f16(const warp34_exec* ex, const void* local_in, void* out,
                            void* stage0, void* stage1,
                            void* sig0, void* sig1, int rank, int num_elems);
+int warp34_tp2_all_reduce_pipelined_f16(
+    const warp34_exec* ex, const void* local_in, void* out,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_elems,
+    uintptr_t dma_stream, uintptr_t ev_ready, const uintptr_t* ev_tx_done, int max_chunks);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* tap_dst_bf16,
@@ -903,6 +907,12 @@ int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
     void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
     int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16(
+    const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset,
+    uintptr_t dma_stream, uintptr_t ev_ready, const uintptr_t* ev_tx_done, int max_chunks);
 int warp34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* out_had64, void* tap_dst_bf16,

@@ -1,6 +1,6 @@
 # warp34 — Session Orientation & Current State
 
-## 9B Single-Card Head-to-Head (`1× RTX 3090 Ti`) & Short-Prompt Burst Scheduler Fix
+## 9B Single-Card & Dual-Card (`TP=2`) Head-to-Head (`1–2× RTX 3090 Ti`), Short-Prompt Burst Packing, & Full-Duplex Pipelined PCIe `TP=2` Collectives
 
 - **Dashboard, Metrics, LoRA Visibility, & Startup Banner Accuracy (`d1bd2bf`, `ca17d41`, `1e70b8b`, `a644b6e`):**
   - Added optional `pools.gdn_checkpoints` (`vram_capacity`/`vram_used`/`host_capacity`/`host_used`) and `config.lora_adapters` to `/api/metrics` + `warp34_pool_units{pool="gdn_ckpt_vram|gdn_ckpt_host"}` and `warp34_lora_adapters_loaded` to `/metrics` (`docs/METRICS.md`), surfaced tiered `WHT128-Q8 checkpoints`, `max_model_len`, numeric `cached` counts, and subtle LoRA badge + Playground `MODEL / LORA` selector in `dashboard/`, and added live `/v1/responses` streaming tool-call accumulation.
@@ -10,16 +10,30 @@
     - **Cold prompt processing (`pp`, tok/s p50):** `warp34 FP16` swept 5/5 (`4.9K`: `5,153` `+2.3%/+7.5%`; `19.4K`: `4,771` `+3.8%/+3.4%`; `38.7K`: `4,274` `+2.5%/+3.6%`; `57.6K`: `3,908` `+2.3%/+2.9%`; `115.1K`: `3,147` `+2.5%/+2.4%`).
     - **Long-context coding agent:** `warp34 FP16` swept 2/2 (`64K`: `27.02 tok/s` `+4.7%/+4.7%`, warm TTFT `401 ms` vs `566`/`582 ms`; `120K`: `14.22 tok/s` `+8.2%/+6.4%`, warm TTFT `495 ms` vs `640`/`674 ms`).
     - **Decode & batching:** `warp34 FP16` won `C4` (`460.3` `+6.4%/+4.4%`) and `C8` (`812.2` `+2.1%/+6.4%`), beat vLLM at `C1` (`127.5` `+3.0%/-1.0%`), and initially trailed at `throughput-c16` (`1,229.2` vs vLLM `1,275.8` / SGLang `1,295.1`) due to ~100–250 ms/wave TTFT inflation.
-- **Short-Prompt Burst Scheduler Fix (`crates/warp34-host/src/scheduler.rs`):**
+- **Short-Prompt Burst Scheduler Fix (`crates/warp34-host/src/scheduler.rs`, `e9cb5d4`):**
   - Diagnosed two causes of `throughput-c16` TTFT inflation: (1) pure-prefill equal-share chunking split 16 × 165-token prompts into `128 + 37` chunks (doubling GDN launches and intermediate state traffic), and (2) once any request entered decode, a flat `256`-token mixed cap serialized remaining short prompts 1-by-1 across 10+ forward passes.
   - Updated `SchedulerV1::schedule_step` to skip pure-prefill splitting for short prompts (`rem <= mixed_cap`) and scale the aggregate mixed-step prefill budget by the count of eligible short causal prefills (`rem <= mixed_cap`, while keeping single-slice and multi-bulk mixed prefills strictly capped at `mixed_cap = 256`), with regression coverage in `test_short_prompt_burst_packs_without_splitting_and_scales_mixed_wave`.
   - Verified on `1× RTX 3090 Ti`: `throughput-c16` jumped from `1,229.2` to `1,255.7–1,274.1 tok/s` and `ttft_p50` dropped from `558 ms` to `413.6 ms` (faster than both `vLLM` `456.7 ms` and `SGLang` `489.8 ms`), with `mise run check-quick`, `15/15` `scheduler::tests`, and `review` clean.
-- **9B `TP=2` Head-to-Head Campaign (`benchmarks/perf/campaigns/9b-tp2-head-to-head.toml`, `2× RTX 3090 Ti` `sm_86`, PCIe `TP=2`):**
-  - `warp34 dump-diff --compare-tp2` on 9B passed (`min_cosine=0.999221`, `tp1_top1 == tp2_top1 == 271`).
+- **Full-Duplex 8-Chunk Pipelined PCIe `TP=2` Collectives (`Tp2DmaPipe`, `crates/warp34-kernels/csrc/ops/op_collectives.cu`, `crates/warp34-host/src/cuda/collectives.rs`):**
+  - Root-caused the initial `TP=2` cold-prefill gap (`777d533`) via `nsys`: on `M=2048` (`16 MiB`) PCIe AllReduces without `iommu=pt`, serialized single-stream `cudaMemcpyAsync` TX (`1.274 ms`) + SM RX (`1.323 ms` = `2.597 ms` total) left PCIe half-duplex while `vLLM`'s `RING_LL` overlapped TX and RX (`2.208 ms` + `0.075 ms` norm = `2.283 ms`).
+  - Ported `Tp2DmaPipe` (`stream`, `ev_ready`, `ev_tx_done: [CudaEvent; 8]`) and `warp34_tp2_all_reduce_pipelined_f16` (`tp2_all_reduce_rx_chunk_f16_kernel`, warmed in `warp34_tp2_warmup()`) from `qwen-image` (`752d1b3`), and extended 8-chunk CUDA-event fork-join pipelining (`>= 512 KiB` on real 2-GPU PCIe mapped host memory, `kRankForceDmaTxFlag` + `kRankSkipTrailingBarrierFlag` on chunks `0..k-2`, 100% CUDA-Graph capturable) to `warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16`.
+  - Verified `0`-ULP bit-for-bit parity across `ar_out`, `residual`, `out`, `out_had64` (including `out == 0`), strided `tap_dst_bf16`, odd-tail in-place `all_reduce_f16`, `< 64 KiB` 1-barrier transitions, and 2-rank CUDA Graph capture/replay in `tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp`, `9/9` `collectives_tp2` `compute-sanitizer` (`memcheck`, `racecheck`, `synccheck`) runs, and 9B `dump-diff --compare-tp2` (`958` tokens / `7.66 MiB`: `min_cosine=0.999934`, `tp1_top1 == tp2_top1 == 16`).
+- **9B `TP=2` Head-to-Head Campaign — 11/11 Clean Sweep (`benchmarks/perf/campaigns/9b-tp2-head-to-head.toml`, `2× RTX 3090 Ti` `sm_86`, PCIe `TP=2`):**
   - Serial 3-engine run (`warp34-9b-tp2-fp16` vs `vLLM 0.34.0` vs `SGLang v0.5.23`, 11 cases × 3 reps + warmup, 100% pass; raw artifacts in `benchmarks/perf/results/9b-tp2-head-to-head-2026-11-19/`):
-    - **Decode & continuous batching:** `warp34` led `C1` (`191.1 tok/s`, `+30.1%` vs vLLM `147.0`, `+4.6%` vs SGLang `182.8`), `C4` (`662.7 tok/s`, `+34.6%` vs vLLM `492.5`, `+19.6%` vs SGLang `553.9`), and `C8` (`987.0 tok/s`, `+15.3%` vs vLLM `855.8`, `+10.0%` vs SGLang `897.3`), and at `C16` hit `1,418.4 tok/s` (`+3.6%` vs vLLM `1,368.9`, `-0.5%` vs SGLang `1,424.9`, lower TTFT `426.6 ms` vs SGLang `430.0 ms`).
-    - **Long-context coding agent:** `warp34` swept 2/2 (`64K`: `33.34 tok/s` `+2.4%/+0.8%`, warm TTFT `389 ms` vs `491`/`493 ms`; `120K`: `18.50 tok/s` `+4.6%/+5.5%`, warm TTFT `506 ms` vs `664`/`668 ms`).
-    - **Cold prompt processing (`pp`, PCIe `TP=2`):** `warp34` matched SGLang (`4.9K`: `5,399` `+1.6%`; `115K`: `3,955` `+0.1%`; `16K–60K`: `-1.0%` to `-3.9%`) and trailed vLLM by `2.7%–5.1%` on multi-MiB (`16 MiB`) `M=2048` PCIe AllReduces (`4.9K`: `5,399` vs `5,582`; `115K`: `3,955` vs `4,169`).
+    - **Cold prompt processing (`pp`, tok/s p50 — 5/5 sweep, `+13.5%..+19.9%` over unpipelined `warp34`):**
+      - `4.9K`: **`6,413.3 tok/s`** (`757.4 ms` TTFT) — **`+14.9%`** vs vLLM (`5,583.1`, `870.0 ms`), **`+20.6%`** vs SGLang (`5,317.5`, `913.5 ms`).
+      - `19.4K`: **`6,174.2 tok/s`** (`3,141.2 ms` TTFT) — **`+14.4%`** vs vLLM (`5,397.7`, `3,593.1 ms`), **`+15.2%`** vs SGLang (`5,360.6`, `3,618.0 ms`).
+      - `38.7K`: **`5,822.7 tok/s`** (`6,648.9 ms` TTFT) — **`+14.3%`** vs vLLM (`5,096.0`, `7,597.0 ms`), **`+15.9%`** vs SGLang (`5,025.9`, `7,703.0 ms`).
+      - `57.6K`: **`5,397.0 tok/s`** (`10,674.5 ms` TTFT) — **`+11.5%`** vs vLLM (`4,839.5`, `11,904.1 ms`), **`+15.2%`** vs SGLang (`4,685.6`, `12,295.1 ms`).
+      - `115.1K`: **`4,489.9 tok/s`** (`25,636.7 ms` TTFT) — **`+7.7%`** vs vLLM (`4,168.5`, `27,612.9 ms`), **`+13.6%`** vs SGLang (`3,952.8`, `29,120.1 ms`).
+    - **Decode & continuous batching (4/4 sweep):**
+      - `decode-c1`: **`190.85 tok/s`** (`37.9 ms` TTFT) — **`+29.9%`** vs vLLM (`146.96`), **`+4.4%`** vs SGLang (`182.76`).
+      - `throughput-c4`: **`665.74 tok/s`** (`110.5 ms` TTFT) — **`+35.2%`** vs vLLM (`492.48`), **`+20.2%`** vs SGLang (`553.88`).
+      - `throughput-c8`: **`998.21 tok/s`** (`210.1 ms` TTFT) — **`+16.6%`** vs vLLM (`855.78`), **`+11.2%`** vs SGLang (`897.31`).
+      - `throughput-c16`: **`1,448.08 tok/s`** (`362.9 ms` TTFT) — **`+5.8%`** vs vLLM (`1,368.95`, `407.1 ms`), **`+1.6%`** vs SGLang (`1,424.95`, `430.0 ms`).
+    - **Long-context coding agent (2/2 sweep):**
+      - `swe-agent-64k-c1`: **`37.17 tok/s`** (`284.6 ms` warm TTFT) — **`+14.2%`** vs vLLM (`32.56`, `455.1 ms`), **`+12.3%`** vs SGLang (`33.09`, `470.7 ms`).
+      - `swe-agent-120k-c1`: **`20.54 tok/s`** (`338.2 ms` warm TTFT) — **`+16.1%`** vs vLLM (`17.69`, `487.9 ms`), **`+17.1%`** vs SGLang (`17.54`, `545.2 ms`).
 
 ## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`) & Pre-Release Verification Pass
 
