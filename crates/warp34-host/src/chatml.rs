@@ -136,7 +136,17 @@ pub fn format_chatml_prompt_with_options(
     preserve_thinking: bool,
 ) -> String {
     let mut out = String::new();
-    let system = messages.first().filter(|m| m.role == "system");
+    let head_system_count = messages.iter().take_while(|m| m.role == "system").count();
+    let leading_system: String = messages[..head_system_count]
+        .iter()
+        .filter_map(|m| {
+            m.content
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let tools = tools.and_then(Value::as_array).filter(|t| !t.is_empty());
     if let Some(tools) = tools {
         out.push_str(
@@ -148,18 +158,14 @@ pub fn format_chatml_prompt_with_options(
         }
         out.push_str("\n</tools>");
         out.push_str(TOOL_INSTRUCTIONS);
-        if let Some(content) = system
-            .and_then(|m| m.content.as_deref())
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-        {
+        if !leading_system.is_empty() {
             out.push_str("\n\n");
-            out.push_str(content);
+            out.push_str(&leading_system);
         }
         out.push_str("<|im_end|>\n");
-    } else if let Some(system) = system {
+    } else if head_system_count > 0 {
         out.push_str("<|im_start|>system\n");
-        out.push_str(system.content.as_deref().unwrap_or("").trim());
+        out.push_str(&leading_system);
         out.push_str("<|im_end|>\n");
     }
     let last_query = messages.iter().rposition(|m| {
@@ -170,7 +176,12 @@ pub fn format_chatml_prompt_with_options(
     for (index, message) in messages.iter().enumerate() {
         let mut content = message.content.as_deref().unwrap_or("").trim();
         match message.role.as_str() {
-            "system" => {}
+            "system" if index < head_system_count => {}
+            "system" => {
+                out.push_str("<|im_start|>system\n");
+                out.push_str(content);
+                out.push_str("<|im_end|>\n");
+            }
             "tool" => {
                 if index == 0 || messages[index - 1].role != "tool" {
                     out.push_str("<|im_start|>user");

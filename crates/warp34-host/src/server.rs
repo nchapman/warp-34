@@ -463,7 +463,7 @@ pub fn parse_openai_messages_with_image_policy(
     let deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
     let mut out = Vec::with_capacity(arr.len());
     let mut images = Vec::new();
-    for (index, item) in arr.iter().enumerate() {
+    for item in arr {
         let raw_role = item
             .get("role")
             .and_then(|v| v.as_str())
@@ -473,9 +473,6 @@ pub fn parse_openai_messages_with_image_policy(
             "user" | "assistant" | "tool" => raw_role,
             other => return Err(format!("unsupported message role '{other}'")),
         };
-        if role == "system" && index != 0 {
-            return Err("system message must be at the beginning".into());
-        }
         let tool_calls = crate::chatml::parse_history_tools(item.get("tool_calls"))?;
         if role != "assistant" && !tool_calls.is_empty() {
             return Err("tool_calls are only valid on assistant messages".into());

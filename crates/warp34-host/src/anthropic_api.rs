@@ -224,6 +224,7 @@ fn convert_messages(
         out.push(json!({"role": "system", "content": sys}));
     }
 
+    let mut has_conversation_msg = false;
     for msg in arr {
         let obj = msg
             .as_object()
@@ -237,236 +238,265 @@ fn convert_messages(
             .ok_or_else(|| AnthropicApiError::bad_request("message missing 'content'"))?;
 
         match role {
-            "user" => match content_val {
-                Value::String(s) => {
-                    out.push(json!({"role": "user", "content": s}));
+            "system" | "developer" => {
+                if let Some(sys_text) = extract_system_prompt(Some(content_val))? {
+                    out.push(json!({"role": "system", "content": sys_text}));
                 }
-                Value::Array(blocks) => {
-                    if blocks.is_empty() {
-                        return Err(AnthropicApiError::bad_request(
-                            "user message content array must not be empty",
-                        ));
+            }
+            "user" => {
+                has_conversation_msg = true;
+                match content_val {
+                    Value::String(s) => {
+                        out.push(json!({"role": "user", "content": s}));
                     }
-                    let mut tool_messages = Vec::new();
-                    let mut user_parts = Vec::new();
-                    let mut has_image = false;
-                    let mut user_text = String::new();
+                    Value::Array(blocks) => {
+                        if blocks.is_empty() {
+                            return Err(AnthropicApiError::bad_request(
+                                "user message content array must not be empty",
+                            ));
+                        }
+                        let mut tool_messages = Vec::new();
+                        let mut user_parts = Vec::new();
+                        let mut has_image = false;
+                        let mut user_text = String::new();
 
-                    for b in blocks {
-                        let bobj = b.as_object().ok_or_else(|| {
-                            AnthropicApiError::bad_request("content block must be an object")
-                        })?;
-                        let btype = bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
-                            AnthropicApiError::bad_request("content block missing string 'type'")
-                        })?;
-                        match btype {
-                            "text" => {
-                                let t =
-                                    bobj.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "text block missing string 'text'",
-                                        )
-                                    })?;
-                                user_text.push_str(t);
-                                user_parts.push(json!({"type": "text", "text": t}));
-                            }
-                            "image" => {
-                                has_image = true;
-                                user_parts.push(convert_image_block(bobj)?);
-                            }
-                            "tool_result" => {
-                                let tool_use_id = bobj
-                                    .get("tool_use_id")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_result block missing non-empty 'tool_use_id'",
-                                        )
-                                    })?;
-                                let is_error = bobj
-                                    .get("is_error")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                let mut tr_text = String::new();
-                                match bobj.get("content") {
-                                    None | Some(Value::Null) => {}
-                                    Some(Value::String(s)) => tr_text.push_str(s),
-                                    Some(Value::Array(inner)) => {
-                                        for ib in inner {
-                                            let iobj = ib.as_object().ok_or_else(|| {
+                        for b in blocks {
+                            let bobj = b.as_object().ok_or_else(|| {
+                                AnthropicApiError::bad_request("content block must be an object")
+                            })?;
+                            let btype =
+                                bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
+                                    AnthropicApiError::bad_request(
+                                        "content block missing string 'type'",
+                                    )
+                                })?;
+                            match btype {
+                                "text" => {
+                                    let t = bobj.get("text").and_then(Value::as_str).ok_or_else(
+                                        || {
+                                            AnthropicApiError::bad_request(
+                                                "text block missing string 'text'",
+                                            )
+                                        },
+                                    )?;
+                                    user_text.push_str(t);
+                                    user_parts.push(json!({"type": "text", "text": t}));
+                                }
+                                "image" => {
+                                    has_image = true;
+                                    user_parts.push(convert_image_block(bobj)?);
+                                }
+                                "tool_result" => {
+                                    let tool_use_id = bobj
+                                        .get("tool_use_id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_result block missing non-empty 'tool_use_id'",
+                                            )
+                                        })?;
+                                    let is_error = bobj
+                                        .get("is_error")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    let mut tr_text = String::new();
+                                    match bobj.get("content") {
+                                        None | Some(Value::Null) => {}
+                                        Some(Value::String(s)) => tr_text.push_str(s),
+                                        Some(Value::Array(inner)) => {
+                                            for ib in inner {
+                                                let iobj = ib.as_object().ok_or_else(|| {
                                                 AnthropicApiError::bad_request(
                                                     "tool_result content block must be an object",
                                                 )
                                             })?;
-                                            match iobj.get("type").and_then(Value::as_str) {
-                                                Some("text") => {
-                                                    if let Some(t) =
-                                                        iobj.get("text").and_then(Value::as_str)
-                                                    {
-                                                        if !tr_text.is_empty() {
-                                                            tr_text.push('\n');
+                                                match iobj.get("type").and_then(Value::as_str) {
+                                                    Some("text") => {
+                                                        if let Some(t) =
+                                                            iobj.get("text").and_then(Value::as_str)
+                                                        {
+                                                            if !tr_text.is_empty() {
+                                                                tr_text.push('\n');
+                                                            }
+                                                            tr_text.push_str(t);
                                                         }
-                                                        tr_text.push_str(t);
                                                     }
-                                                }
-                                                Some("image") => {
-                                                    has_image = true;
-                                                    user_parts.push(convert_image_block(iobj)?);
-                                                }
-                                                Some(other) => {
-                                                    return Err(AnthropicApiError::bad_request(
-                                                        format!(
-                                                            "unsupported tool_result inner block type '{other}'"
-                                                        ),
-                                                    ));
-                                                }
-                                                None => {
-                                                    return Err(AnthropicApiError::bad_request(
-                                                        "tool_result inner block missing 'type'",
-                                                    ));
+                                                    Some("image") => {
+                                                        has_image = true;
+                                                        user_parts.push(convert_image_block(iobj)?);
+                                                    }
+                                                    Some(other) => {
+                                                        return Err(
+                                                            AnthropicApiError::bad_request(
+                                                                format!(
+                                                                    "unsupported tool_result inner block type '{other}'"
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                    None => {
+                                                        return Err(
+                                                            AnthropicApiError::bad_request(
+                                                                "tool_result inner block missing 'type'",
+                                                            ),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
+                                        Some(_) => {
+                                            return Err(AnthropicApiError::bad_request(
+                                                "tool_result 'content' must be a string or array",
+                                            ));
+                                        }
                                     }
-                                    Some(_) => {
+                                    if is_error && !tr_text.starts_with("Error:") {
+                                        tr_text = format!("Error: {tr_text}");
+                                    }
+                                    tool_messages.push(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_use_id,
+                                        "content": tr_text,
+                                    }));
+                                }
+                                other => {
+                                    return Err(AnthropicApiError::bad_request(format!(
+                                        "unsupported user content block type '{other}'"
+                                    )));
+                                }
+                            }
+                        }
+
+                        out.extend(tool_messages);
+                        if has_image {
+                            out.push(json!({"role": "user", "content": user_parts}));
+                        } else if !user_parts.is_empty() {
+                            out.push(json!({"role": "user", "content": user_text}));
+                        }
+                    }
+                    _ => {
+                        return Err(AnthropicApiError::bad_request(
+                            "user 'content' must be a string or array of blocks",
+                        ));
+                    }
+                }
+            }
+            "assistant" => {
+                has_conversation_msg = true;
+                match content_val {
+                    Value::String(s) => {
+                        out.push(json!({"role": "assistant", "content": s}));
+                    }
+                    Value::Array(blocks) => {
+                        let mut thinking_text = String::new();
+                        let mut assistant_text = String::new();
+                        let mut tool_calls = Vec::new();
+
+                        for b in blocks {
+                            let bobj = b.as_object().ok_or_else(|| {
+                                AnthropicApiError::bad_request("assistant block must be an object")
+                            })?;
+                            let btype =
+                                bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
+                                    AnthropicApiError::bad_request(
+                                        "assistant block missing string 'type'",
+                                    )
+                                })?;
+                            match btype {
+                                "thinking" => {
+                                    if let Some(t) = bobj.get("thinking").and_then(Value::as_str) {
+                                        thinking_text.push_str(t);
+                                    }
+                                }
+                                "redacted_thinking" => {}
+                                "text" => {
+                                    let t = bobj.get("text").and_then(Value::as_str).ok_or_else(
+                                        || {
+                                            AnthropicApiError::bad_request(
+                                                "assistant text block missing string 'text'",
+                                            )
+                                        },
+                                    )?;
+                                    assistant_text.push_str(t);
+                                }
+                                "tool_use" => {
+                                    let id = bobj
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_use block missing non-empty 'id'",
+                                            )
+                                        })?;
+                                    let name = bobj
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_use block missing non-empty 'name'",
+                                            )
+                                        })?;
+                                    let input =
+                                        bobj.get("input").cloned().unwrap_or_else(|| json!({}));
+                                    if !input.is_object() {
                                         return Err(AnthropicApiError::bad_request(
-                                            "tool_result 'content' must be a string or array",
+                                            "tool_use 'input' must be a JSON object",
                                         ));
                                     }
+                                    tool_calls.push(json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": input,
+                                        }
+                                    }));
                                 }
-                                if is_error && !tr_text.starts_with("Error:") {
-                                    tr_text = format!("Error: {tr_text}");
+                                other => {
+                                    return Err(AnthropicApiError::bad_request(format!(
+                                        "unsupported assistant content block type '{other}'"
+                                    )));
                                 }
-                                tool_messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": tr_text,
-                                }));
-                            }
-                            other => {
-                                return Err(AnthropicApiError::bad_request(format!(
-                                    "unsupported user content block type '{other}'"
-                                )));
                             }
                         }
-                    }
 
-                    out.extend(tool_messages);
-                    if has_image {
-                        out.push(json!({"role": "user", "content": user_parts}));
-                    } else if !user_parts.is_empty() {
-                        out.push(json!({"role": "user", "content": user_text}));
-                    }
-                }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(
-                        "user 'content' must be a string or array of blocks",
-                    ));
-                }
-            },
-            "assistant" => match content_val {
-                Value::String(s) => {
-                    out.push(json!({"role": "assistant", "content": s}));
-                }
-                Value::Array(blocks) => {
-                    let mut thinking_text = String::new();
-                    let mut assistant_text = String::new();
-                    let mut tool_calls = Vec::new();
-
-                    for b in blocks {
-                        let bobj = b.as_object().ok_or_else(|| {
-                            AnthropicApiError::bad_request("assistant block must be an object")
-                        })?;
-                        let btype = bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
-                            AnthropicApiError::bad_request("assistant block missing string 'type'")
-                        })?;
-                        match btype {
-                            "thinking" => {
-                                if let Some(t) = bobj.get("thinking").and_then(Value::as_str) {
-                                    thinking_text.push_str(t);
-                                }
-                            }
-                            "redacted_thinking" => {}
-                            "text" => {
-                                let t =
-                                    bobj.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "assistant text block missing string 'text'",
-                                        )
-                                    })?;
-                                assistant_text.push_str(t);
-                            }
-                            "tool_use" => {
-                                let id = bobj
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_use block missing non-empty 'id'",
-                                        )
-                                    })?;
-                                let name = bobj
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_use block missing non-empty 'name'",
-                                        )
-                                    })?;
-                                let input = bobj.get("input").cloned().unwrap_or_else(|| json!({}));
-                                if !input.is_object() {
-                                    return Err(AnthropicApiError::bad_request(
-                                        "tool_use 'input' must be a JSON object",
-                                    ));
-                                }
-                                tool_calls.push(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input,
-                                    }
-                                }));
-                            }
-                            other => {
-                                return Err(AnthropicApiError::bad_request(format!(
-                                    "unsupported assistant content block type '{other}'"
-                                )));
-                            }
+                        let mut amsg = json!({
+                            "role": "assistant",
+                            "content": if assistant_text.is_empty() && !tool_calls.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(assistant_text)
+                            },
+                        });
+                        if !thinking_text.is_empty() {
+                            amsg["reasoning_content"] = json!(thinking_text);
                         }
+                        if !tool_calls.is_empty() {
+                            amsg["tool_calls"] = Value::Array(tool_calls);
+                        }
+                        out.push(amsg);
                     }
-
-                    let mut amsg = json!({
-                        "role": "assistant",
-                        "content": if assistant_text.is_empty() && !tool_calls.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::String(assistant_text)
-                        },
-                    });
-                    if !thinking_text.is_empty() {
-                        amsg["reasoning_content"] = json!(thinking_text);
+                    _ => {
+                        return Err(AnthropicApiError::bad_request(
+                            "assistant 'content' must be a string or array of blocks",
+                        ));
                     }
-                    if !tool_calls.is_empty() {
-                        amsg["tool_calls"] = Value::Array(tool_calls);
-                    }
-                    out.push(amsg);
                 }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(
-                        "assistant 'content' must be a string or array of blocks",
-                    ));
-                }
-            },
+            }
             other => {
                 return Err(AnthropicApiError::bad_request(format!(
-                    "unsupported Anthropic message role '{other}': expected 'user' or 'assistant'"
+                    "unsupported Anthropic message role '{other}': expected 'user', 'assistant', or 'system'"
                 )));
             }
         }
+    }
+    if !has_conversation_msg {
+        return Err(AnthropicApiError::bad_request(
+            "'messages' must contain at least one 'user' or 'assistant' message",
+        ));
     }
     Ok(out)
 }
@@ -540,6 +570,11 @@ pub fn translate_anthropic_to_chat(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| AnthropicApiError::bad_request("tool missing non-empty 'name'"))?;
+            if name == "DeferredToolPlaceholder"
+                && tobj.get("defer_loading").and_then(Value::as_bool) == Some(true)
+            {
+                continue;
+            }
             let schema = tobj
                 .get("input_schema")
                 .cloned()
@@ -1338,6 +1373,68 @@ mod tests {
         assert_eq!(msgs[2]["reasoning_content"], "Reading file");
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["content"], "pub mod server;");
+
+        let claude_code_req = json!({
+            "model": "qwen3.8-27b-warp34",
+            "max_tokens": 32768,
+            "stream": true,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.327.502; cch=abcd1234;"},
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "output_config": {"effort": "medium"},
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Executes bash",
+                    "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+                },
+                {
+                    "name": "DeferredToolPlaceholder",
+                    "description": "Reserved placeholder",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": true
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>Instructions</system-reminder>\n"},
+                        {"type": "text", "text": "hi"}
+                    ]
+                },
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "# Environment\nPrimary working directory: /tmp",
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let (cc_chat, _) = translate_anthropic_to_chat(&claude_code_req, "qwen", 5, true).unwrap();
+        let cc_msgs = cc_chat["messages"].as_array().unwrap();
+        assert_eq!(cc_msgs.len(), 3);
+        assert_eq!(cc_msgs[0]["role"], "system");
+        assert_eq!(cc_msgs[1]["role"], "user");
+        assert_eq!(cc_msgs[2]["role"], "system");
+        assert_eq!(
+            cc_msgs[2]["content"],
+            "# Environment\nPrimary working directory: /tmp"
+        );
+        let cc_tools = cc_chat["tools"].as_array().unwrap();
+        assert_eq!(cc_tools.len(), 1);
+        assert_eq!(cc_tools[0]["function"]["name"], "Bash");
+        let (parsed_msgs, _) =
+            crate::server::parse_openai_messages_multimodal(&cc_chat["messages"]).unwrap();
+        let formatted =
+            crate::chatml::format_chatml_prompt(&parsed_msgs, Some(&cc_chat["tools"]), true);
+        assert!(formatted.contains("<|im_start|>user\n<system-reminder>Instructions</system-reminder>\nhi<|im_end|>\n<|im_start|>system\n# Environment\nPrimary working directory: /tmp<|im_end|>\n<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]

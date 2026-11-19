@@ -35,7 +35,6 @@ fn malformed_tool_history_and_template_roles_are_rejected() {
         json!({"role":"assistant","tool_calls":[{"function":{"name":"x>bad","arguments":{}}}]}),
         json!({"role":"assistant","tool_calls":[{"function":{"name":"x","arguments":{"bad>key":0}}}]}),
         json!({"role":"tool","tool_calls":[{"function":{"name":"x","arguments":{}}}]}),
-        json!({"role":"system","content":"late system"}),
         json!({"role":"unknown","content":"bad role"}),
     ] {
         assert!(
@@ -50,6 +49,21 @@ fn malformed_tool_history_and_template_roles_are_rejected() {
             {"role":"system","content":"no user"}
         ]))
         .is_err()
+    );
+}
+
+#[test]
+fn mid_turn_system_messages_render_in_place() {
+    let (messages, _) = parse_openai_messages_multimodal(&json!([
+        {"role":"system", "content":"Global instructions"},
+        {"role":"user", "content":"hi"},
+        {"role":"system", "content":"# Environment\nWorking dir: /tmp"}
+    ]))
+    .unwrap();
+    let prompt = format_chatml_prompt(&messages, None, true);
+    assert_eq!(
+        prompt,
+        "<|im_start|>system\nGlobal instructions<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>system\n# Environment\nWorking dir: /tmp<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
 }
 
