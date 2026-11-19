@@ -14,13 +14,13 @@ Third-Party Attributions & Architectural Donors
    - License: Apache License, Version 2.0
 
 2. vLLM Reference Kernels, Model Spine, & Reasoning/Tool Parsers
-   - Reference donor: `vllm-project/vllm` (`0.31.0`, commit `8352b2427`)
+   - Reference donor: `vllm-project/vllm` (`0.34.0`, commit `62d4bc3c7`)
    - Subsystems: FP16 Qwen 3.5 / 3.6 / 3.8 model spine, Marlin W4A16/W8A16/MoE repacking & GEMMs, `GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, `Qwen3_5MTP`, GPU sampler pipeline, and `Qwen3Parser` reasoning/tool semantics.
    - Copyright The vLLM team
    - License: Apache License, Version 2.0
 
 3. SGLang Hybrid Prefix Cache & DFlash2 Block-Parallel Speculative Verification
-   - Reference donor: `sgl-project/sglang` (`v0.5.19`, commit `0bcd822377`)
+   - Reference donor: `sgl-project/sglang` (`v0.5.23`, commit `297e54fd10`)
    - Subsystems: `MambaRadixCache` + `HybridReqToTokenPool` ping-pong GDN state checkpoint donation and `DFlashWorkerV2` block-parallel drafter verification.
    - Copyright SGLang Contributors
    - License: Apache License, Version 2.0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vLLM 0.31.0 greedy oracle generator for warp34.
+"""vLLM 0.34.0 greedy oracle generator for warp34.
 
 Generates greedy token IDs (temp=0, ignore_eos=True) and per-step top-5 logprobs
 on a single prompt or across the canonical 12-prompt suite (tools/oracle/prompts.json).

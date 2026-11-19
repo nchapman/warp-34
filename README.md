@@ -207,7 +207,7 @@ When multiple questions share the same `state`, `warp34` either taps all questio
 
 ## Deep Dive 4: Why `warp34` Is Fast (Engine Internals)
 
-Every subsystem in `warp34` is built against an explicit reference donor (`vLLM 0.31.0` for the `FP16` spine, Marlin GEMMs, `MTP`, 9-step GPU sampler, and parsers; `SGLang v0.5.19` for `MambaRadixCache` and `DFlash2` verification; `vllm.cpp` for native CUDA C++ GDN kernels; and `warp3090` for `TQ4` KV compression and low-latency collectives) and verified continuously against them.
+Every subsystem in `warp34` is built against an explicit reference donor (`vLLM 0.34.0` for the `FP16` spine, Marlin GEMMs, `MTP`, 9-step GPU sampler, and parsers; `SGLang v0.5.23` for `MambaRadixCache` and `DFlash2` verification; `vllm.cpp` for native CUDA C++ GDN kernels; and `warp3090` for `TQ4` KV compression and low-latency collectives) and verified continuously against them.
 
 1. **Paged TurboQuant 4-Bit KV Cache (`TQ4`):**
    - Full-attention KV rows (`head_dim = 256`) are rotated on the fly using a Seed-42 Rademacher sign flip + Fast Walsh-Hadamard Transform (`WHT-256`) and quantized against a 16-centroid Beta(256) Lloyd-Max codebook into `132 B` rows (`block_tq4_0`, `4.125` bits/weight).

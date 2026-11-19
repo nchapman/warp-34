@@ -686,7 +686,7 @@ def main() -> None:
 
     oracle_label = args.oracle_label
     if not oracle_label:
-        oracle_label = "SGLang v0.5.19" if (args.preset and "sglang" in args.preset) else "vLLM 0.31.0"
+        oracle_label = "SGLang v0.5.23" if (args.preset and "sglang" in args.preset) else "vLLM 0.34.0"
 
     table = render_scoreboard(oracle_label, oracle_prof, args.warp34_label, warp34_prof)
     print(table)

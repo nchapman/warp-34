@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vLLM 0.31.0 / PyTorch per-op and per-layer tensor dumper for `warp34-oracle dump-diff`.
+"""vLLM 0.34.0 / PyTorch per-op and per-layer tensor dumper for `warp34-oracle dump-diff`.
 
 Generates deterministic golden tensor fixtures (.safetensors) for:
 1. GemmaRMSNorm + fused_add_gemma_rms_norm (`1.0 + weight` unit-offset, FP32 variance)

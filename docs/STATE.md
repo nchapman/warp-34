@@ -1,5 +1,16 @@
 # warp34 — Session Orientation & Current State
 
+## Upstream Oracle Upgrade (`vLLM 0.34.0`, `SGLang v0.5.23`, `xgrammar 0.2.8`)
+
+- **Pinned Baselines & Local Oracle Environment (`BASELINE.txt`, `AGENTS.md`, `NOTICE`, `README.md`, `tools/oracle/{vllm_dump,vllm_greedy,vllm_vl_dump,hgptq_oracle,profile_diff}.py`):**
+  - Upgraded the local Python oracle environment from `vLLM 0.31.0` (`8352b2427`) to **`vLLM 0.34.0` (`62d4bc3c7`)** (`torch==2.14.0`, `xgrammar==0.2.8`, `transformers==5.22.2`, `flashinfer-python==0.7.3`, `humming-kernels==0.1.19`, `pillow==13.0.0`), pulled **`lmsysorg/sglang:v0.5.23`** (`297e54fd10`), and updated local donor source checkouts (`/home/nchapman/Code/warp3090/vendor/vllm` -> `62d4bc3c7`, `/home/nchapman/Code/warp3090-dflash/vendor/sglang` -> `297e54fd10`).
+  - **Live GPU Parity & Host Gate Verification (`CUDA_VISIBLE_DEVICES=1` RTX 3090 Ti):**
+    - `tools/oracle/vllm_dump.py` (`vLLM 0.34.0`): **`43/43` op fixture tensors** match `tools/oracle/goldens/op_fixtures.safetensors` (`0` diffs > `1e-3`).
+    - `tools/oracle/vllm_greedy.py` (`vLLM 0.34.0`, `Qwen/Qwen3.5-4B` `chat00`): **`32/32` greedy tokens** match `tools/oracle/goldens/4B/chat00.ids` bit-for-bit.
+    - `tools/oracle/hgptq_oracle.py`: all `CompressedTensorsLinearTransformMethod`, `HadamardTransform`, `MarlinLinearKernel`, and `CompressedTensorsMoEMethod` patch anchors verified against `vLLM 0.34.0`.
+    - `lmsysorg/sglang:v0.5.23`: verified GPU container boot and `sglang==0.5.23` runtime.
+    - Host & Rust oracle suites: `mise run oracle-check` (`82/82`), `xgrammar_oracle` (`3/3`), `chatml_formatting` (`6/6`), `jpeg_decode` (`2/2`), `mise run perf-check`, and `mise run check-quick` all pass.
+
 ## Tiered `WHT128-Q8_0` (`BF16` Scale) GDN Checkpoint Pool
 
 - **Warp-Coalesced `WHT128-Q8_0` CUDA Kernels (`crates/warp34-kernels/csrc/ops/op_gdn_ckpt.cu`, `crates/warp34-kernels/src/lib.rs`, `crates/warp34-host/src/cuda/warmup.rs`):**

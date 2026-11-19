@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native vLLM 0.31.0 Qwen3.5 single-image oracle (no parity assertion).
+"""Native vLLM 0.34.0 Qwen3.5 single-image oracle (no parity assertion).
 
 Trusted local workers only: VLLM_ALLOW_INSECURE_SERIALIZATION=1 is required
 for collective_rpc callables. Output must be a new/empty directory on a filesystem
@@ -240,8 +240,8 @@ def main():
         model = Path(snapshot_download(repo_id=args.model))
     model = model.resolve(strict=True)
     import vllm
-    if vllm.__version__ != "0.31.0":
-        raise RuntimeError(f"requires audited vLLM 0.31.0, got {vllm.__version__}")
+    if vllm.__version__ != "0.34.0":
+        raise RuntimeError(f"requires audited vLLM 0.34.0, got {vllm.__version__}")
     # Qwen3_5ProcessingInfo inherits Qwen3VLProcessingInfo.get_hf_processor,
     # explicitly requesting Qwen3VLProcessor, whose image_processor is Qwen2VL.
     from transformers import Qwen3VLProcessor

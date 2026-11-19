@@ -29,8 +29,8 @@ def sha(path):
 
 def patch_transforms():
     import vllm
-    if vllm.__version__ != '0.31.0':
-        raise RuntimeError(f'Requires vLLM 0.31.0, got {vllm.__version__}')
+    if vllm.__version__ != '0.34.0':
+        raise RuntimeError(f'Requires vLLM 0.34.0, got {vllm.__version__}')
     # Initialize the public quantization module first (linear imports it back).
     from vllm.model_executor.layers.quantization.compressed_tensors import compressed_tensors  # noqa: F401
     from vllm.model_executor.layers.quantization.compressed_tensors.transform import linear, module as tfm_module
