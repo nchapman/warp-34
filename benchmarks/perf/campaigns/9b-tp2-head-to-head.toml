@@ -1,6 +1,6 @@
 # Dual-card 9B head-to-head campaign on 2x RTX 3090 Ti (2x 24 GiB, sm_86, PCIe TP=2):
-# Qwen3.5-9B comparing warp34 (FP16 KV) vs vLLM 0.34.0 vs SGLang v0.5.23
-# across:
+# Qwen3.5-9B comparing warp34 (FP16 KV) vs vLLM 0.34.0 vs SGLang v0.5.23 vs llama.cpp 1.0.0-dev (0a7675746, --split-mode tensor)
+# across both Plain (speculation=none) and Native MTP-3 (k=3) passes:
 #   1. Prompt-processing (pp) scaling curve: cold unique 4K / 16K / 32K / 60K / 115K
 #   2. Steady-state decode & continuous-batching throughput: C1 / C4 / C8 / C16 (256 output tok)
 #   3. Long-context coding-agent replay: 64K / 120K warm prefix reuse
@@ -55,6 +55,70 @@ weight_format = "AWQ-int4-g128"
 kv_format = "fp16"
 cache_config = "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3"
 launch_command = "docker run --rm --name warp34-perf-9b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.23 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede8c5d1716d824cd843e2889c648083 --served-model-name qwen35-9b-awq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 16 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
+
+[[engines]]
+id = "llamacpp-9b-tp2-fp16"
+engine = "llama.cpp"
+version = "1.0.0-dev@0a7675746; binary sha256 d13056e38e4a8f7f21e5f949069743fa3720dabcd6b86c109973e3d6edda9966"
+cohort = "9b-tp2-gguf-practical-4bit-sm86"
+parallelism = "tensor-split-2gpu-nccl"
+model = "qwen35-9b-gguf"
+model_revision = "3885219b6810b007914f3a7950a8d1b469d598a5"
+weight_format = "GGUF UD-Q4_K_XL"
+quantization_details = "unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-UD-Q4_K_XL.gguf (5.97 GB)"
+kv_format = "fp16"
+cache_config = "FP16 K/V 2-GPU (--split-mode tensor --tensor-split 1,1 with NCCL, ctx_size 131072, n_parallel 16, kv_unified=true, batch/ubatch 2048, flash_attn on)"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 /home/nchapman/.cache/warp34-benchmark-builds/llama.cpp-0a7675746/bin/llama-server --model /home/nchapman/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-GGUF/snapshots/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-UD-Q4_K_XL.gguf --alias qwen35-9b-gguf --n-gpu-layers 999 --split-mode tensor --tensor-split 1,1 --ctx-size 131072 -np 16 -kvu -b 2048 -ub 2048 --flash-attn on --cache-type-k f16 --cache-type-v f16 --seed 34 --host 127.0.0.1 --port 18034"
+
+# --- Native MTP-3 (k=3) pass on 2x RTX 3090 Ti ---
+
+[[engines]]
+id = "warp34-9b-tp2-fp16-mtp3"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "fp16"
+speculation = "mtp-k3"
+cache_config = "FP16 KV TP=2 12288 pages (196608 tokens), FP32 SSM, max_num_seqs 16, Native MTP-3 (batched B=1..4 verify), full-duplex pipelined PCIe DMA collectives, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b --tp 2 --kv-format fp16 --kv-pages 12288 --max-num-seqs 16 --speculative mtp --mtp-k 3 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "vllm-9b-tp2-fp16-mtp3"
+engine = "vllm"
+version = "0.34.0"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede8c5d1716d824cd843e2889c648083"
+weight_format = "AWQ-int4-g128"
+kv_format = "fp16"
+speculation = "mtp-k3"
+cache_config = "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90, max_num_seqs 16), FP32 SSM, Native MTP-3, V1 APC prefix caching on, reasoning-parser qwen3"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede8c5d1716d824cd843e2889c648083 --served-model-name qwen35-9b-awq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 16 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "sglang-9b-tp2-fp16-mtp3"
+engine = "sglang"
+version = "0.5.23"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede8c5d1716d824cd843e2889c648083"
+weight_format = "AWQ-int4-g128"
+kv_format = "fp16"
+speculation = "mtp-k3"
+cache_config = "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88, max_running_requests 16), FP16 conv, FP32 SSM, NEXTN MTP-3 (steps=3, draft_tokens=4), Unified Radix Cache on"
+launch_command = "docker run --rm --name warp34-perf-9b-tp2-sglang-mtp3 --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.23 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede8c5d1716d824cd843e2889c648083 --served-model-name qwen35-9b-awq --dtype float16 --tp-size 2 --context-length 131072 --max-running-requests 16 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 16 --cuda-graph-bs-prefill 512 1024 2048 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
+
+[[engines]]
+id = "llamacpp-9b-tp2-fp16-mtp3"
+engine = "llama.cpp"
+version = "1.0.0-dev@0a7675746; binary sha256 d13056e38e4a8f7f21e5f949069743fa3720dabcd6b86c109973e3d6edda9966"
+cohort = "9b-tp2-gguf-practical-4bit-sm86"
+parallelism = "tensor-split-2gpu-nccl"
+model = "qwen35-9b-gguf"
+model_revision = "3885219b6810b007914f3a7950a8d1b469d598a5"
+weight_format = "GGUF UD-Q4_K_XL + MTP Q4_K_M"
+quantization_details = "unsloth/Qwen3.5-9B-GGUF UD-Q4_K_XL (5.97 GB) + a4lg/Qwen3.5-9B-MTP-ONLY-GGUF@b609b41c4092 Q4_K_M (1.58 GB)"
+kv_format = "fp16"
+speculation = "mtp-k3"
+cache_config = "FP16 K/V 2-GPU (--split-mode tensor --tensor-split 1,1 with NCCL, ctx_size 131072, n_parallel 16, kv_unified=true, batch/ubatch 2048, flash_attn on, draft-mtp n_max=3)"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 /home/nchapman/.cache/warp34-benchmark-builds/llama.cpp-0a7675746/bin/llama-server --model /home/nchapman/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-GGUF/snapshots/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-UD-Q4_K_XL.gguf --alias qwen35-9b-gguf --n-gpu-layers 999 --n-gpu-layers-draft all --split-mode tensor --tensor-split 1,1 --ctx-size 131072 -np 16 -kvu -b 2048 -ub 2048 --flash-attn on --cache-type-k f16 --cache-type-v f16 --spec-type draft-mtp --spec-draft-model /home/nchapman/.cache/huggingface/hub/models--a4lg--Qwen3.5-9B-MTP-ONLY-GGUF/snapshots/b609b41c40921b0d1912f0d42347e53e28d22731/Qwen3.5-9B-MTP-ONLY-Q4_K_M.gguf --spec-draft-n-max 3 --seed 34 --host 127.0.0.1 --port 18034"
 
 # --- A. Prompt processing (pp) scaling curve (unique cold prompts, short output) ---
 
