@@ -365,7 +365,7 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Multi-stage build process decoupling the Node/pnpm React dashboard compilation from the CUDA/Rust binary build.
   * Runtime image based on `ubuntu:26.04` (shared-link runtime filesystem size ~775.6 MB; the ~575.4 MB static variant was an experiment, not the current default) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
-  * Security hardening: Runs under an unprivileged system user (`warp34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
+  * Standard Hugging Face cache & health checks: Binds `0.0.0.0` via `WARP34_HOST=0.0.0.0`, supports standard `-v ~/.cache/huggingface:/root/.cache/huggingface` mounts (plus non-root overrides via `--user "$(id -u):$(id -g)" -e HF_HOME=/cache`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**
   * Compiles native SASS cubins for NVIDIA A100 (`sm_80`), Ampere (`sm_86`), and Ada Lovelace (`sm_89`) plus `compute_89` PTX fallback.
   * Embedded device code compression enabled (`WARP34_NVCC_EXTRA=--compress-mode=size`).
