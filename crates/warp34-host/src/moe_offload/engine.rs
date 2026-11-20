@@ -1316,12 +1316,11 @@ impl RankTieredMoe {
             && HotExpertCache::auto_cpu_bridge_preferred()
         {
             let mut bridge_runtime = None;
-            let k_static =
-                if (64..=crate::model::TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT).contains(&k_hot) {
-                    k_hot - 16
-                } else {
-                    k_hot
-                };
+            let k_static = if k_hot >= crate::model::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
+                k_hot - 16
+            } else {
+                k_hot
+            };
             for (store, cache) in stores.iter().zip(&mut caches) {
                 if !store.layout().supports_cpu_bridge() {
                     continue;

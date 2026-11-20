@@ -1039,11 +1039,20 @@ impl Qwen3_5ModelRank {
             |policy: KvFormatPolicy, auto_mode: bool| -> Option<(usize, usize, bool)> {
                 if let Some(explicit_pages) = requested_kv_pages {
                     return eval_candidate(policy, explicit_pages, auto_mode)
-                        .map(|(slots, host_embed)| (explicit_pages, slots, host_embed));
+                        .map(|(slots, host_embed, _)| (explicit_pages, slots, host_embed));
+                }
+                if cfg.uses_tiered_moe() {
+                    return select_tiered_moe_auto_fit_pages(
+                        cfg,
+                        tp_size,
+                        max_target_pages,
+                        |pages| eval_candidate(policy, pages, auto_mode),
+                    )
+                    .map(|(pages, slots, host_embed, _)| (pages, slots, host_embed));
                 }
                 let mut pages = max_target_pages;
                 loop {
-                    if let Some((slots, host_embed)) = eval_candidate(policy, pages, auto_mode) {
+                    if let Some((slots, host_embed, _)) = eval_candidate(policy, pages, auto_mode) {
                         return Some((pages, slots, host_embed));
                     }
                     if pages <= DEFAULT_TARGET_KV_PAGES {
@@ -1064,7 +1073,13 @@ impl Qwen3_5ModelRank {
             policy_adjusted = true;
         }
 
-        let goal_pages = requested_kv_pages.unwrap_or(max_target_pages);
+        let goal_pages = requested_kv_pages.unwrap_or_else(|| {
+            if cfg.uses_tiered_moe() {
+                TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES.min(max_target_pages)
+            } else {
+                max_target_pages
+            }
+        });
         let can_stepdown_tq4_all = allow_kv_format_stepdown
             && selected_policy == KvFormatPolicy::Tq4
             && cfg.head_dim == 256;
@@ -1884,7 +1899,7 @@ impl PrePoolModelRank {
                     capacity.state_slots.is_some() && has_vision_weights(&cfg, archive),
                     base_headroom,
                 );
-                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
+                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_options(
                     &cfg,
                     tp_size,
                     post_weight_available,
@@ -1894,6 +1909,7 @@ impl PrePoolModelRank {
                         .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
                         .saturating_add(rank0_extra_headroom),
                     bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
+                    capacity.native_mtp,
                     capacity.dflash_reserve_bytes,
                 );
                 let stage_cap = select_tiered_moe_stage_capacity(&cfg, tp_size, hot_per_layer);

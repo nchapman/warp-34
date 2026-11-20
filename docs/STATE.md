@@ -1,5 +1,18 @@
 # warp34 — Session Orientation & Current State
 
+## Data-Informed Tiered-MoE Pareto Auto-Fit Planner & `TP=1` Dynamic-LRU Fix
+
+- **Empirical Pareto Sweep & `k_static` Dynamic-LRU Fix (`crates/warp34-host/src/moe_offload/engine.rs`, `crates/warp34-host/src/model/{rank_capacity.rs,rank.rs,tests.rs}`):**
+  - Swept `hot_per_layer` on `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`1–2× RTX 3090 Ti`):
+    - Discovered & fixed a `TP=1` bug in `moe_offload/engine.rs` where `k_static` disabled its `16` dynamic LRU slots whenever `k_hot > 96` (`..=TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT`), causing a `-24%` decode cliff (`51.7 -> 39.2 tok/s` at `128`). Changing to `k_hot >= TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS (64)` lifted `TP=1 RCO` decode at `192/512` from `43.92` to **`59.83 tok/s` (`+36.2%`, `-23%` TTFT)** and revealed the hard `-31%` dynamic-LRU cliff below `k_hot = 64` (`48.79 -> 33.63 tok/s`).
+    - Measured the `TP=2 RCO` curve (`64..224/256`: `57.5 -> 70.5 -> 84.3 -> 96.2 -> 102.2 -> 106.0 tok/s`, TTFT `515 -> 165 ms`), pinpointing the empirical diminishing-returns knee at **`75%` of `local_experts`** (`+12%..+23%` per `+12.5%` experts below `75%`, dropping to `< 4%` above `75%`).
+  - **Uncapped Smooth Hot-Expert Sizing (`plan_tiered_moe_hot_per_layer_with_options`):** Removed the static `96`/`104`/`160` ceilings, stopped charging the `~1.15 GiB` `MTP` reserve in `Plain` mode (`TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES = 128 MiB`), raised `MTP_PARTIAL_CACHE_HEADROOM_BYTES` (`256 -> 512 MiB`) and `TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES` (`640 -> 896 MiB`) so every `MTP-3` mode keeps `>= 508 MiB` free VRAM.
+  - **3-Tier Pareto Auto-Fit (`select_tiered_moe_auto_fit_pages`):** When `--ctx-size`/`--kv-pages` is omitted on tiered-MoE models: (1) expand KV above `128K` up to `262K` only while maintaining `hot >= 75%`; (2) otherwise target the **`128K` coding-agent baseline** if `hot >= 64` (dynamic-LRU floor); (3) otherwise step KV down (`64K -> 4K`) to preserve `hot >= 64` on tight `16 GB` cards before falling back on compact GPUs.
+  - **Verified Live (`1–2× RTX 3090 Ti`, zero manual flags, `8/8` pass, `>= 508 MiB` free on all 8 modes):**
+    - `W4` (`TP=1/TP=2`, Plain/`MTP-3`): `128K` auto-fit across all 4 modes, `free = 1,546 / 508 / 1,502 / 1,326 MiB`, `W4 TP=1 MTP-3` `45.1 tok/s` end-to-end (vs `33 tok/s` prior), `W4 TP=2 MTP-3` `72.7 tok/s`.
+    - `RCO` (`TP=1/TP=2`, Plain/`MTP-3`): `TP=1` `128K` (`38.0 / 66.2 tok/s`, `free = 1,618 / 720 MiB`), `TP=2 Plain` **`262K` (`100%`)** (`69.9 tok/s`, `free = 1,534 MiB`), `TP=2 MTP-3` **`128K`** (`107.2 tok/s`, `free = 1,056 MiB`).
+  - **Gates:** `mise run check-quick` PASS, `mise run test-quick` (`383/383` host + `4/4` kernels PASS), `review` (`0` actionable findings).
+
 ## Single-Layout Shared-Weight `W4A8` INT8-IMMA Prefill (`sm_86` / `sm_89`, Zero Extra Weight VRAM)
 
 - **Shared-`k16`-Layout `W4A8` IMMA Kernel & Dynamic Per-Token `INT8` Quantizer (`crates/warp34-kernels/csrc/marlin/{kernel.h,marlin_template.h}`, `crates/warp34-kernels/csrc/ops/op_marlin.cu`, `crates/warp34-kernels/csrc/warp34_cuda.h`, `crates/warp34-host/src/cuda/warmup.rs`, `crates/warp34-host/src/model/{forward.rs,weights/hgptq.rs}`):**

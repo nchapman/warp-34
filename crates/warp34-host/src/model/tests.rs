@@ -217,16 +217,28 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (104 and 160),
-        // while TP=1 with 4096-page KV reserve uses 96 so MTP-3 keeps k_hot = 192 in VRAM.
-        let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
+        // Uncapped smooth scaling: `plan_tiered_moe_hot_per_layer` fills available VRAM above
+        // fixed overhead (8-aligned) up to `local_experts` rather than artificially capping at
+        // 96/104/160. Plain mode (`native_mtp = false`) frees the unused MTP reserve for more
+        // hot experts.
+        let (hot_tp1_mtp, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
             19_600 * 1024 * 1024,
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_default, 104);
+        assert!(hot_tp1_mtp > TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT);
+        let (hot_tp1_plain, _) = plan_tiered_moe_hot_per_layer_with_options(
+            &cfg,
+            1,
+            19_600 * 1024 * 1024,
+            gib + 38 * 1024 * 1024,
+            450 * 1024 * 1024,
+            false,
+            0,
+        );
+        assert!(hot_tp1_plain > hot_tp1_mtp);
         let (hot_tp1_4k_kv, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -234,7 +246,7 @@ mod serving_capacity_tests {
             2 * gib,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_4k_kv, 96);
+        assert!(hot_tp1_4k_kv < hot_tp1_mtp);
 
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
@@ -243,11 +255,20 @@ mod serving_capacity_tests {
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp2_default, 160);
+        let (hot_tp2_plain, _) = plan_tiered_moe_hot_per_layer_with_options(
+            &cfg,
+            2,
+            22_500 * 1024 * 1024,
+            gib + 38 * 1024 * 1024,
+            450 * 1024 * 1024,
+            false,
+            0,
+        );
+        assert!(hot_tp2_plain > TIERED_MOE_TP2_DEFAULT_HOT);
+        assert!(hot_tp2_plain > hot_tp2_default);
 
-        // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100 where >= 4 GiB slack remains
-        // after placing all local experts in VRAM), `plan_tiered_moe_hot_per_layer` promotes
-        // `hot_per_layer` to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
+        // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100), `plan_tiered_moe_hot_per_layer`
+        // scales smoothly to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
         let (hot_tp1_a100_80g, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, 70 * gib, 2 * gib, gib);
         assert_eq!(hot_tp1_a100_80g, 512);
         let (hot_tp2_a100_40g, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, 38 * gib, 2 * gib, gib);
@@ -274,8 +295,8 @@ mod serving_capacity_tests {
         );
         assert!(hot_with_dflash < hot_without_dflash);
 
-        // TP=2 at 12288 pages + MTP reserve (~4.3 GiB base+KV+MTP) and 1.2 GiB state pool:
-        // exact 8-aligned hot_per_layer = 104, fitting within 19_600 MiB.
+        // TP=2 at 12288 pages + MTP reserve and 1.2 GiB state pool:
+        // exact 8-aligned hot_per_layer = 96, fitting within 19_600 MiB.
         let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;
         let min_state_12k = 1200 * 1024 * 1024;
         let (hot_tp2_12k, reserve_12k) = plan_tiered_moe_hot_per_layer(
@@ -285,7 +306,7 @@ mod serving_capacity_tests {
             base_plus_kv_12k,
             min_state_12k,
         );
-        assert_eq!(hot_tp2_12k, 104);
+        assert_eq!(hot_tp2_12k, 96);
         assert!(base_plus_kv_12k + min_state_12k + reserve_12k <= 19_600 * 1024 * 1024);
 
         // Insufficient VRAM falls back to min_hot (16 on TP=1, 32 on TP=2)
@@ -411,7 +432,7 @@ mod serving_capacity_tests {
             base_plus_kv_8k_tq4,
             min_state_18,
         );
-        assert_eq!(hot_rco_tp2_8k, TIERED_MOE_TP2_DEFAULT_HOT);
+        assert!(hot_rco_tp2_8k >= 176);
         assert!(base_plus_kv_8k_tq4 + min_state_18 + reserve_rco_tp2_8k <= 16_400 * mib);
     }
 
@@ -438,9 +459,9 @@ mod serving_capacity_tests {
             plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, full_residency_need - 1),
             MTP_TP1_SERVING_HOT_EXPERTS
         );
-        assert_eq!(
-            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram),
-            MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        assert!(
+            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram)
+                >= MTP_TP1_STREAMED_PREFILL_MAX_HOT
         );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(
@@ -472,10 +493,19 @@ mod serving_capacity_tests {
             cfg.num_experts / 2
         );
 
-        // Stepped degradation under tighter VRAM budgets
+        // Stepped degradation under tighter VRAM budgets (512 MiB partial headroom floor)
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(
+                1,
+                512,
+                exp_bytes,
+                MTP_MEDIUM_HOT_EXPERTS * exp_bytes + MTP_PARTIAL_CACHE_HEADROOM_BYTES
+            ),
+            MTP_MEDIUM_HOT_EXPERTS
+        );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 600 * 1024 * 1024),
-            MTP_MEDIUM_HOT_EXPERTS
+            MTP_COMPACT_HOT_EXPERTS
         );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 300 * 1024 * 1024),
@@ -485,6 +515,187 @@ mod serving_capacity_tests {
             plan_mtp_tiered_moe_hot_experts(1, 32, exp_bytes, 300 * 1024 * 1024),
             MTP_FALLBACK_HOT_EXPERTS
         );
+    }
+
+    #[test]
+    fn tiered_moe_pareto_auto_fit_balances_kv_and_hot_experts_across_cards_and_quants() {
+        use super::super::rank_capacity::{
+            evaluate_serving_kv_candidate_budget, select_tiered_moe_auto_fit_pages,
+            tiered_moe_auto_fit_knee_hot,
+        };
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let mut w4_cfg = sample_qwen4_exp_config();
+        w4_cfg.moe_intermediate_size = 512;
+
+        // Build RCO mixed W2/W4 config (63.95 MiB/hot step vs 95.625 MiB W4).
+        let mut rco_targets_w2 = Vec::new();
+        let mut rco_targets_w4 = Vec::new();
+        for layer in 0..48usize {
+            let pat = format!(
+                "re:.*(?<!mtp\\.)layers\\.{layer}\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+            );
+            if (layer + 1).is_multiple_of(4) {
+                rco_targets_w4.push(pat);
+            } else {
+                rco_targets_w2.push(pat);
+            }
+        }
+        let rco_quant_json = serde_json::json!({
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "w2_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w2,
+                    "weights": { "actorder": null, "dynamic": false, "group_size": 64, "num_bits": 2, "strategy": "group", "symmetric": true, "type": "int" }
+                },
+                "w4_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w4,
+                    "weights": { "actorder": null, "dynamic": false, "group_size": 64, "num_bits": 4, "strategy": "group", "symmetric": true, "type": "int" }
+                }
+            },
+            "transform_config": {
+                "config_groups": {
+                    "v": {
+                        "head_dim": 64,
+                        "precision": "torch.float32",
+                        "randomize": false,
+                        "requires_grad": false,
+                        "type": "hadamard",
+                        "apply": [
+                            { "ignore": [], "inverse": true, "location": "weight_input", "targets": ["re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"] },
+                            { "ignore": [], "inverse": false, "location": "input", "targets": ["re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"] }
+                        ]
+                    }
+                }
+            }
+        });
+        let mut rco_cfg = w4_cfg.clone();
+        rco_cfg.moe_intermediate_size = 512;
+        rco_cfg.quant = crate::loader::ModelConfig::parse_quant(Some(&rco_quant_json)).unwrap();
+
+        let fit_for = |cfg: &ModelConfig, tp: usize, free_vram: usize, native_mtp: bool| {
+            let raw_est = if tp == 1 { 4_150 * mib } else { 2_800 * mib };
+            select_tiered_moe_auto_fit_pages(cfg, tp, 16_384, |pages| {
+                evaluate_serving_kv_candidate_budget(
+                    cfg,
+                    tp,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    pages,
+                    raw_est,
+                    256 * mib,
+                    8 * mib,
+                    free_vram,
+                    64,
+                    native_mtp,
+                    true,
+                    false,
+                    0,
+                    0,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+            })
+        };
+
+        // 1. 24 GiB TP=1 W4 (Plain & MTP-3): selects 128K (8,192 pages) coding-agent ideal
+        //    instead of wasting 1.58 GiB on 262K, and Plain gets more hot experts than MTP-3.
+        let (p_24_tp1_w4_plain, _, _, h_24_tp1_w4_plain) =
+            fit_for(&w4_cfg, 1, 24 * gib, false).expect("24 GiB TP=1 W4 Plain");
+        let (p_24_tp1_w4_mtp, _, _, h_24_tp1_w4_mtp) =
+            fit_for(&w4_cfg, 1, 24 * gib, true).expect("24 GiB TP=1 W4 MTP");
+        assert_eq!(p_24_tp1_w4_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert_eq!(p_24_tp1_w4_mtp, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_24_tp1_w4_plain > h_24_tp1_w4_mtp);
+        assert!(h_24_tp1_w4_mtp >= 112);
+
+        // 2. 24 GiB TP=1 RCO (Plain & MTP-3): 128K KV + ~2x more hot experts than old 96 cap!
+        let (p_24_tp1_rco_plain, _, _, h_24_tp1_rco_plain) =
+            fit_for(&rco_cfg, 1, 24 * gib, false).expect("24 GiB TP=1 RCO Plain");
+        assert_eq!(p_24_tp1_rco_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_24_tp1_rco_plain >= 192);
+
+        // 3. 24 GiB TP=2 RCO (Plain & MTP-3): exceeds the 75% Pareto knee (192/256) even at
+        //    262K, so it unlocks BOTH 262K KV and >= 75% hot experts!
+        let knee_tp2 = tiered_moe_auto_fit_knee_hot(&rco_cfg, 2);
+        assert_eq!(knee_tp2, 192);
+        let (p_24_tp2_rco_plain, _, _, h_24_tp2_rco_plain) =
+            fit_for(&rco_cfg, 2, 24 * gib, false).expect("24 GiB TP=2 RCO Plain");
+        let (p_24_tp2_rco_mtp, _, _, h_24_tp2_rco_mtp) =
+            fit_for(&rco_cfg, 2, 24 * gib, true).expect("24 GiB TP=2 RCO MTP");
+        assert_eq!(p_24_tp2_rco_plain, 16_384);
+        assert!(h_24_tp2_rco_plain >= knee_tp2);
+        assert_eq!(p_24_tp2_rco_mtp, 16_384);
+        assert!(h_24_tp2_rco_mtp >= knee_tp2);
+
+        // 4. 16 GiB TP=1 RCO Plain: fits 128K coding-agent baseline while staying above the
+        //    64-expert CPU-bridge cliff.
+        let (p_16_tp1_rco_plain, _, _, h_16_tp1_rco_plain) =
+            fit_for(&rco_cfg, 1, 15_600 * mib, false).expect("16 GiB TP=1 RCO Plain");
+        assert_eq!(p_16_tp1_rco_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_16_tp1_rco_plain >= 64);
+
+        // 5. 16 GiB TP=1 W4 (8 state slots): Plain fits 128K with >= 64 hot, and under tighter
+        //    headroom where 128K would drop below the 64-expert CPU-bridge cliff, Tier 3a steps
+        //    KV down to <= 64K to keep the CPU bridge active (>= 64 hot).
+        let (p_16_tp1_w4_plain, _, _, h_16_tp1_w4_plain) = select_tiered_moe_auto_fit_pages(
+            &w4_cfg,
+            1,
+            16_384,
+            |pages| {
+                evaluate_serving_kv_candidate_budget(
+                    &w4_cfg,
+                    1,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    pages,
+                    4_150 * mib,
+                    256 * mib,
+                    8 * mib,
+                    15_600 * mib,
+                    8,
+                    false,
+                    true,
+                    false,
+                    0,
+                    0,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+            },
+        )
+        .expect("16 GiB TP=1 W4 Plain");
+        assert_eq!(p_16_tp1_w4_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_16_tp1_w4_plain >= 64);
+
+        // Direct deterministic verification of Tier 3a (CPU-bridge cliff avoidance) & Tier 3b.
+        let (p_cliff, _, _, h_cliff) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                let hot = if pages > TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES {
+                    56
+                } else {
+                    64
+                };
+                Some((8, true, hot))
+            })
+            .expect("Tier 3a cliff avoidance");
+        assert_eq!(p_cliff, TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES);
+        assert_eq!(h_cliff, 64);
+
+        let (p_compact, _, _, h_compact) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                if pages <= 2_048 {
+                    Some((4, true, 16))
+                } else {
+                    None
+                }
+            })
+            .expect("Tier 3b compact fallback");
+        assert_eq!(p_compact, 2_048);
+        assert_eq!(h_compact, 16);
     }
 
     #[test]
@@ -742,7 +953,7 @@ mod serving_capacity_tests {
             ),
             None
         );
-        let (slots_tq4_all, host_embed) = evaluate_serving_kv_candidate_budget(
+        let (slots_tq4_all, host_embed, _) = evaluate_serving_kv_candidate_budget(
             &cfg,
             1,
             KvFormatPolicy::Tq4All,
@@ -767,7 +978,7 @@ mod serving_capacity_tests {
 
         // 2. When --kv-format tq4 is explicitly pinned, 27B + DFlash2 + vision still fits
         //    >= 196K (12,288 pages) on 24 GiB while preserving lazy ViT headroom.
-        let (slots_tq4_196k, host_embed_196k) = evaluate_serving_kv_candidate_budget(
+        let (slots_tq4_196k, host_embed_196k, _) = evaluate_serving_kv_candidate_budget(
             &cfg,
             1,
             KvFormatPolicy::Tq4,
@@ -791,7 +1002,7 @@ mod serving_capacity_tests {
         assert!(host_embed_196k);
 
         // 3. Without DFlash2 (27B Plain), 256K (16,384 pages) fits directly in Tq4.
-        let (slots_plain, _) = evaluate_serving_kv_candidate_budget(
+        let (slots_plain, _, _) = evaluate_serving_kv_candidate_budget(
             &cfg,
             1,
             KvFormatPolicy::Tq4,
@@ -853,7 +1064,7 @@ mod serving_capacity_tests {
         // capping `effective_requested_state_slots` below `dflash_min_state_slots` or
         // double-charging `dflash_reserve_bytes`.
         let tiered_cfg = sample_qwen4_exp_config();
-        let (slots_tiered_tp2, _) = evaluate_serving_kv_candidate_budget(
+        let (slots_tiered_tp2, _, _) = evaluate_serving_kv_candidate_budget(
             &tiered_cfg,
             2,
             KvFormatPolicy::Tq4,

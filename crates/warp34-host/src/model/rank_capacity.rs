@@ -199,9 +199,31 @@ pub const TIERED_MOE_STAGE_RESERVE_SLOTS: usize = 512;
 /// Extra expert-stride slots (`256`) reserved on `TP >= 4` where all local experts fit in VRAM.
 pub const TIERED_MOE_TP4_STAGE_RESERVE_SLOTS: usize = 256;
 
-/// Fixed post-target VRAM reserve (`640 MiB`) on `TP=1` / `TP=2` for `MTP` non-expert weights,
-/// `QSA` workspace buffers, and CUDA graph capture pools.
-pub const TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES: usize = 640 * 1024 * 1024;
+/// Fixed post-target VRAM reserve (`896 MiB`) on `TP=1` / `TP=2` for `MTP` non-expert weights,
+/// `QSA` workspace buffers, `128K+` MTP KV cache, and CUDA graph capture pools (`>= 512 MiB` free).
+pub const TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES: usize = 896 * 1024 * 1024;
+
+/// Fixed post-target VRAM cushion (`128 MiB`) on `TP=1` / `TP=2` in Plain mode (no `MTP`/`DFlash2`)
+/// for tiered-MoE slot-table metadata and graph capture slack beyond `base_headroom`.
+pub const TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Ideal coding-agent KV baseline (`8,192` pages = `128K` tokens) targeted by tiered-MoE
+/// serving auto-fit before trading extra KV beyond `128K` against hot expert residency.
+pub const TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES: usize = 8_192;
+
+/// Minimum practical KV baseline (`4,096` pages = `64K` tokens) used when `128K` would push
+/// hot experts below the async CPU-bridge cliff (`64` experts/layer on `TP=1`).
+pub const TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES: usize = 4_096;
+
+/// Minimum hot experts per layer (`64`) required to reserve `16` dynamic LRU slots alongside
+/// the static hot cache on `TP=1` (below `64`, decode drops `-31%` from `48.8` to `33.6 tok/s`).
+pub const TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS: usize = 64;
+
+/// Empirical Pareto diminishing-returns knee (`75%` of `local_experts`, 8-aligned): below `75%`,
+/// each `+12.5%` hot experts yields `+12%..+23%` decode speedup; above `75%`, marginal gain drops
+/// to `< 4%`, so surplus VRAM expands auto-fit KV from `128K` toward `262K` first.
+pub const TIERED_MOE_AUTO_FIT_KNEE_NUM: usize = 3;
+pub const TIERED_MOE_AUTO_FIT_KNEE_DEN: usize = 4;
 
 /// Fixed extra VRAM reserve (`64 MiB`) for tiny synthetic tiered-MoE unit-test models.
 pub const TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES: usize = 64 * 1024 * 1024;
@@ -219,9 +241,9 @@ pub(super) const MIN_PLE_ROW_STAGING_BYTES: usize = 2560;
 /// Free VRAM headroom (`512 MiB`) preserved after placing `100%` of `MTP` local experts in VRAM on `TP >= 2`.
 pub const MTP_FULL_RESIDENCY_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
 
-/// Free VRAM headroom (`256 MiB`) preserved after allocating a partial `MTP` `HotExpertCache`
-/// so `QSA` workspaces, `FullAttentionLayerWeights`, and `MTP` CUDA graphs fit comfortably.
-pub const MTP_PARTIAL_CACHE_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
+/// Free VRAM headroom (`512 MiB`) preserved after allocating a partial `MTP` `HotExpertCache`
+/// so `QSA` workspaces, `FullAttentionLayerWeights`, and `MTP` CUDA graphs keep `>= ~480 MiB` free.
+pub const MTP_PARTIAL_CACHE_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum `MTP` GPU hot expert count (`192`) on `TP=1` (`local_experts = 512`).
 pub const MTP_TP1_STREAMED_PREFILL_MAX_HOT: usize = 192;
@@ -418,7 +440,7 @@ pub(super) fn serving_state_slots(max_num_seqs: usize) -> Result<usize> {
 }
 
 /// Computes the per-layer hot expert cache capacity (`K_hot`) and total VRAM reserve
-/// for tiered MoE models (`qwen4_exp`).
+/// for tiered MoE models (`qwen4_exp`), reserving `MTP` headroom by default.
 pub fn plan_tiered_moe_hot_per_layer(
     cfg: &ModelConfig,
     tp_size: usize,
@@ -426,12 +448,13 @@ pub fn plan_tiered_moe_hot_per_layer(
     base_headroom_plus_kv_bytes: usize,
     min_state_pool_bytes: usize,
 ) -> (usize, usize) {
-    plan_tiered_moe_hot_per_layer_with_dflash(
+    plan_tiered_moe_hot_per_layer_with_options(
         cfg,
         tp_size,
         available_vram_after_weights_and_scratch,
         base_headroom_plus_kv_bytes,
         min_state_pool_bytes,
+        true,
         0,
     )
 }
@@ -447,12 +470,34 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
     min_state_pool_bytes: usize,
     dflash_reserve_bytes: usize,
 ) -> (usize, usize) {
+    plan_tiered_moe_hot_per_layer_with_options(
+        cfg,
+        tp_size,
+        available_vram_after_weights_and_scratch,
+        base_headroom_plus_kv_bytes,
+        min_state_pool_bytes,
+        dflash_reserve_bytes == 0,
+        dflash_reserve_bytes,
+    )
+}
+
+/// Computes the per-layer hot expert cache capacity (`K_hot`) and total VRAM reserve
+/// for tiered MoE models (`qwen4_exp`), filling available VRAM above `fixed_overhead`
+/// smoothly up to `local_experts` (8-aligned) without static `TP=1`/`TP=2` caps and
+/// charging `MTP` / `DFlash2` reserves only when those speculative modes are enabled.
+pub fn plan_tiered_moe_hot_per_layer_with_options(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    available_vram_after_weights_and_scratch: usize,
+    base_headroom_plus_kv_bytes: usize,
+    min_state_pool_bytes: usize,
+    native_mtp: bool,
+    dflash_reserve_bytes: usize,
+) -> (usize, usize) {
     if !cfg.uses_tiered_moe() {
         return (0, 0);
     }
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    let default_hot =
-        default_tiered_moe_hot_ceiling(tp_size, local_experts, base_headroom_plus_kv_bytes);
     let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
     if (tp_size < 4 && local_experts <= TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX)
         || cfg.num_experts < TIERED_MOE_MIN_MODEL_EXPERTS
@@ -466,15 +511,20 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
         return (hot, reserve);
     }
     let min_hot = if tp_size >= 2 {
-        TIERED_MOE_TP2_MIN_HOT_EXPERTS.min(default_hot)
+        TIERED_MOE_TP2_MIN_HOT_EXPERTS.min(local_experts)
     } else {
-        TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot)
+        TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(local_experts)
     };
+    let stage_slots_default = TIERED_MOE_STAGE_CAPACITY_DEFAULT.saturating_mul(2);
     let extra_reserve = if tp_size >= 4 {
         (TIERED_MOE_TP4_STAGE_RESERVE_SLOTS * exp_bytes).saturating_add(dflash_reserve_bytes)
-    } else {
+    } else if native_mtp {
         (TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes)
             .saturating_add(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES.max(dflash_reserve_bytes))
+    } else if dflash_reserve_bytes > 0 {
+        (stage_slots_default * exp_bytes).saturating_add(dflash_reserve_bytes)
+    } else {
+        (stage_slots_default * exp_bytes).saturating_add(TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES)
     };
     let fixed_overhead = base_headroom_plus_kv_bytes
         .saturating_add(min_state_pool_bytes)
@@ -495,7 +545,7 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
     {
         let compact_extra_reserve =
             TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS.saturating_mul(exp_bytes);
-        let hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
+        let hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(local_experts);
         let reserve = hot.saturating_mul(actual_per_hot_step) + compact_extra_reserve;
         return (hot, reserve);
     }
@@ -503,22 +553,112 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
         if available_vram_after_weights_and_scratch > fixed_overhead && actual_per_hot_step > 0 {
             let max_affordable =
                 (available_vram_after_weights_and_scratch - fixed_overhead) / actual_per_hot_step;
-            let full_residency_slack = 4 * 1024 * 1024 * 1024usize;
-            let full_residency_need = fixed_overhead
-                .saturating_add(local_experts.saturating_mul(actual_per_hot_step))
-                .saturating_add(full_residency_slack);
-            if available_vram_after_weights_and_scratch >= full_residency_need {
+            if max_affordable >= local_experts {
                 local_experts
             } else {
                 let aligned = (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT)
                     * TIERED_MOE_HOT_SLOT_ALIGNMENT;
-                aligned.clamp(min_hot, default_hot)
+                aligned.clamp(min_hot, local_experts)
             }
         } else {
             min_hot
         };
     let reserve = hot.saturating_mul(actual_per_hot_step) + extra_reserve;
     (hot, reserve)
+}
+
+/// Returns the Pareto diminishing-returns knee (`75%` of `local_experts`, 8-aligned) for
+/// tiered-MoE auto-fit KV vs hot-expert balancing.
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn tiered_moe_auto_fit_knee_hot(cfg: &ModelConfig, tp_size: usize) -> usize {
+    let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
+    let min_hot = if tp_size >= 2 {
+        TIERED_MOE_TP2_MIN_HOT_EXPERTS.min(local_experts)
+    } else {
+        TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(local_experts)
+    };
+    let knee = (local_experts.saturating_mul(TIERED_MOE_AUTO_FIT_KNEE_NUM)
+        / TIERED_MOE_AUTO_FIT_KNEE_DEN
+        / TIERED_MOE_HOT_SLOT_ALIGNMENT)
+        * TIERED_MOE_HOT_SLOT_ALIGNMENT;
+    knee.clamp(min_hot, local_experts)
+}
+
+/// Selects the Pareto-optimal `(pages, state_slots, host_embed, hot_per_layer)` for tiered-MoE
+/// serving auto-fit when `--ctx-size` / `--kv-pages` is omitted:
+/// 1. Above `128K` (`8,192` pages): expand KV up to `max_target_pages` only while `hot >= 75%`
+///    (the empirical diminishing-returns knee).
+/// 2. At `128K`: accept `128K` (ideal coding-agent baseline) if `hot >= 64` (keeps async CPU
+///    bridge active on `TP=1`, avoiding the `-31%` decode cliff) or `local_experts < 128`.
+/// 3. At `<= 64K`: search `64K -> 4K`, preferring `hot >= 64` first, then any valid fit.
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn select_tiered_moe_auto_fit_pages<F>(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    max_target_pages: usize,
+    mut eval: F,
+) -> Option<(usize, usize, bool, usize)>
+where
+    F: FnMut(usize) -> Option<(usize, bool, usize)>,
+{
+    let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
+    let knee_hot = tiered_moe_auto_fit_knee_hot(cfg, tp_size);
+    let bridge_floor_hot = if local_experts >= 128 {
+        TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS
+    } else {
+        0
+    };
+    let ideal_pages = TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES.min(max_target_pages);
+    let floor_pages = TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES.min(ideal_pages);
+
+    // Tier 1: > 128K only while maintaining >= 75% hot experts.
+    if max_target_pages > ideal_pages {
+        let mut pages = max_target_pages;
+        while pages > ideal_pages {
+            if let Some((slots, host_embed, hot)) = eval(pages)
+                && hot >= knee_hot
+            {
+                return Some((pages, slots, host_embed, hot));
+            }
+            pages = pages.saturating_sub(64);
+        }
+    }
+
+    // Tier 2: 128K coding-agent baseline, provided we stay above the CPU-bridge cliff.
+    if let Some((slots, host_embed, hot)) = eval(ideal_pages)
+        && hot >= bridge_floor_hot
+    {
+        return Some((ideal_pages, slots, host_embed, hot));
+    }
+
+    // Tier 3a: <= 64K while keeping the CPU bridge active (>= 64 hot experts).
+    if bridge_floor_hot > 0 {
+        let mut pages = floor_pages;
+        loop {
+            if let Some((slots, host_embed, hot)) = eval(pages)
+                && hot >= bridge_floor_hot
+            {
+                return Some((pages, slots, host_embed, hot));
+            }
+            if pages <= DEFAULT_TARGET_KV_PAGES {
+                break;
+            }
+            pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+        }
+    }
+
+    // Tier 3b: tight/compact GPU fallback — largest KV in [4K..=128K] that fits at all.
+    let mut pages = ideal_pages;
+    loop {
+        if let Some((slots, host_embed, hot)) = eval(pages) {
+            return Some((pages, slots, host_embed, hot));
+        }
+        if pages <= DEFAULT_TARGET_KV_PAGES {
+            break;
+        }
+        pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+    }
+    None
 }
 
 /// Determines whether untied `embed_tokens` should be placed in zero-copy `MappedHostBuffer`
@@ -847,7 +987,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     dflash_min_state_slots: usize,
     lora_reserve: LoraCapacityReserve,
     auto_fit_mode: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, bool, usize)> {
     if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16) {
         return None;
     }
@@ -946,28 +1086,30 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         };
         requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
     };
-    let (allocated_moe_bytes, post_pool_spec_or_moe_reserve) = if cfg.uses_tiered_moe() {
-        let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
-            cfg,
-            tp_size,
-            post_weight_available,
-            base_headroom
-                .saturating_add(vision_extra)
-                .saturating_add(req_kv_bytes)
-                .saturating_add(lora_reserve.device_bytes_per_rank),
-            state_bytes.saturating_mul(min_state_slots_for_moe),
-            dflash_reserve_bytes,
-        );
-        let allocated_moe = tiered_moe_resident_and_staging_bytes(cfg, tp_size, hot_per_layer);
-        let post_pool_reserve = if dflash_reserve_bytes > 0 {
-            dflash_reserve_bytes
+    let (allocated_moe_bytes, post_pool_spec_or_moe_reserve, planned_hot_per_layer) =
+        if cfg.uses_tiered_moe() {
+            let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_options(
+                cfg,
+                tp_size,
+                post_weight_available,
+                base_headroom
+                    .saturating_add(vision_extra)
+                    .saturating_add(req_kv_bytes)
+                    .saturating_add(lora_reserve.device_bytes_per_rank),
+                state_bytes.saturating_mul(min_state_slots_for_moe),
+                native_mtp,
+                dflash_reserve_bytes,
+            );
+            let allocated_moe = tiered_moe_resident_and_staging_bytes(cfg, tp_size, hot_per_layer);
+            let post_pool_reserve = if dflash_reserve_bytes > 0 {
+                dflash_reserve_bytes
+            } else {
+                total_moe_reserve.saturating_sub(allocated_moe)
+            };
+            (allocated_moe, post_pool_reserve, hot_per_layer)
         } else {
-            total_moe_reserve.saturating_sub(allocated_moe)
+            (0, dflash_reserve_bytes, 0)
         };
-        (allocated_moe, post_pool_reserve)
-    } else {
-        (0, dflash_reserve_bytes)
-    };
     let available_for_pools = post_weight_available.checked_sub(allocated_moe_bytes)?;
     let vision_headroom = if archive_has_vision && auto_fit_mode {
         VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
@@ -1017,5 +1159,5 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     if total_state_slots < target_min_slots {
         return None;
     }
-    Some((total_state_slots, use_host_embed))
+    Some((total_state_slots, use_host_embed, planned_hot_per_layer))
 }
