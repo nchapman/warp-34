@@ -107,7 +107,7 @@ Parallelism & Speculative Decoding:
   --no-cuda-graph, --enforce-eager    Disable CUDA Graph capture and run eager launches
 
 Serving Options (warp34 serve):
-  --host <addr>                       Bind address (default: 127.0.0.1; select an interface for remote access)
+  --host <addr>                       Bind address (default: 127.0.0.1, or WARP34_HOST; select an interface for remote access)
   --port <n>                          Listen port (default: 8000)
   --max-num-seqs <1..16>              Max concurrent active sequences (default: 16; alias: --max-running-requests)
   --max-model-len <tokens>            Max total prompt + output tokens per request (supports 16k, 64k, etc.;
@@ -474,6 +474,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) warp34_prof_path: Option<String>,
     pub(crate) prof_rounds: usize,
     pub(crate) host: String,
+    pub(crate) explicit_host: bool,
     pub(crate) port: u16,
     pub(crate) enable_thinking: bool,
     pub(crate) speculative_kind: Option<crate::proposer::SpeculativeKind>,
@@ -542,6 +543,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut warp34_prof_path: Option<String> = None;
     let mut prof_rounds = 128usize;
     let mut host = "127.0.0.1".to_string();
+    let mut explicit_host = false;
     let mut port = 8000u16;
     let mut enable_thinking = true;
     let mut speculative_kind = None;
@@ -775,6 +777,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--host" => {
                 i += 1;
                 host = args.get(i).cloned().ok_or("missing --host")?;
+                explicit_host = true;
             }
             "--port" | "-P" => {
                 i += 1;
@@ -918,6 +921,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         warp34_prof_path,
         prof_rounds,
         host,
+        explicit_host,
         port,
         enable_thinking,
         speculative_kind,
@@ -967,6 +971,21 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
         return Err("--draft-revision requires --draft-model".into());
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn resolve_serve_host(
+    host: &str,
+    explicit_host: bool,
+    env_host: Option<&str>,
+) -> String {
+    if explicit_host {
+        return host.to_string();
+    }
+    if let Some(env_val) = env_host.map(str::trim).filter(|s| !s.is_empty()) {
+        return env_val.to_string();
+    }
+    host.to_string()
 }
 
 #[cfg(feature = "cuda")]

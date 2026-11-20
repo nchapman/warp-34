@@ -70,7 +70,7 @@ API key controls API operations. Binding is not per-user authentication.
 | Inference, models, tokenization/counts, decisions, stored Responses, and aliases | Require the configured API key; unauthenticated if none is configured |
 | Stored Responses retrieval, deletion, cancellation, and chaining | Also enforce existing credential-scope ownership; a response ID alone grants no access |
 
-Keep the default `--host 127.0.0.1` for local access. To expose the service, select
+Keep the default `--host 127.0.0.1` for local access (`WARP34_HOST` sets the fallback bind address when `--host` is omitted; the official Docker image sets `WARP34_HOST=0.0.0.0` so `-p 127.0.0.1:8000:8000` works out of the box). To expose the service, select
 an explicit interface with `--host`; a Tailscale address limits the listener to
 that interface but still requires appropriate tailnet access rules. `--host
 0.0.0.0` listens on all IPv4 interfaces, subject to firewall rules. Use a firewall,

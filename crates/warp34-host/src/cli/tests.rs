@@ -19,6 +19,25 @@ fn serve_webui_defaults_scope_and_arity() {
     let defaults = parse(&["serve"]);
     assert!(defaults.serve.options.webui);
     assert_eq!(defaults.host, "127.0.0.1");
+    assert!(!defaults.explicit_host);
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, None),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, Some("  ")),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, Some(" 0.0.0.0 ")),
+        "0.0.0.0"
+    );
+    let explicit = parse(&["serve", "--host", "127.0.0.1"]);
+    assert!(explicit.explicit_host);
+    assert_eq!(
+        resolve_serve_host(&explicit.host, explicit.explicit_host, Some("0.0.0.0")),
+        "127.0.0.1"
+    );
     for argv in [
         vec!["serve", "--no-webui"],
         vec!["serve", "--no-webui", "--port", "9000"],

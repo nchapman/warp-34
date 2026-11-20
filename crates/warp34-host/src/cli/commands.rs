@@ -1028,6 +1028,7 @@ pub(crate) fn run_serve(
         resolved_model,
         tp,
         host,
+        explicit_host,
         port,
         allow_remote_images,
         kv_format,
@@ -1076,6 +1077,11 @@ pub(crate) fn run_serve(
         }
         None => "none".to_string(),
     };
+    let host = resolve_serve_host(
+        &host,
+        explicit_host,
+        std::env::var("WARP34_HOST").ok().as_deref(),
+    );
     let bind_addr = format!("{host}:{port}");
     let kv_mode_init = if explicit_kv_format {
         kv_format.clone()

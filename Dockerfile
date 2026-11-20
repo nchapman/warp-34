@@ -88,6 +88,7 @@ ENV HOME=/home/warp34 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_REQUIRE_CUDA="cuda>=13.0"
 USER warp34
+ENV WARP34_HOST=0.0.0.0
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1

@@ -25,7 +25,7 @@ Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-nat
 docker run --rm --gpus '"device=0"' -p 127.0.0.1:8000:8000 \
   --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
   ghcr.io/nchapman/warp34:dev \
-  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp --host 0.0.0.0
+  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
 ```
 
 ### Option B: Build from source
@@ -205,7 +205,7 @@ docker run --rm --gpus '"device=0"' \
   -p 127.0.0.1:8000:8000 \
   --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/models,readonly \
   ghcr.io/nchapman/warp34:dev \
-  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --offline --host 0.0.0.0
+  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --offline
 ```
 
 **Run on 2 GPUs** (no `--ipc=host` required):
@@ -214,7 +214,7 @@ docker run --rm --gpus '"device=0"' \
 docker run --rm --gpus '"device=0,1"' -p 127.0.0.1:8000:8000 \
   --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
   ghcr.io/nchapman/warp34:dev \
-  serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2 --speculative mtp --host 0.0.0.0
+  serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2 --speculative mtp
 ```
 
 Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes to `main` (`:dev`, `:sha-<commit>`) and on `v*` tags (`:latest`, `:X.Y`, `:X.Y.Z`). Build locally with `docker build --platform linux/amd64 -t warp34:local .`.
