@@ -1036,6 +1036,7 @@ pub(crate) fn run_serve(
         kv_pages,
         use_cuda_graph,
         lora_modules,
+        speculative_choice,
         ..
     } = options;
     let checkpoint_label = raw_model.clone();
@@ -1076,6 +1077,11 @@ pub(crate) fn run_serve(
             }
         }
         None => "none".to_string(),
+    };
+    let spec_label = if speculative_choice == SpeculativeChoice::Auto && spec_config.is_some() {
+        format!("{spec_label} [auto]")
+    } else {
+        spec_label
     };
     let host = resolve_serve_host(
         &host,

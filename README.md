@@ -31,7 +31,7 @@ Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-nat
 docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/nchapman/warp34:latest \
-  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
 ### Option B: Build from source
@@ -45,7 +45,7 @@ cd warp34
 mise install
 mise run build   # tip: set WARP34_ARCH=sm_89 (or sm_86/sm_80) to compile only your GPU arch
 
-./target/release/warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
+./target/release/warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
 ### Verify it works
@@ -79,7 +79,7 @@ Open **`http://127.0.0.1:8000/`** in your browser for live telemetry, **`/playgr
 
 ## Pick a Model for Your GPU
 
-Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapman/models) hosts Hadamard-rotated `W4A16-HGPTQ` and mixed-precision `W2.6A16-HGPTQ-RCO` checkpoints tuned specifically for `warp34`. Every row below runs with zero manual KV/memory flags—just pass the model ID to `warp34 serve` (add `--speculative mtp` to enable `MTP-3`):
+Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapman/models) hosts Hadamard-rotated `W4A16-HGPTQ` and mixed-precision `W2.6A16-HGPTQ-RCO` checkpoints tuned specifically for `warp34`. Every row below runs with **zero manual flags**—just pass the model ID to `warp34 serve` (`MTP-3`, `tq4` KV, and context auto-fit are all enabled by default; pass `--speculative off` to disable speculation):
 
 | GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint @ `128K tq4` | Why pick it |
 |---|---|---:|---|
@@ -134,23 +134,23 @@ claude --model "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 
 ## Common Recipes
 
-> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all -p 127.0.0.1:8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface ghcr.io/nchapman/warp34:latest`). `warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly).
+> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all -p 127.0.0.1:8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface ghcr.io/nchapman/warp34:latest`). `warp34 serve` defaults to `--speculative auto`, `--kv-format auto` (`tq4`), and `-c auto` (auto-fit context).
 
 <details>
 <summary>8 GB, 12 GB, &amp; 16 GB GPU starter commands</summary>
 
 ```sh
 # 8 GB GPU (e.g., RTX 4060): Qwen3.5-9B W2.6-RCO + Vision + MTP-3 @ 128K
-warp34 serve nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO --speculative mtp
+warp34 serve nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO
 
 # 12 GB GPU (e.g., RTX 3060 / 4070): Qwen3.5-9B W4 + Vision + MTP-3 @ 128K
-warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ
 
 # 16 GB GPU (e.g., RTX 4060 Ti / 4080): Qwen3.6-35B-A3B MoE W2.6-RCO + MTP-3 @ 128K
-warp34 serve nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO --speculative mtp
+warp34 serve nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO
 
 # 16 GB GPU (dense alt): Qwen3.8-27B W2.6-RCO + MTP-3 @ 128K
-warp34 serve nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO --speculative mtp
+warp34 serve nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO
 ```
 
 </details>
@@ -159,12 +159,12 @@ warp34 serve nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO --speculative mtp
 <summary>24 GB GPU: <code>27B + DFlash2</code> block drafting &amp; <code>180B Flash-Next</code> on 1 card</summary>
 
 ```sh
-# Qwen3.8-27B + DFlash2 block drafting on a single 24 GB GPU
+# Qwen3.8-27B + DFlash2 block drafting on a single 24 GB GPU (--draft-model auto-enables DFlash2)
 warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
+  --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
 
 # 180B Qwen3.8-Flash-Next W2.6-RCO + MTP-3 on a single 24 GB GPU (~66 tok/s, auto-fit 128K)
-warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --speculative mtp
+warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO
 ```
 
 </details>
@@ -174,13 +174,11 @@ warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --speculative mtp
 
 ```sh
 # 180B Qwen3.8-Flash-Next + MTP-3 across 2x 24 GB GPUs (auto-fits 128K-256K ctx + hot experts)
-warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO \
-  --speculative mtp --tp 2
+warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2
 
 # Qwen3.8-27B + DFlash2 across 2x 24 GB GPUs
 warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
-  --tp 2
+  --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --tp 2
 ```
 
 </details>
@@ -192,8 +190,7 @@ Load up to 62 PEFT LoRA adapters alongside the base model and select any adapter
 
 ```sh
 warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
-  --lora-modules reviewer=org/my-lora-adapter \
-  --speculative mtp
+  --lora-modules reviewer=org/my-lora-adapter
 ```
 
 *(Replace `org/my-lora-adapter` with any compatible Hugging Face repo or local adapter directory.)*
@@ -219,7 +216,7 @@ Clients authenticate with `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 ```sh
 # Multi-turn terminal REPL (pass -p "..." for a single turn)
-warp34 chat nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
+warp34 chat nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
 </details>
@@ -270,7 +267,7 @@ docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
   --user "$(id -u):$(id -g)" -e HF_HOME=/cache \
   -v ~/.cache/huggingface:/cache \
   ghcr.io/nchapman/warp34:latest \
-  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
 *(Append `:ro` to the volume mount and `--offline` to run completely offline against an existing cache.)*
@@ -281,7 +278,7 @@ docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
 docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/nchapman/warp34:latest \
-  serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2 --speculative mtp
+  serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2
 ```
 
 Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes to `main` (`:dev`, `:sha-<commit>`) and on `v*` tags (`:latest`, `:X.Y`, `:X.Y.Z`). Build locally with `docker build --platform linux/amd64 -t warp34:local .`.

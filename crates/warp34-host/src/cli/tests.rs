@@ -384,12 +384,24 @@ fn invalid_commands_and_options_never_resolve() {
         (
             &[
                 "generate",
+                "--speculative",
+                "mtp",
                 "--draft-revision",
                 "draft-ref",
                 "--draft-model",
                 "org/draft",
             ],
             "--draft-model requires --speculative dflash2",
+        ),
+        (
+            &[
+                "generate",
+                "--speculative",
+                "off",
+                "--draft-model",
+                "org/draft",
+            ],
+            "--draft-model cannot be combined with --speculative off",
         ),
         (
             &["generate", "--speculative", "dflash2"],
@@ -1315,4 +1327,137 @@ fn serve_cli_parses_reasoning_budget_and_effort_flags() {
         Some("- time up -")
     );
     assert!(!dash_msg.reasoning_effort_budget);
+
+    let budget_off = parse(&["--reasoning-budget", "off", "--reasoning-effort", "off"]);
+    assert_eq!(budget_off.reasoning_budget, None);
+    assert!(!budget_off.reasoning_effort_budget);
+    assert_eq!(budget_off.reasoning_effort.as_deref(), Some("none"));
+
+    let budget_auto = parse(&["--reasoning-budget", "auto"]);
+    assert_eq!(budget_auto.reasoning_budget, None);
+    assert!(budget_auto.reasoning_effort_budget);
+
+    let budget_suffix = parse(&["--reasoning-budget", "4k"]);
+    assert_eq!(budget_suffix.reasoning_budget, Some(4096));
+}
+
+#[cfg(feature = "cuda")]
+fn write_minimal_safetensors(path: &std::path::Path, tensor_name: &str) {
+    let header =
+        format!(r#"{{"{tensor_name}":{{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}}}"#);
+    let header_bytes = header.as_bytes();
+    let mut out = Vec::with_capacity(8 + header_bytes.len() + 4);
+    out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(header_bytes);
+    out.extend_from_slice(&[0u8; 4]);
+    std::fs::write(path, out).unwrap();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn speculative_auto_resolves_mtp_dflash2_and_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mtp_dir = tmp.path().join("mtp_model");
+    std::fs::create_dir_all(&mtp_dir).unwrap();
+    write_minimal_safetensors(&mtp_dir.join("model.safetensors"), "mtp.norm.weight");
+
+    let plain_dir = tmp.path().join("plain_model");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    write_minimal_safetensors(&plain_dir.join("model.safetensors"), "model.norm.weight");
+
+    let decision_dir = tmp.path().join("decision_model");
+    std::fs::create_dir_all(&decision_dir).unwrap();
+    write_minimal_safetensors(&decision_dir.join("model.safetensors"), "mtp.norm.weight");
+    std::fs::write(decision_dir.join("decision_config.json"), b"{}").unwrap();
+
+    // 1. Default in serve/chat/generate is auto -> picks MTP when checkpoint has MTP weights.
+    for sub in ["serve", "chat", "generate"] {
+        let args = vec![sub.to_string(), "org/mtp".to_string()];
+        let prepared = prepare_cuda_cli(&args, |_, _, _| Ok(mtp_dir.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.options.speculative_choice, SpeculativeChoice::Auto);
+        assert_eq!(
+            prepared.spec_config.as_ref().map(|s| (s.kind, s.mtp_k)),
+            Some((crate::proposer::SpeculativeKind::Mtp, 3)),
+            "sub={sub}"
+        );
+    }
+
+    // 2. Default in bench stays off even when checkpoint has MTP weights.
+    let bench_args = vec!["bench".to_string(), "org/mtp".to_string()];
+    let bench = prepare_cuda_cli(&bench_args, |_, _, _| Ok(mtp_dir.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bench.options.speculative_choice, SpeculativeChoice::Off);
+    assert!(bench.spec_config.is_none());
+
+    // 3. Auto stays off for plain checkpoints and Decision-only checkpoints.
+    let plain = prepare_cuda_cli(
+        &["serve".to_string(), "org/plain".to_string()],
+        |_, _, _| Ok(plain_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(plain.spec_config.is_none());
+
+    let decision = prepare_cuda_cli(
+        &["serve".to_string(), "org/glide".to_string()],
+        |_, _, _| Ok(decision_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(decision.spec_config.is_none());
+
+    // 4. --speculative off disables MTP even when weights are present.
+    let disabled = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--speculative".to_string(),
+            "off".to_string(),
+        ],
+        |_, _, _| Ok(mtp_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(disabled.options.speculative_choice, SpeculativeChoice::Off);
+    assert!(disabled.spec_config.is_none());
+
+    // 5. Passing --draft-model with default auto promotes to DFlash2 without requiring --speculative dflash2.
+    let dflash = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--draft-model".to_string(),
+            "org/draft".to_string(),
+            "-c".to_string(),
+            "auto".to_string(),
+        ],
+        |model, _, _| Ok(tmp.path().join(model.replace('/', "_"))),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(dflash.options.speculative_choice, SpeculativeChoice::Auto);
+    assert_eq!(
+        dflash.spec_config.as_ref().map(|s| s.kind),
+        Some(crate::proposer::SpeculativeKind::DFlash2)
+    );
+    assert_eq!(dflash.options.ctx_tokens, None);
+
+    // 6. --draft-model with --speculative off is rejected.
+    let err = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--speculative".to_string(),
+            "off".to_string(),
+            "--draft-model".to_string(),
+            "org/draft".to_string(),
+        ],
+        |_, _, _| panic!("must fail before resolution"),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("--draft-model cannot be combined with --speculative off"));
 }

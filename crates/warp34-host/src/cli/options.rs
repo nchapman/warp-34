@@ -91,18 +91,19 @@ Model & Hub Options:
   --lora, --active-lora <name|spec>   Activate a LoRA adapter for single-sequence CLI commands
 
 Context & KV Cache Options:
-  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (default: auto-fit up to 256k in serve,
+  -c, --ctx-size <auto|tokens>        Target KV pool capacity in tokens (default: auto up to 256k in serve,
                                       16k chat, 4k generate; supports k/M suffixes: 4k, 16k, 32k, 64k, 128k, 256k;
                                       aliases: --context-length, --kv-tokens)
-  --kv-format <policy>                tq4 (default, 3.07x; auto-fits tq4_all in serve when needed for full context),
-                                      tq4_all (3.88x), fp8, q8_0, fp16, bf16, auto
+  --kv-format <policy>                auto (default: tq4 3.07x, auto-fits tq4_all in serve when needed for full context),
+                                      tq4, tq4_all (3.88x), fp8, q8_0, fp16, bf16
                                       (aliases: --kv-cache-dtype, --cache-type-k)
   --kv-pages <n>                      Target KV pool in 16-token pages (low-level alternative to --ctx-size)
 
 Parallelism & Speculative Decoding:
-  --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (alias: --tensor-parallel-size)
-  --speculative mtp|dflash2|none      Speculative decoding mode (native MTP or DFlash2 block drafter)
-  --draft-model <id|path>             DFlash2 draft checkpoint (required for --speculative dflash2)
+  --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (default: 1; alias: --tensor-parallel-size)
+  --speculative auto|mtp|dflash2|off  Speculative decoding (default: auto in serve/chat/generate — uses native MTP
+                                      when present or DFlash2 when --draft-model is set; off in bench/oracle)
+  --draft-model <id|path>             DFlash2 draft checkpoint (implies --speculative dflash2 when --speculative is auto)
   --mtp-k <1..3>                      Draft tokens per MTP round (default: 3; alias: --num-speculative-tokens)
   --no-cuda-graph, --enforce-eager    Disable CUDA Graph capture and run eager launches
 
@@ -116,8 +117,8 @@ Serving Options (warp34 serve):
   --api-key <val> | --api-key-env <v> Optional bearer token auth for all API operations, including aliases (not only /v1)
                                       Metrics (/metrics and /api/metrics), minimal health, and enabled webui remain unauthenticated
   --no-webui                         Disable the web UI only; metrics and API remain available
-  --reasoning-effort <level>          Default reasoning_effort (none|minimal|low|medium|high|xhigh|max)
-  --reasoning-budget <n|-1>           Default thinking token budget (-1 = unlimited, disables effort cap)
+  --reasoning-effort <level>          Default reasoning_effort (off|none|minimal|low|medium|high|xhigh|max)
+  --reasoning-budget <auto|off|n>     Default thinking token budget (default: auto; off/-1 = unlimited, disables effort cap)
   --reasoning-budget-message <text>   Transition text injected before </think> on budget exhaustion ("" for none)
   --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
                                       medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
@@ -146,10 +147,11 @@ Benchmark Options (warp34 bench):
   --out <path>                        Write benchmark JSON summary to file
 
 Examples:
-  warp34 serve Qwen/Qwen3.5-4B -c 64k --speculative mtp
-  warp34 serve nchapman/Qwen3.5-27B-W4A16-AutoRound --tp 2 -c 32k --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash
-  warp34 chat Qwen/Qwen3.5-4B --speculative mtp
-  warp34 generate Qwen/Qwen3.5-4B -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#;
+  warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
+  warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
+  warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2
+  warp34 chat nchapman/Qwen3.8-27B-W4A16-HGPTQ
+  warp34 generate nchapman/Qwen3.5-9B-W4A16-HGPTQ -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#;
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Default)]
@@ -278,19 +280,30 @@ impl ServeCliConfig {
             let value = args
                 .get(*i)
                 .ok_or_else(|| "missing --reasoning-budget value".to_string())?;
-            let parsed: i64 = value
-                .trim()
-                .parse()
-                .map_err(|_| "invalid --reasoning-budget".to_string())?;
-            if parsed < -1 {
-                return Err("--reasoning-budget must be >= -1 (-1 for unlimited)".into());
-            }
-            if parsed == -1 {
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("auto") {
+                self.options.reasoning_budget = None;
+                self.options.reasoning_effort_budget = true;
+            } else if trimmed.eq_ignore_ascii_case("off")
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("unlimited")
+            {
                 self.options.reasoning_budget = None;
                 self.options.reasoning_effort_budget = false;
+            } else if let Ok(parsed) = trimmed.parse::<i64>() {
+                if parsed < -1 {
+                    return Err("--reasoning-budget must be >= -1 (-1/off for unlimited)".into());
+                }
+                if parsed == -1 {
+                    self.options.reasoning_budget = None;
+                    self.options.reasoning_effort_budget = false;
+                } else {
+                    self.options.reasoning_budget =
+                        Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
+                }
             } else {
                 self.options.reasoning_budget =
-                    Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
+                    Some(parse_token_count(trimmed, "--reasoning-budget")?);
             }
             return Ok(true);
         }
@@ -381,8 +394,13 @@ impl ServeCliConfig {
                 self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?);
             }
             "--reasoning-effort" => {
-                crate::server::validate_reasoning_effort(&value)?;
-                self.options.reasoning_effort = Some(value);
+                let normalized = if value.trim().eq_ignore_ascii_case("off") {
+                    "none".to_string()
+                } else {
+                    value
+                };
+                crate::server::validate_reasoning_effort(&normalized)?;
+                self.options.reasoning_effort = Some(normalized);
             }
             _ => unreachable!(),
         }
@@ -443,6 +461,38 @@ impl ServeCliConfig {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculativeChoice {
+    Auto,
+    Off,
+    Explicit(crate::proposer::SpeculativeKind),
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn checkpoint_supports_auto_mtp(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    // Decision-only CodeReadout checkpoints (GLiDE/d3) do not decode tokens with MTP.
+    if dir.join("readout.safetensors").is_file() || dir.join("decision_config.json").is_file() {
+        return false;
+    }
+    let has_mtp = |path: &std::path::Path| -> bool {
+        crate::loader::SafetensorsArchive::open(path).is_ok_and(|archive| {
+            archive.resolve_name("mtp.norm.weight").is_some()
+                || archive
+                    .resolve_name("mtp.hyper_connection_mixer.hc_norm.weight")
+                    .is_some()
+        })
+    };
+    if has_mtp(dir) {
+        return true;
+    }
+    let compact_dir = dir.join("runtime/mtp-int4-g32");
+    compact_dir.is_dir() && has_mtp(&compact_dir)
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) struct CudaCliOptions {
     pub(crate) serve: ServeCliConfig,
     pub(crate) model: String,
@@ -477,6 +527,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) explicit_host: bool,
     pub(crate) port: u16,
     pub(crate) enable_thinking: bool,
+    pub(crate) speculative_choice: SpeculativeChoice,
     pub(crate) speculative_kind: Option<crate::proposer::SpeculativeKind>,
     pub(crate) draft_model: Option<String>,
     pub(crate) mtp_k: usize,
@@ -546,6 +597,10 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut explicit_host = false;
     let mut port = 8000u16;
     let mut enable_thinking = true;
+    let mut speculative_choice = match sub {
+        "serve" | "chat" | "generate" => SpeculativeChoice::Auto,
+        _ => SpeculativeChoice::Off,
+    };
     let mut speculative_kind = None;
     let mut draft_model = None;
     let mut mtp_k = 3usize;
@@ -574,11 +629,20 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--offline" => offline = true,
             "--speculative" | "--speculative-algorithm" => {
                 i += 1;
-                speculative_kind = match args.get(i).map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("mtp" | "nextn") => Some(crate::proposer::SpeculativeKind::Mtp),
-                    Some("dflash2" | "dflash") => Some(crate::proposer::SpeculativeKind::DFlash2),
-                    Some("none" | "off" | "disabled") => None,
-                    _ => return Err("--speculative expects mtp or dflash2".into()),
+                speculative_choice = match args.get(i).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("auto") => SpeculativeChoice::Auto,
+                    Some("mtp" | "nextn") => {
+                        SpeculativeChoice::Explicit(crate::proposer::SpeculativeKind::Mtp)
+                    }
+                    Some("dflash2" | "dflash") => {
+                        SpeculativeChoice::Explicit(crate::proposer::SpeculativeKind::DFlash2)
+                    }
+                    Some("none" | "off" | "disabled") => SpeculativeChoice::Off,
+                    _ => return Err("--speculative expects auto, mtp, dflash2, or off".into()),
+                };
+                speculative_kind = match speculative_choice {
+                    SpeculativeChoice::Explicit(kind) => Some(kind),
+                    SpeculativeChoice::Auto | SpeculativeChoice::Off => None,
                 };
             }
             "--draft-model" | "--speculative-draft-model-path" | "--model-draft" | "-md" => {
@@ -599,7 +663,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--ctx-size" | "-c" | "--context-length" | "--kv-tokens" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing --ctx-size")?;
-                ctx_tokens = Some(parse_token_count(raw, "--ctx-size")?);
+                if raw.trim().eq_ignore_ascii_case("auto") {
+                    ctx_tokens = None;
+                } else {
+                    ctx_tokens = Some(parse_token_count(raw, "--ctx-size")?);
+                }
             }
             "--kv-pages" | "--num-gpu-blocks-override" => {
                 i += 1;
@@ -891,6 +959,10 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         kv_pages = Some(tokens.div_ceil(16));
     }
 
+    if speculative_choice == SpeculativeChoice::Auto && draft_model.is_some() {
+        speculative_kind = Some(crate::proposer::SpeculativeKind::DFlash2);
+    }
+
     Ok(Some(CudaCliOptions {
         serve,
         model,
@@ -924,6 +996,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         explicit_host,
         port,
         enable_thinking,
+        speculative_choice,
         speculative_kind,
         draft_model,
         mtp_k,
@@ -1076,9 +1149,11 @@ pub(crate) fn validate_cuda_options(
     }
     if draft_model.is_some() && *speculative_kind != Some(crate::proposer::SpeculativeKind::DFlash2)
     {
-        return Err(
-            "--draft-model requires --speculative dflash2; native MTP uses target weights".into(),
-        );
+        return Err(if options.speculative_choice == SpeculativeChoice::Off {
+            "--draft-model cannot be combined with --speculative off".into()
+        } else {
+            "--draft-model requires --speculative dflash2; native MTP uses target weights".into()
+        });
     }
     if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) && draft_model.is_none()
     {
@@ -1300,6 +1375,13 @@ pub(crate) fn prepare_cuda_cli_with_env(
         )
         .map_err(|e| e.to_string())?,
     )?;
+    if options.speculative_choice == SpeculativeChoice::Auto
+        && options.speculative_kind.is_none()
+        && options.image_urls.is_empty()
+        && checkpoint_supports_auto_mtp(std::path::Path::new(&options.resolved_model))
+    {
+        options.speculative_kind = Some(crate::proposer::SpeculativeKind::Mtp);
+    }
     let draft_model = options
         .draft_model
         .as_ref()

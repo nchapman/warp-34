@@ -6,7 +6,7 @@ fn speculative_cli_validation_without_a_visible_gpu() {
     for (args, error) in [
         (
             vec!["generate", "--speculative", "bad"],
-            "--speculative expects mtp or dflash2",
+            "--speculative expects auto, mtp, dflash2, or off",
         ),
         (
             vec!["generate", "--speculative", "dflash2"],
@@ -72,7 +72,7 @@ fn speculative_cli_validation_without_a_visible_gpu() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--speculative mtp|dflash2"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--speculative auto|mtp|dflash2|off"));
 }
 
 #[test]
@@ -127,7 +127,9 @@ fn cli_option_parsing_preserves_errors_and_help_short_circuit() {
             .output()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("--speculative mtp|dflash2"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--speculative auto|mtp|dflash2|off")
+        );
     }
 }
 
