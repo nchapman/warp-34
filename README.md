@@ -247,6 +247,17 @@ For kernel and parity work, `warp34` also ships built-in oracle subcommands (`du
 
 Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for bug reports, regression-first fixes, and PR verification requirements.
 
+## Acknowledgments
+
+`warp34` builds on ideas, kernels, and reference designs from these projects and papers:
+
+- **[vLLM](https://github.com/vllm-project/vllm)** & **[Marlin (`IST-DASLab/marlin`)](https://github.com/IST-DASLab/marlin)** — Marlin mixed-precision GEMM kernels, FP16 Qwen model spine, `MTP`, GPU sampler pipeline, and reasoning/tool parser reference.
+- **[SGLang](https://github.com/sgl-project/sglang)** — `MambaRadixCache` hybrid KV + recurrent-state prefix caching and `DFlash2` block-parallel speculative verification.
+- **[`localai-org/vllm.cpp`](https://github.com/localai-org/vllm.cpp)** — Native CUDA C++ Gated DeltaNet (GDN) recurrence and chunked WY prefill kernel reference.
+- **[TurboQuant (`arXiv:2504.19874`)](https://arxiv.org/abs/2504.19874)** & **[`TheTom/llama-cpp-turboquant`](https://github.com/TheTom/llama-cpp-turboquant)** — Walsh-Hadamard + Beta Lloyd-Max 4-bit KV quantization method, block format, and fused attention kernels behind `TQ4`.
+- **[`DominikBucko/qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** & **[`Niko1221/Strata`](https://github.com/Niko1221/Strata)** — Tiered MoE offloading, hot/cold expert caching, and `Qwen3.8-Flash-Next` consumer-GPU serving reference designs.
+- **[DFlash (`arXiv:2602.06036`)](https://arxiv.org/abs/2602.06036)** — Block-parallel speculative drafting architecture behind `DFlash2`.
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for third-party attributions.
