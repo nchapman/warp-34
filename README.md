@@ -1,11 +1,13 @@
 # warp34
 
-The fastest single-binary inference engine for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
+The [fastest](#performance) single-binary inference engine for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%20sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 [![Models on HF](https://img.shields.io/badge/Hugging%20Face-nchapman%2Fmodels-ffd21e.svg)](https://huggingface.co/nchapman/models)
+
+[Quickstart](#quickstart) · [Pick a Model](#pick-a-model-for-your-gpu) · [APIs & Coding Agents](#apis--coding-agents) · [Performance](#performance) · [Docs](#documentation)
 
 Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), and A100 (`sm_80`) GPUs.
 
@@ -15,17 +17,17 @@ Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for 
 
 **Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30-series, RTX 40-series, or A100 GPU, and a CUDA 13-capable driver (R580+).
 
-> **VRAM note:** The commands below run `nchapman/Qwen3.5-9B-W4A16-HGPTQ` (`~8.6 GiB`, 12 GB+ GPUs). On an **8 GB GPU**, swap in `nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO` (`6.0 GiB`)—or pick any checkpoint from [Pick a Model for Your GPU](#pick-a-model-for-your-gpu).
+> **Flagship 24 GB setup:** The commands below run **`Qwen3.8-27B-W4A16-HGPTQ`** with `MTP-3` speculation, Vision, and auto-fitted `128K–256K` `tq4` context on a single 24 GB GPU. On a **12 GB** card, swap in `nchapman/Qwen3.5-9B-W4A16-HGPTQ`; on **8 GB**, use `nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO` (see [Pick a Model for Your GPU](#pick-a-model-for-your-gpu)).
 
 ### Option A: Docker (fastest — no build tools or host CUDA toolkit needed)
 
 Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
 
 ```sh
-docker run --rm --gpus '"device=0"' -p 127.0.0.1:8000:8000 \
-  --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
-  ghcr.io/nchapman/warp34:dev \
-  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
+  -v warp34-models:/home/warp34/.cache/huggingface/hub \
+  ghcr.io/nchapman/warp34:latest \
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
 ```
 
 ### Option B: Build from source
@@ -39,7 +41,7 @@ cd warp34
 mise install
 mise run build   # tip: set WARP34_ARCH=sm_89 (or sm_86/sm_80) to compile only your GPU arch
 
-./target/release/warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+./target/release/warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
 ```
 
 ### Verify it works
@@ -50,7 +52,7 @@ mise run build   # tip: set WARP34_ARCH=sm_89 (or sm_86/sm_80) to compile only y
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
+    "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
     "messages": [{"role": "user", "content": "Say hello in one sentence."}],
     "max_tokens": 64
   }'
@@ -108,14 +110,14 @@ For example, to point **Claude Code** directly at your local `warp34` server:
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
 ANTHROPIC_AUTH_TOKEN=warp34 \
-claude --model "nchapman/Qwen3.5-9B-W4A16-HGPTQ"
+claude --model "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 ```
 
 ---
 
 ## Common Recipes
 
-> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus '"device=0"' ... ghcr.io/nchapman/warp34:dev`).
+> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all ... ghcr.io/nchapman/warp34:latest`).
 
 ### Speculative decoding & multi-GPU serving
 
@@ -200,20 +202,20 @@ Returns calibrated probabilities and confidence scores without generating tokens
 **Reuse an existing host Hugging Face cache offline:**
 
 ```sh
-docker run --rm --gpus '"device=0"' \
+docker run --rm --gpus all \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_CACHE=/models \
   -p 127.0.0.1:8000:8000 \
-  --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/models,readonly \
-  ghcr.io/nchapman/warp34:dev \
+  -v "$HOME/.cache/huggingface/hub:/models:ro" \
+  ghcr.io/nchapman/warp34:latest \
   serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --offline
 ```
 
 **Run on 2 GPUs** (no `--ipc=host` required):
 
 ```sh
-docker run --rm --gpus '"device=0,1"' -p 127.0.0.1:8000:8000 \
-  --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
-  ghcr.io/nchapman/warp34:dev \
+docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
+  -v warp34-models:/home/warp34/.cache/huggingface/hub \
+  ghcr.io/nchapman/warp34:latest \
   serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2 --speculative mtp
 ```
 
@@ -223,18 +225,46 @@ Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes t
 
 ---
 
-## Performance Snapshot (`HGPTQ` / `RCO`, Lossless Verification)
+## Performance
+
+### Head-to-head vs. `vLLM`, `SGLang`, and `llama.cpp`
+
+End-to-end HTTP serving p50 (`tok/s`) on `Qwen3.5-9B` with Native `MTP-3` (`FP16` KV). We benchmark `9B` here because `vLLM` and `SGLang` OOM trying to fit `Qwen3.8-27B` with full context, Vision, and `MTP-3` on a single 24 GB GPU.
+
+**Single GPU (`1× RTX 3090 Ti`, `11/11` clean sweep):**
+
+| Workload | **`warp34`** | `vLLM 0.34.0` | `SGLang v0.5.23` | `llama.cpp` | `warp34` lead |
+|---|---:|---:|---:|---:|---:|
+| **Cold 4K prefill** | **`8,223`** | `4,801` | `4,539` | `4,892` | **`+68%` to `+81%`** |
+| **Cold 115K prefill** | **`4,097`** | `2,875` | `2,885` | `3,124` | **`+31%` to `+43%`** |
+| **Single-stream decode (`C=1`)** | **`233.5`** | `180.6` | `179.2` | `194.4` | **`+20%` to `+30%`** |
+| **Batched decode (`C=16`)** | **`1,346.4`** | `1,276.8` | `881.5` | *crash* | **`+5%` to `+53%`** |
+| **Coding agent (`64K` ctx)** | **`42.3`** | `22.9` | `27.2` | `31.8` | **`+33%` to `+85%`** |
+| **Coding agent (`120K` ctx)** | **`19.5`** | `11.2` | `13.2` | `15.1` | **`+29%` to `+74%`** |
+
+**Two GPUs (`2× RTX 3090 Ti` PCIe, `11/11` clean sweep):**
+
+| Workload | **`warp34`** | `vLLM 0.34.0` | `SGLang v0.5.23` | `llama.cpp` | `warp34` lead |
+|---|---:|---:|---:|---:|---:|
+| **Cold 4K prefill** | **`8,408`** | `5,282` | `5,044` | `4,169` | **`+59%` to `+102%`** |
+| **Cold 115K prefill** | **`5,492`** | `3,902` | `3,742` | `3,119` | **`+41%` to `+76%`** |
+| **Single-stream decode (`C=1`)** | **`338.6`** | `232.6` | `251.4` | `217.0` | **`+35%` to `+56%`** |
+| **Batched decode (`C=16`)** | **`1,675.8`** | `1,354.0` | `1,264.5` | *crash* | **`+24%` to `+33%`** |
+| **Coding agent (`64K` ctx)** | **`49.8`** | `27.5` | `34.1` | `30.5` | **`+46%` to `+81%`** |
+| **Coding agent (`120K` ctx)** | **`26.4`** | `14.2` | `17.2` | `15.2` | **`+53%` to `+86%`** |
+
+### Throughput across models (`HGPTQ` / `W2.6-RCO`, lossless verification)
 
 | Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) |
 |---|---|---:|---:|---:|---:|
-| **Qwen3.5-9B** | Cold 4K prefill (`W4A8`) | `8,632 tok/s` | `15,939 tok/s` | `8,905 tok/s` | `16,104 tok/s` |
+| **Qwen3.5-9B** | Cold 4K prefill (`Plain`, `W4A8`) | `8,632 tok/s` | `15,939 tok/s` | `8,905 tok/s` | `16,104 tok/s` |
 | **Qwen3.5-9B** | Decode `MTP-3` (`C=1` / `C=16`) | `234` / `1,346` | `253` / `1,553` | `339` / `1,676` | `369` / `2,319` |
-| **Qwen3.8-27B** | Cold 4K prefill (`W4A8`) | `2,350 tok/s` | `4,283 tok/s` | `3,094 tok/s` | `5,926 tok/s` |
+| **Qwen3.8-27B** | Cold 4K prefill (`Plain`, `W4A8`) | `2,350 tok/s` | `4,283 tok/s` | `3,094 tok/s` | `5,926 tok/s` |
 | **Qwen3.8-27B** | Decode Plain / `MTP-3` / `DFlash2` | `52` / `150` / `248` | — | `85` / `252` / `365` | `97` / `246` / `328` |
 | **Qwen3.6-35B-A3B** | Decode Plain / `MTP-3` | `205` / `429` | — | `262` / `553` | `315` / `672` |
 | **Qwen3.8-Flash-Next** | Serving `MTP-3` (`W4` / `W2.6-RCO`) | `45` / `66 tok/s` | `58` / — | `73` / `107 tok/s` | `117` / — |
 
-*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full head-to-head numbers vs. `vLLM`, `SGLang`, and `llama.cpp` are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
+*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full `27B`, `Flash-Next`, and `Plain` (non-MTP) head-to-head campaigns are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
 
 ---
 
@@ -275,7 +305,7 @@ mise run check         # full release gate + compute-sanitizer (requires GPUs + 
 
 For kernel and parity work, `warp34` also ships built-in oracle subcommands (`dump-diff`, `greedy-diff`, and `profile-diff`) to verify layer tensors, greedy/speculative parity, and `nsys` kernel timings against `vLLM` and `SGLang`.
 
-Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for bug reports, regression-first fixes, and PR verification requirements.
+Questions or bug reports? Open a [GitHub Issue](https://github.com/nchapman/warp34/issues). Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for regression-first fixes and PR verification requirements.
 
 ## Acknowledgments
 
