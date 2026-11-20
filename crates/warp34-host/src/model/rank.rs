@@ -1035,33 +1035,31 @@ impl Qwen3_5ModelRank {
             )
         };
 
-        let find_for_policy_mode =
-            |policy: KvFormatPolicy, auto_mode: bool| -> Option<(usize, usize, bool)> {
-                if let Some(explicit_pages) = requested_kv_pages {
-                    return eval_candidate(policy, explicit_pages, auto_mode)
-                        .map(|(slots, host_embed, _)| (explicit_pages, slots, host_embed));
+        let find_for_policy_mode = |policy: KvFormatPolicy,
+                                    auto_mode: bool|
+         -> Option<(usize, usize, bool)> {
+            if let Some(explicit_pages) = requested_kv_pages {
+                return eval_candidate(policy, explicit_pages, auto_mode)
+                    .map(|(slots, host_embed, _)| (explicit_pages, slots, host_embed));
+            }
+            if cfg.uses_tiered_moe() {
+                return select_tiered_moe_auto_fit_pages(cfg, tp_size, max_target_pages, |pages| {
+                    eval_candidate(policy, pages, auto_mode)
+                })
+                .map(|(pages, slots, host_embed, _)| (pages, slots, host_embed));
+            }
+            let mut pages = max_target_pages;
+            loop {
+                if let Some((slots, host_embed, _)) = eval_candidate(policy, pages, auto_mode) {
+                    return Some((pages, slots, host_embed));
                 }
-                if cfg.uses_tiered_moe() {
-                    return select_tiered_moe_auto_fit_pages(
-                        cfg,
-                        tp_size,
-                        max_target_pages,
-                        |pages| eval_candidate(policy, pages, auto_mode),
-                    )
-                    .map(|(pages, slots, host_embed, _)| (pages, slots, host_embed));
+                if pages <= DEFAULT_TARGET_KV_PAGES {
+                    break;
                 }
-                let mut pages = max_target_pages;
-                loop {
-                    if let Some((slots, host_embed, _)) = eval_candidate(policy, pages, auto_mode) {
-                        return Some((pages, slots, host_embed));
-                    }
-                    if pages <= DEFAULT_TARGET_KV_PAGES {
-                        break;
-                    }
-                    pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
-                }
-                None
-            };
+                pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+            }
+            None
+        };
 
         let mut selected_policy = requested_policy;
         let mut policy_adjusted = false;

@@ -641,11 +641,8 @@ mod serving_capacity_tests {
         // 5. 16 GiB TP=1 W4 (8 state slots): Plain fits 128K with >= 64 hot, and under tighter
         //    headroom where 128K would drop below the 64-expert CPU-bridge cliff, Tier 3a steps
         //    KV down to <= 64K to keep the CPU bridge active (>= 64 hot).
-        let (p_16_tp1_w4_plain, _, _, h_16_tp1_w4_plain) = select_tiered_moe_auto_fit_pages(
-            &w4_cfg,
-            1,
-            16_384,
-            |pages| {
+        let (p_16_tp1_w4_plain, _, _, h_16_tp1_w4_plain) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
                 evaluate_serving_kv_candidate_budget(
                     &w4_cfg,
                     1,
@@ -665,13 +662,28 @@ mod serving_capacity_tests {
                     LoraCapacityReserve::default(),
                     true,
                 )
-            },
-        )
-        .expect("16 GiB TP=1 W4 Plain");
+            })
+            .expect("16 GiB TP=1 W4 Plain");
         assert_eq!(p_16_tp1_w4_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
         assert!(h_16_tp1_w4_plain >= 64);
+    }
 
-        // Direct deterministic verification of Tier 3a (CPU-bridge cliff avoidance) & Tier 3b.
+    #[test]
+    fn tiered_moe_pareto_auto_fit_protects_64k_floor_and_compact_fallback() {
+        use crate::model::rank_capacity::select_tiered_moe_auto_fit_pages;
+
+        let w4_cfg = sample_qwen4_exp_config();
+
+        // Direct deterministic verification of Tier 2 ([64K..128K] cliff avoidance),
+        // floor protection (never crushing context below 64K just to chase hot=64), and Tier 3.
+        let (p_mid, _, _, h_mid) = select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+            let hot = if pages > 6_144 { 56 } else { 64 };
+            Some((8, true, hot))
+        })
+        .expect("Tier 2 intermediate 96K cliff avoidance");
+        assert_eq!(p_mid, 6_144);
+        assert_eq!(h_mid, 64);
+
         let (p_cliff, _, _, h_cliff) =
             select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
                 let hot = if pages > TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES {
@@ -681,9 +693,20 @@ mod serving_capacity_tests {
                 };
                 Some((8, true, hot))
             })
-            .expect("Tier 3a cliff avoidance");
+            .expect("Tier 2 64K floor cliff avoidance");
         assert_eq!(p_cliff, TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES);
         assert_eq!(h_cliff, 64);
+
+        let (p_no_crush, _, _, h_no_crush) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                // hot=64 only fits at <= 8K; planner must NOT crush context to 8K and instead
+                // keeps 128K usable context at hot=56 via Tier 3.
+                let hot = if pages <= 512 { 64 } else { 56 };
+                Some((8, true, hot))
+            })
+            .expect("Never crush context below 64K to chase hot=64");
+        assert_eq!(p_no_crush, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert_eq!(h_no_crush, 56);
 
         let (p_compact, _, _, h_compact) =
             select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
@@ -693,7 +716,7 @@ mod serving_capacity_tests {
                     None
                 }
             })
-            .expect("Tier 3b compact fallback");
+            .expect("Tier 3 compact fallback");
         assert_eq!(p_compact, 2_048);
         assert_eq!(h_compact, 16);
     }

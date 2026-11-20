@@ -588,9 +588,11 @@ pub(super) fn tiered_moe_auto_fit_knee_hot(cfg: &ModelConfig, tp_size: usize) ->
 /// serving auto-fit when `--ctx-size` / `--kv-pages` is omitted:
 /// 1. Above `128K` (`8,192` pages): expand KV up to `max_target_pages` only while `hot >= 75%`
 ///    (the empirical diminishing-returns knee).
-/// 2. At `128K`: accept `128K` (ideal coding-agent baseline) if `hot >= 64` (keeps async CPU
-///    bridge active on `TP=1`, avoiding the `-31%` decode cliff) or `local_experts < 128`.
-/// 3. At `<= 64K`: search `64K -> 4K`, preferring `hot >= 64` first, then any valid fit.
+/// 2. In `[64K, 128K]`: pick the largest context (starting at the `128K` coding-agent ideal,
+///    stepping down to the `64K` floor) that keeps `hot >= 64` (dynamic LRU active, avoiding
+///    the `-31%` decode cliff). Never sacrifices context below `64K` just to chase `hot >= 64`.
+/// 3. Fallback: if even `64K` cannot sustain `hot >= 64` (e.g., tight `16 GB` cards), pick the
+///    largest fitting context in `[4K, 128K]` with whatever `hot >= min_hot` fits.
 #[cfg(any(test, feature = "cuda"))]
 pub(super) fn select_tiered_moe_auto_fit_pages<F>(
     cfg: &ModelConfig,
@@ -624,30 +626,22 @@ where
         }
     }
 
-    // Tier 2: 128K coding-agent baseline, provided we stay above the CPU-bridge cliff.
-    if let Some((slots, host_embed, hot)) = eval(ideal_pages)
-        && hot >= bridge_floor_hot
-    {
-        return Some((ideal_pages, slots, host_embed, hot));
-    }
-
-    // Tier 3a: <= 64K while keeping the CPU bridge active (>= 64 hot experts).
-    if bridge_floor_hot > 0 {
-        let mut pages = floor_pages;
-        loop {
-            if let Some((slots, host_embed, hot)) = eval(pages)
-                && hot >= bridge_floor_hot
-            {
-                return Some((pages, slots, host_embed, hot));
-            }
-            if pages <= DEFAULT_TARGET_KV_PAGES {
-                break;
-            }
-            pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+    // Tier 2: largest context in [64K, 128K] that stays above the 64-expert dynamic-LRU cliff.
+    // Never crushes context below the 64K floor just to chase hot >= 64.
+    let mut pages = ideal_pages;
+    loop {
+        if let Some((slots, host_embed, hot)) = eval(pages)
+            && hot >= bridge_floor_hot
+        {
+            return Some((pages, slots, host_embed, hot));
         }
+        if pages <= floor_pages {
+            break;
+        }
+        pages = pages.saturating_sub(64).max(floor_pages);
     }
 
-    // Tier 3b: tight/compact GPU fallback — largest KV in [4K..=128K] that fits at all.
+    // Tier 3: tight/compact GPU fallback — largest KV in [4K..=128K] that fits at all.
     let mut pages = ideal_pages;
     loop {
         if let Some((slots, host_embed, hot)) = eval(pages) {
