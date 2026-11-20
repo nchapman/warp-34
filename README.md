@@ -1,346 +1,242 @@
 # warp34
 
-`warp34` is a Rust and CUDA inference engine built specifically for the **Qwen 3.5, 3.6, and 3.8 hybrid model family** running on **1 to 4 NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs**.
+A single-binary Rust and CUDA inference engine built specifically for **Qwen 3.5, 3.6, 3.8, and Flash-Next** models on NVIDIA A100, RTX 30-series, and RTX 40-series GPUs.
 
-If you have one or more NVIDIA A100s, RTX 3090s, or RTX 4090s and want to run modern Qwen models—dense hybrids, sparse MoEs, vision-language models, the `Qwen3.8-Flash-Next` (Qwen4 preview) architecture, Multi-LoRA adapters, or zero-decode decision models—`warp34` is built to get more speed and context out of your cards than general-purpose engines like `vLLM` or `SGLang`.
+[![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%20sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 
-### What you need to know up front
+No Python, no NCCL, and no runtime dependencies. Because `warp34` is purpose-built for Qwen's hybrid Gated DeltaNet + full-attention architecture, it delivers faster prefill, faster speculative decoding, and up to 262K context on consumer 24 GB GPUs—outperforming general-purpose engines like `vLLM` and `SGLang` on supported Qwen hybrid workloads.
 
-- **It is a single binary with zero Python at runtime.** `warp34` handles Safetensors loading, Hugging Face Hub downloads (including Xet transfers and transient-outage cache fallback), scheduling, speculative decoding, Multi-LoRA routing, multi-GPU coordination, an OpenAI/Anthropic/Decision HTTP server, an interactive terminal `chat` REPL, and an embedded live web dashboard + API Playground.
-- **It is purpose-built for hybrid recurrent + attention models.** Qwen 3.5/3.6/3.8 models interleave 3 layers of Gated DeltaNet (GDN linear attention) with 1 layer of full attention. `warp34` treats both states as first-class citizens: prefix caching (`MambaRadixCache`), speculative decoding (`DFlash2` and `MTP`), and continuous batching all checkpoint and roll back GDN recurrent state and paged KV cache together atomically.
-- **It fits huge contexts and huge models onto 24 GB cards.** Our **TurboQuant 4-bit KV cache (`TQ4`)** compresses full-attention KV by **3.07×** (`tq4`) to **3.88×** (`tq4_all`) directly inside the FlashAttention/paged-decode kernels (plus native hardware **`FP8 E4M3` KV** on `sm_89+`), letting a single 24 GB GPU run `Qwen3.8-27B` up to **262K context** or fit `Qwen3.6-35B-A3B` with `MTP-3` and Vision on one card.
-- **It scales across datacenter NVLink and consumer PCIe motherboards without NCCL.** Multi-GPU (`--tp 2` and `--tp 4`) uses custom `~18 µs` collectives that automatically pick **1-hop NVLink P2P** when a bridge/NVSwitch is present or **2-hop pinned system memory over PCIe** when P2P is disabled on consumer boards—all fully captured inside CUDA Graphs.
+## Highlights
+
+- **Single binary, zero Python** — Handles Hugging Face downloads, OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/completions`), Anthropic (`/v1/messages`), and Decision (`/v1/systemone`, `/v1/decisions`) APIs, a terminal `chat` REPL, and an embedded web dashboard (`/` & `/playground`).
+- **Up to 262K context on 24 GB GPUs** — Built-in 4-bit TurboQuant KV cache (`tq4`, 3.07× compression) and hardware `fp8` KV (`sm_89+`) with automatic VRAM sizing and hybrid KV + recurrent-state prefix caching.
+- **Fast prefill & lossless speculation** — `W4A8` prefill acceleration on RTX 30/40-series (zero extra weight VRAM) plus native `MTP` (`k=1..3`) and `DFlash2` block drafting—all compatible with prefix caching and multi-GPU.
+- **Runs 180B `Qwen3.8-Flash-Next` on 1–2 consumer GPUs** — Memory-mapped n-gram tables, 3-tier hot/cold MoE offloading with an AVX-512/AVX2 CPU bridge, and automatic context-vs-speed sizing.
+- **Multi-GPU without NCCL** — `--tp 2` and `--tp 4` automatically use NVLink P2P or 2-hop pinned PCIe transfers inside CUDA Graphs (no `--ipc=host` needed in Docker).
+- **Structured outputs, Multi-LoRA, & Decision APIs** — `<think>`-aware XGrammar constraints (JSON Schema, Regex, CFG, Qwen XML tools), up to 62 hot-swappable LoRA adapters (`--lora-modules`), and single-prefill zero-decode classification/scoring.
 
 ---
 
 ## Quickstart
 
-### 1. Clone and build
+**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU, and a CUDA 13-capable driver (R580+).
 
-You need an x86-64 Linux machine, an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU, CUDA 13.4 (`/opt/cuda`), and [Git LFS](https://git-lfs.com/) (for test fixtures). [mise](https://mise.jdx.dev/) manages the pinned Rust, Node, and pnpm toolchain.
+### Option A: Docker (fastest — no build tools or host CUDA toolkit needed)
+
+Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
 
 ```sh
-git lfs install
+docker run --rm --gpus '"device=0"' -p 127.0.0.1:8000:8000 \
+  --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
+  ghcr.io/nchapman/warp34:dev \
+  serve nchapman/Qwen3.5-4B-W4A16-HGPTQ --host 0.0.0.0
+```
+
+### Option B: Build from source
+
+Requires CUDA 13.4 (`/usr/local/cuda` or `/opt/cuda`, or set `CUDA_HOME`) and [mise](https://mise.jdx.dev/) (installs pinned Rust, Node, and pnpm). Install [Git LFS](https://git-lfs.com/) only if you plan to run the oracle test suite:
+
+```sh
 git clone https://github.com/nchapman/warp34.git
 cd warp34
 
-export PATH="/opt/cuda/bin:$PATH"
 mise install
-mise run build   # builds the embedded web dashboard + release binary with CUDA
+mise run build   # tip: set WARP34_ARCH=sm_89 (or sm_86/sm_80) to compile only your GPU arch
+
+./target/release/warp34 serve nchapman/Qwen3.5-4B-W4A16-HGPTQ
 ```
 
-### 2. Run a server (downloads the model automatically on first run)
+### Verify it works
 
-Point `warp34 serve` at a Hugging Face repo ID or a local directory. It will pull the required Safetensors shards into your standard Hugging Face cache (`~/.cache/huggingface/hub`) and start listening:
-
-```sh
-./target/release/warp34 serve \
-  --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
-  --kv-format tq4 -c 32k --tp 1 --port 8000
-```
-
-While it is running, open **`http://127.0.0.1:8000/`** in your browser to use the live telemetry dashboard, interactive API Playground (`/playground`), and coding-agent setup guide (`/connect`). Pass `--no-webui` if you want an API-only server.
-
-### 3. Talk to it
-
-`warp34 serve` speaks **OpenAI Chat Completions** (`/v1/chat/completions`), **OpenAI Responses** (`/v1/responses`), **OpenAI Completions** (`/v1/completions`), **Anthropic Messages** (`/v1/messages`), and **System One / Decision APIs** (`/v1/systemone`, `/v1/decisions`) out of the box:
+`warp34 serve` downloads the checkpoint into `~/.cache/huggingface/hub` on first run, auto-sizes the KV cache to your GPU, and prints `Endpoint : http://127.0.0.1:8000` when ready:
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
-    "messages": [{"role": "user", "content": "Explain why Gated DeltaNet needs state checkpoints for prefix caching."}],
-    "max_tokens": 256
+    "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 64
   }'
 ```
 
-For quick interactive chat, one-off generation, or benchmarking from the terminal without spinning up a server:
+Open **`http://127.0.0.1:8000/`** in your browser for live telemetry, **`/playground`** for an interactive multi-API tester, and **`/connect`** for coding-agent setup snippets. Pass `--no-webui` for an API-only server.
+
+---
+
+## Common Recipes
+
+> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus '"device=0"' ... ghcr.io/nchapman/warp34:dev`).
+
+### Interactive terminal chat & benchmarking
 
 ```sh
-# Interactive multi-turn chat REPL (or pass --prompt for a single turn):
-./target/release/warp34 chat nchapman/Qwen3.5-4B-W4A16-HGPTQ
+# Multi-turn terminal REPL (omit --prompt for interactive mode)
+warp34 chat nchapman/Qwen3.5-4B-W4A16-HGPTQ --speculative mtp
 
-# One-off raw generation:
-./target/release/warp34 generate --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --prompt "Hello!"
+# One-off generation
+warp34 generate nchapman/Qwen3.5-4B-W4A16-HGPTQ -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6
 
-# Benchmark prefill + decode with realistic coding prompt and lossless speculative verification:
-./target/release/warp34 bench \
-  --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
+# Prefill + decode benchmark with a realistic coding prompt
+warp34 bench nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
-  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --realistic-prompt --verify-lossless
+  --prompt-len 512 --gen-len 128 --realistic-prompt
 ```
 
----
+### Speculative decoding & multi-GPU serving
 
-## Deep Dive 1: The Qwen 3.5 / 3.6 / 3.8 Hybrid Family
-
-The core Qwen 3.5 family (`model_type: "qwen3_5"` and `"qwen3_5_moe"`—which also backs checkpoints labeled `Qwen3.6-35B-A3B` and `Qwen3.8-27B`) uses a 3:1 hybrid block: three Gated DeltaNet (`QwenGatedDeltaNetAttention`) linear-attention layers followed by one full-attention layer (`Qwen3NextAttention` with packed output sigmoid gating, `GemmaRMSNorm`, and partial 3D `mRoPE`).
-
-### Supported models & formats
-
-- **Dense hybrids:** `0.8B`, `2B`, `4B`, `9B`, and `27B` (`Qwen3.8-27B`).
-- **Sparse MoE hybrid:** `Qwen3.6-35B-A3B` (`256` routed experts + `1` shared expert, `3B` active parameters per token). With `W4A16-HGPTQ` and `--kv-format tq4`, the entire `35B-A3B` model (plus `MTP-3` and Vision) runs on a **single 24 GB GPU** at **205.0 tok/s** (`Plain`) and **429.1 tok/s** (`MTP-3`), or across **2× GPUs (`TP=2`)** at **261.5 tok/s** (`Plain`), **553.4 tok/s** (`MTP-3`), and **1,043.8 tok/s** (`B=8` batched `MTP-3`).
-- **Multimodal Vision (`Qwen3.5-VL`):** Native support for `2B`, `4B`, `9B`, `27B`, `35B-A3B`, and `Flash-Next` vision checkpoints (`Qwen3_VisionTransformer` 24/27-layer ViT, 2×2 spatial merger, 3D `mRoPE`, PNG/JPEG/PPM decoding, and content-hashed vision prefix caching).
-- **Quantization & Multi-LoRA:** `W4A16-HGPTQ` (producer-fused in-register $H_{64}$ block-Hadamard GPTQ), mixed `W2.6A16-HGPTQ-RCO`, standard `GPTQ`, `AWQ`, `compressed-tensors`, and `AutoRound` (`W4A16` symmetric/asymmetric and `W8A16`), plus unquantized `FP16`/`BF16`. Supports up to **62 concurrent PEFT LoRA adapters** (`--lora name=repo_or_path`) with per-request routing across dense and MoE checkpoints.
-
-### Speculative decoding (`DFlash2` and `MTP`)
-
-Standard engines struggle to combine speculative decoding with hybrid recurrent models—for example, `vLLM 0.31.0` cannot combine hybrid prefix caching with external draft models and its `DFlash2` implementation stalls on `TP=2`. `warp34` supports two speculative engines that compose cleanly with `TP=1/2/4` and prefix caching:
-
-1. **`DFlash2` Block-Parallel Drafter (`--speculative dflash2`):**
-   - Taps multi-layer target hidden states (`TapPlan`) to condition a fast block drafter (`M=16` verify rows on `4B`, `M=8` verify rows with a `2048` sliding window on `27B` and `Flash-Next`), supporting both native `BF16` drafters and `W4A16-HGPTQ` quantized drafters (`2.16 GiB` on `27B`).
-   - Preserves native `BF16` activations for the drafter (preventing the `FP16` overflow seen on the 4B drafter) while keeping the target model on an `FP16` spine.
-2. **Native Multi-Token Prediction (`--speculative mtp --mtp-k 1..3`):**
-   - Uses the checkpoint's built-in 1-layer TP-sharded MTP sidecar (dense or MoE), including batched multi-sequence verify (`B = 2..8`).
-   - Quantizes unquantized MTP `draft_lm_head` weights on the GPU at load time into `MarlinW4A16` (`group_size = 64`), shrinking its memory bandwidth footprint by **3.56×** without touching the target model's lossless verification head.
-
-### Reference throughput (`--kv-format tq4` / `fp8`, verified lossless)
-
-| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 1× A100 (`sm_80`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) | 2× A100 (`sm_80`) |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **Qwen3.5-4B** | Plain / `MTP-3` / `DFlash2` | `204` / `542` / `1,577` | `223` / `621` / `1,757` | `308` / `728` / `1,705` | `258` / `664` / `1,520` | `328` / `871` / `2,055` | `248` / `626` / `1,318` |
-| **Qwen3.8-27B** | Plain (`M=1`) | `51.8 tok/s` | `54.7 tok/s` | `78.2 tok/s` | `85.4 tok/s` | `97.4 tok/s` | `135.4 tok/s` |
-| **Qwen3.8-27B** | `MTP (k=3)` | `150.1 tok/s` | `153.6 tok/s` | `221.3 tok/s` | `252.1 tok/s` | `257.6 tok/s` | `348.5 tok/s` |
-| **Qwen3.8-27B** | `DFlash2 (k=7)` | `247.9 tok/s` | `305.5 tok/s` | `370.9 tok/s` | `365.1 tok/s` | `400.6 tok/s` | `475.1 tok/s` |
-| **Qwen3.6-35B-A3B** | Plain / `MTP (k=3)` | `205.0` / `429.1` | `246.0` / `473.1` | `297.2` / `531.6` | `261.5` / `553.4` | `315.3` / `672.0` | `404.4` / `749.3` |
-
-*(On `4× RTX 3090 (TP=4)`, `27B` reaches `291.0 tok/s` with `MTP-3` and `438.3 tok/s` with `DFlash2`. Note that speculative speedups depend on draft acceptance rate $\tau$: the table above reports standard `warp34 bench` peak acceptance, while `warp34 bench --realistic-prompt` and the `Open-SWE-Traces` multi-agent campaigns measure natural coding-prompt acceptance where `27B MTP-3` achieves `96–113 tok/s` on `TP=1` and `156–164 tok/s` on `TP=2`.)*
-
----
-
-## Deep Dive 2: `Qwen3.8-Flash-Next` (The Qwen4 Architecture Preview)
-
-Despite the `3.8` in its name, **`Qwen3.8-Flash-Next`** (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`) is the first open-weight release of the **Qwen4** architecture. It is a **180B total parameter** checkpoint (`125B` hybrid MoE backbone with `6B` active per token + `51.2B` n-gram embedding table + `4B` MTP drafter).
-
-Running a 180B-parameter checkpoint on 1 or 2 consumer 24 GB GPUs without swap-thrashing or stalling on PCIe transfers requires purpose-built support for all five of its new architectural primitives:
-
-1. **HyperConnection (`GatedResidual`, `hc_count = 4`):**
-   Instead of a single `[T, 2560]` residual stream, all 48 layers carry 4 parallel streams (`[T, 4, 2560]`) mixed via per-branch `GemmaRMSNorm` and low-rank (`320`-dim) input/injection projections. `warp34` fuses the branch combine and grouped RMSNorm and runs the low-rank down + inject projections in a single dual skinny GEMM kernel (`warp34_small_n_gemm_dual_f16`), eliminating 240 separate cuBLAS launches per token.
-2. **Qwen Sparse Attention (`QSA`):**
-   On the 12 full-attention layers, a lightweight 4-query MQA indexer scores 4:1 mean-pooled key blocks and selects at most `512` blocks (`2,048` tokens) per query to attend over in the main `TQ4`/`Q8_0`/`FP16` paged KV cache. During `MTP` drafting, steps 1..2 reuse step 0's selected block indices.
-3. **N-Gram Per-Layer Embeddings (`PLE`, `51.3 GiB` across 128 FP8 shards):**
-   Loading 51.3 GiB of n-gram tables into anonymous RAM alongside routed experts would exhaust a 64–128 GB workstation. Instead, `PleMmapTable` memory-maps the 128 `F8_E4M3` shards read-only from disk, computes deterministic `splitmix64` 3-gram row IDs, prefaults unique 4 KiB pages in parallel with `madvise(MADV_WILLNEED)`, gathers only the needed `2,560 B/token`, and updates the dilated short-conv state inside `StateBundlePool` (so prefix caching and speculative rollback work automatically).
-4. **3-Tier 512-Expert MoE Engine (`top-10` routed + `1` shared expert per layer):**
-   - **Tier 1 (GPU VRAM Hot Cache):** Hardware-aware VRAM auto-planning keeps `88–96` hot experts/layer in VRAM on `TP=1`, `112` experts/layer/rank (`224/512 = 43.75%`) on `TP=2 / EP=2`, and **all `512` experts (`128/rank = 100%`) in VRAM on `TP=4 / EP=4`** (zero CPU offload).
-   - **Tier 2 (Pinned RAM + 0-ULP CPU MoE Bridge):** On 1× and 2× 24 GB setups, cold experts live in pinned system RAM (`HostExpertStore`). During prefill, an async H2D stream stages cold experts two groups ahead of GPU Grouped-MMA compute. During decode, cold experts are evaluated either via on-device GPU LRU pull (`GpuLru`) or in parallel by our lock-free **Rust CPU MoE Bridge** (`CpuHybrid`), which dispatches across physical CPU cores using `AVX-512`, `AVX2+FMA+F16C`, or portable scalar code—all sharing the exact same 16-lane pairwise reduction tree for **0-ULP bit-identity**.
-5. **Dual-Stream Qwen4 `MTP` (`K = 3`):**
-   Pairs the 1-layer QSA + 512-expert `INT4 g32` MTP sidecar with an online `MarlinW4A16`-quantized `draft_lm_head` and automatic VRAM residency for MTP routed experts (`100%` VRAM-resident on `TP >= 2`).
+`warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly):
 
 ```sh
-# Run Qwen3.8-Flash-Next on 1, 2, or 4 GPUs with 3-token MTP speculation:
-./target/release/warp34 serve \
-  --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ \
-  --speculative mtp --mtp-k 3 --kv-format tq4 -c 32k --tp 2 --port 8000
+# Qwen3.8-27B + DFlash2 block drafting on a single 24 GB GPU
+warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
+  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
+
+# 180B Qwen3.8-Flash-Next + MTP-3 across 2x 24 GB GPUs (auto-fits 128K-262K ctx + hot experts)
+warp34 serve nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ \
+  --speculative mtp --mtp-k 3 --tp 2
 ```
 
-On `TP=2` with `MTP-3`, `warp34` reaches **92.8–136.0 tok/s** on warm interactive chat (`187.2 tok/s` on 2× A100 80GB NVLink), **65.3–69.3 tok/s** on live HTTP `short-chat` serving (`4,096` TQ4 pages), and **147.2 tok/s** on `TP=4 / EP=4` (`100%` VRAM-resident). See [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) for the complete architecture guide.
+### Multi-LoRA & API authentication
 
----
+```sh
+export WARP34_API_KEY="your-secret-key"
+warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
+  --lora-modules reviewer=org/my-lora-adapter \
+  --api-key-env WARP34_API_KEY \
+  --max-num-seqs 8 -c 64k
+```
 
-## Deep Dive 3: Decision Models (Zero-Decode System-1 Classifiers & Scorers)
+Clients authenticate with `Authorization: Bearer <key>` or `x-api-key: <key>`, and select the adapter by passing `"model": "reviewer"` (replace `org/my-lora-adapter` with any compatible Hugging Face repo or local adapter path).
 
-Sometimes you don't want a model to chat—you want it to read a ticket, document, or image and answer 10 structured routing, classification, or rubric-scoring questions in a single shot.
+### Zero-decode Decision API (`/v1/systemone`, `/v1/decisions`)
 
-`warp34` includes a native **Decision Engine** that evaluates up to **64 typed questions** over a shared `state` (and optional multimodal `images`) in **a single prefill forward pass with zero autoregressive decode tokens (`output_tokens = 0`)**. It returns calibrated IEEE-754 `f64` probability distributions, expected rubric scores, and analytical confidence metrics over two wire-compatible endpoints:
-
-- **`POST /v1/systemone`** — The TypeSafe System One standard contract.
-- **`POST /v1/decisions`** — An ergonomic ordered-array/object adapter (`object: "decision.list"`).
-
-### Three question types
-
-1. **`noul` (boolean / proposition probability):** Returns `"noul": 0.0..1.0` representing $P(\text{true})$ for yes/no or proposition checks.
-2. **`choice` (categorical classification):** Evaluates named option keys (`2..64` options) and returns the winning key, full `"probabilities"` map, and calibrated `"confidence"`.
-3. **`score` (ordinal rubric scoring):** Evaluates ordered rubric levels (`0..K-1`) and returns the integer `score` / expected value $\sum_i i \cdot p_i$, the `"legend"`, per-level `"probabilities"`, and ordinal `"confidence"`.
-
-### Auto-detected decision model profiles
-
-When you load a checkpoint (or attach a Decision LoRA adapter via `--lora`), `warp34` automatically inspects `decision_config.json`, `config.json`, and `readout.safetensors` to select the right readout pipeline:
-
-| Profile | Example Checkpoints | How It Evaluates Decisions |
-|---|---|---|
-| **`CodeReadout` (`GLiDE`)** | `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `fastino/GLiDE-*`, or `GLiDE` LoRA adapters | Uses `CodeReadoutHead` (`readout.safetensors`, up to 64 option codes, optional `lm_head` omitted), `noncausal_full_attention`, optional `midloop` damped-Euler recurrence, and top-1/top-2 margin confidence (`96.88%` on JevBench Public / `100%` on MultiQ with `GLiDE-9B`). |
-| **`CodeReadout` (`d3`)** | `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ`, `vllm-sr/d3-*` | Uses `CodeReadoutHead` (`readout.safetensors`), `header-v1` multi-question summary layout, `state_once` single-prefill multi-question taps, `prefix_bidir` bidirectional state attention, `temperature_by_questions`, and normalized-entropy confidence (`95.31%` on JevBench Public / `100%` on MultiQ with `d3-ultra`). |
-| **`CausalLm` (Default)** | **Any standard Qwen 3.5 / 3.6 / 3.8 model** (`nchapman/Qwen3.5-4B-W4A16-HGPTQ`, `Qwen3.8-27B-W4A16-HGPTQ`, etc.) | Works on any loaded Qwen chat model with no special head required—uses `"state"`-first JSON formatting, a non-thinking `<think>\n\n</think>\n\nAnswer: ` prefix, last-row `lm_head` candidate logits (`A..X`), and LCP shared-prefix batching across `MambaRadixCache`. |
-
-*(Optional `order_passes: 2` evaluates both forward and reverse option orders and averages probabilities in `f64` to cancel positional bias.)*
-
-### Example `/v1/systemone` request
+Evaluate up to 64 boolean (`noul`), categorical (`choice`), or rubric (`score`) questions over shared context (and optional images) in a **single prefill pass with zero decode tokens**. Works on specialized `GLiDE` / `d3` checkpoints or any standard Qwen model:
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{
-    "state": "Customer reports 502 Bad Gateway across us-east-1 API ingress after TLS certificate rotation.",
+    "state": "502 Bad Gateway across us-east-1 ingress after TLS certificate rotation.",
     "questions": {
-      "is_outage": {
-        "type": "noul",
-        "instructions": "Is live production traffic currently impacted?"
-      },
-      "owner_team": {
+      "is_outage": { "type": "noul", "instructions": "Is live production traffic impacted?" },
+      "owner": {
         "type": "choice",
-        "instructions": "Which engineering team should be paged?",
-        "criteria": {
-          "network": "DNS, TLS, ingress, or load balancers",
-          "storage": "Databases, object storage, or disks",
-          "billing": "Quotas, invoices, or payments"
-        }
-      },
-      "severity": {
-        "type": "score",
-        "instructions": "Rate operational severity from 0 (cosmetic) to 3 (critical).",
-        "criteria": [
-          "Cosmetic issue",
-          "Minor degradation with workaround",
-          "Major feature unavailable",
-          "Production outage affecting live traffic"
-        ]
+        "instructions": "Which team should be paged?",
+        "criteria": { "network": "TLS, DNS, ingress", "storage": "Databases, disks" }
       }
     }
   }'
 ```
 
-When multiple questions share the same `state`, `warp34` either taps all question answers in a single `state_once` prefill (`d3`) or warms the shared prefix once into `MambaRadixCache` (KV pages + GDN state snapshot) and fans out only the short question suffixes. See [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for the full wire contract and JevBench results.
+Returns calibrated probabilities and confidence scores without generating tokens:
 
----
-
-## Deep Dive 4: Why `warp34` Is Fast (Engine Internals)
-
-Every subsystem in `warp34` is built against an explicit reference donor (`vLLM 0.34.0` for the `FP16` spine, Marlin GEMMs, `MTP`, 9-step GPU sampler, and parsers; `SGLang v0.5.23` for `MambaRadixCache` and `DFlash2` verification; `vllm.cpp` for native CUDA C++ GDN kernels; and `warp3090` for `TQ4` KV compression and low-latency collectives) and verified continuously against them.
-
-1. **Paged TurboQuant 4-Bit KV Cache (`TQ4`):**
-   - Full-attention KV rows (`head_dim = 256`) are rotated on the fly using a Seed-42 Rademacher sign flip + Fast Walsh-Hadamard Transform (`WHT-256`) and quantized against a 16-centroid Beta(256) Lloyd-Max codebook into `132 B` rows (`block_tq4_0`, `4.125` bits/weight).
-   - `--kv-format tq4` uses a **boundary-anchored recipe** (`3.07×` compression): the first 2 and last 2 full-attention layers use rotated `Q8_0` (`272 B/row`) while the 12 interior layers use `TQ4` (`132 B/row`). `--kv-format tq4_all` compresses all layers to `TQ4` (`3.88×`).
-   - Both `tq4` and `tq4_all` pass **8/8 needle-in-a-haystack tests** from `32K` through `262K` context on `Qwen3.8-27B` on a single 24 GB GPU.
-2. **Hybrid Prefix Caching (`MambaRadixCache`):**
-   - Caching full-attention KV pages alone is useless on a hybrid model if you have to recompute the Gated DeltaNet recurrent state from token 0.
-   - `MambaRadixCache` maintains dual reference counts (`full_lock_ref` for KV pages and `mamba_lock_ref` for chunk-aligned `C = 64` GDN + PLE `StateBundle` snapshots) and uses 2-slot ping-pong track buffers to donate committed recurrent states into the radix tree—cutting warm prefix TTFT by **up to 95%** and restoring speculative draft context (`PrefixMemo`) on cache hits.
-3. **Logical Page IDs Decoupled from Physical Layout (`KvLayerLayout`):**
-   - Logical page allocation (`B = 16` tokens/page) is shared across namespaces while each layer resolves its own physical format (`FP16`, `BF16`, `Q8_0`, `TQ4`, `DFlashDraftContext`, or `QsaIndexer`).
-4. **End-to-End `FP16` Spine + Composite CUDA Graphs:**
-   - All target hidden states, norms, RoPE, attention, GDN recurrence I/O, and Marlin GEMMs consume and produce `FP16` directly (`0` `f32 ↔ f16` glue casts), while GDN `ssm_state` (`[H_v, 128, 128]`) and softmax/norm reductions stay `FP32`.
-   - Decode and speculative verify steps are captured into composite CUDA Graphs with valid-row masking (`valid_token_mask` / `valid_req_mask`) and 2-slot pipelined host overlap (`~20 µs` inter-graph gap).
-
----
-
-## Deep Dive 5: Serving, Structured Outputs, & Observability
-
-### Multi-protocol HTTP APIs
-
-A single `warp34 serve` instance exposes:
-- **OpenAI Chat Completions (`POST /v1/chat/completions`)** & **Completions (`POST /v1/completions`)**
-- **OpenAI Responses (`POST /v1/responses`, `GET /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`)**
-- **Anthropic Messages (`POST /v1/messages`, `POST /v1/messages/count_tokens`)** — including streaming `thinking` and `tool_use` blocks
-- **Decision APIs (`POST /v1/systemone`, `POST /v1/decisions`)**
-- **Tokenization & Health (`POST /tokenize`, `POST /detokenize`, `GET /v1/models`, `GET /health`)**
-
-### Reasoning, tool calls, and `<think>`-aware constrained decoding
-
-- **9-step GPU sampler:** Handles repetition/presence/frequency penalties, `logit_bias`, `min_tokens`, `temperature`, `min_p`, `top_k`, `top_p`, Gumbel-max sampling, and `top_logprobs` entirely on the GPU.
-- **Reasoning & Tool Parsers:** Native support for `<think>...</think>` blocks (`enable_thinking`, `reasoning_effort` / `output_config.effort`) and **Qwen3-XML** tool calls (`tool_choice: "auto" | "required" | {"function": ...}`).
-- **Structured Outputs (XGrammar):** Uses the pure-Rust **`xgrammar-rs`** compiler and matcher for **JSON Schema**, **Regex**, **Context-Free Grammars (EBNF / Lark)**, and native **Structural Tags**, including Qwen XML tools. A shared compiler cache and per-request reasoning gate follow vLLM's architecture; GPU token masks constrain the answer after reasoning ends. Speculative decoding advances private matcher state and commits only accepted output. Unsupported constraints fail explicitly rather than silently becoming unconstrained. See [Structured Outputs](docs/STRUCTURED_OUTPUTS.md).
-
-### Authentication & concurrency controls
-
-Authentication is off by default for local ergonomics. For deployments, pass an environment variable containing your secret key:
-
-```sh
-export WARP34_API_KEY="your-secret-key"
-./target/release/warp34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
-  --api-key-env WARP34_API_KEY \
-  --served-model-name coding-model \
-  --max-num-seqs 8 --kv-pages 2048 --max-model-len 32768
+```json
+{
+  "model": "nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+  "answers": {
+    "is_outage": { "type": "noul", "noul": 0.98 },
+    "owner": { "type": "choice", "choice": "network", "probabilities": { "network": 0.97, "storage": 0.03 }, "confidence": 0.94 }
+  },
+  "usage": { "input_tokens": 62, "output_tokens": 0, "cached_tokens": 0 }
+}
 ```
 
-Clients can authenticate with either `Authorization: Bearer <key>` or `x-api-key: <key>`.
+<details>
+<summary>More Docker options (offline host cache &amp; 2-GPU setup)</summary>
 
-### Live dashboard, API Playground, & Prometheus metrics
-
-- **`GET /`** serves the embedded shadcn dark React dashboard, **`GET /playground`** serves the interactive multi-API Playground (`Chat`, `Responses`, `Anthropic Messages`, `SystemOne`, `Decisions`), and **`GET /connect`** serves the coding-agent setup guide (all bundled directly into the `warp34` binary—no Node runtime needed at serving time; disable with `--no-webui`).
-- **`GET /metrics`** exports Prometheus counters, gauges, and latency histograms; **`GET /api/metrics`** serves the same telemetry as versioned JSON.
-
----
-
-## Docker
-
-**Packaging choice:** CUDA libraries are shared and copied into a separate layer before the executable, so routine application updates can reuse the cached library download. Pruned static cuBLAS saved space on first install, but made every changed executable layer much larger (~442 MB vs ~40 MB).
-
-Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`). The multi-stage build ships `warp34`, shared `libcudart`/`libcublas`/`libcublasLt`, and a small Ubuntu 26.04 runtime with TLS certificates and a curl healthcheck—no Python, Node, CUDA toolkit, or model weights. Embedded CUDA code is size-compressed; native `sm_80`, `sm_86`, and `sm_89` kernels are included in the same image.
-
-**Host requirements:** Linux `amd64` with an x86-64-v3 CPU (AVX2/FMA), an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU with enough VRAM for the selected model, a CUDA 13-capable NVIDIA driver, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). CUDA 13.x minor-version compatibility starts at driver branch R580; a current driver is recommended because newer CUDA features/PTX can require newer drivers. The host does **not** need the CUDA toolkit installed. The container checks the CUDA 13 driver capability before startup.
+**Reuse an existing host Hugging Face cache offline:**
 
 ```sh
-docker pull ghcr.io/nchapman/warp34:dev
-# Or build locally:
-docker build --platform linux/amd64 -t warp34:local .
-```
-
-Mount your host Hugging Face cache to run offline or let it download on first use:
-
-```sh
-docker run --rm --name warp34-local --gpus '"device=0"' \
+docker run --rm --gpus '"device=0"' \
   --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_CACHE=/models \
   -p 127.0.0.1:8000:8000 \
   --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/models,readonly \
-  warp34:local serve \
-  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --host 0.0.0.0
+  ghcr.io/nchapman/warp34:dev \
+  serve nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --host 0.0.0.0
 ```
 
-For download-on-first-use, use a persistent writable named volume instead of the read-only bind mount, and omit `--offline`:
+**Run on 2 GPUs** (no `--ipc=host` required):
 
 ```sh
-docker run --rm --name warp34-local --gpus '"device=0"' \
-  -p 127.0.0.1:8000:8000 \
+docker run --rm --gpus '"device=0,1"' -p 127.0.0.1:8000:8000 \
   --mount type=volume,src=warp34-models,dst=/home/warp34/.cache/huggingface/hub \
-  --health-start-period=10m \
-  warp34:local serve \
-  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --host 0.0.0.0
+  ghcr.io/nchapman/warp34:dev \
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative mtp --host 0.0.0.0
 ```
 
-The image defaults to non-root `warp34`. The read-only host-cache example instead uses your host UID/GID because Hub metadata can be owner-readable only; it also moves `HOME` and the cache outside `warp34`'s private home directory. A new named volume inherits the image's cache-directory ownership and works with the default user. Adjust `--health-start-period` for slow downloads or large models. The default healthcheck probes port 8000; if you change the server port, also override `--health-cmd`.
+Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes to `main` (`:dev`, `:sha-<commit>`) and on `v*` tags (`:latest`, `:X.Y`, `:X.Y.Z`). Build locally with `docker build --platform linux/amd64 -t warp34:local .`.
 
-For two GPUs, pass `--gpus '"device=0,1"'` and `--tp 2` (because `warp34` uses pinned memory / P2P rather than NCCL, you don't even need `--ipc=host`).
-
-Local rebuilds reuse BuildKit caches for pnpm, Cargo downloads, and compiled Rust/CUDA objects. CI exports ordinary build layers to the GitHub Actions cache; cache-mount contents are local to the builder and are not included in that export.
+</details>
 
 ---
 
-## Development, Verification Oracles, & Benchmarks
+## Supported Models & Performance
+
+| Family | Sizes / Checkpoints | Highlights |
+|---|---|---|
+| **Qwen 3.5 / 3.8 Dense** | `0.8B`, `2B`, `4B`, `9B`, `27B` | Full hybrid GDN + attention, Vision (`VL`), `MTP-3`, `DFlash2`, up to `262K` ctx |
+| **Qwen 3.6 Sparse MoE** | `35B-A3B` (`256` experts, `3B` active) | Fits on **1× 24 GB GPU** with `MTP-3` + Vision (`tq4` KV) |
+| **Qwen 3.8 Flash-Next** | `180B` (`512` experts, `6B` active, `qwen4_exp`) | HyperConnection, Sparse Attention (`QSA`), mmap `PLE`, 3-tier MoE on `1–4×` GPUs |
+| **Decision Models** | `GLiDE-*`, `d3-*`, or any Qwen model | `CodeReadout` head + `CausalLm` fallback on `/v1/systemone` & `/v1/decisions` |
+| **Quantizations** | `HGPTQ` (`W4A16`, `W2.6-RCO`), `GPTQ`, `AWQ`, `AutoRound`, `compressed-tensors`, `FP16`/`BF16` | Shared-weight `W4A8` INT8-IMMA prefill on `sm_86`/`sm_89` (zero extra weight VRAM) |
+
+### Headline throughput (`W4A16-HGPTQ`, lossless verification)
+
+| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) |
+|---|---|---:|---:|---:|---:|
+| **Qwen3.5-9B** | Cold 4K prefill (`W4A8`) | `8,632 tok/s` | `15,939 tok/s` | `8,905 tok/s` | `16,104 tok/s` |
+| **Qwen3.5-9B** | Decode `MTP-3` (`C=1` / `C=16`) | `234` / `1,346` | `253` / `1,553` | `339` / `1,676` | `369` / `2,319` |
+| **Qwen3.8-27B** | Cold 4K prefill (`W4A8`) | `2,350 tok/s` | `4,283 tok/s` | `3,094 tok/s` | `5,926 tok/s` |
+| **Qwen3.8-27B** | Decode Plain / `MTP-3` / `DFlash2` | `52` / `150` / `248` | — | `85` / `252` / `365` | `97` / `246` / `328` |
+| **Qwen3.6-35B-A3B** | Decode Plain / `MTP-3` | `205` / `429` | — | `262` / `553` | `315` / `672` |
+| **Qwen3.8-Flash-Next** | Serving `MTP-3` (`W4` / `W2.6-RCO`) | `45` / `66 tok/s` | `58` / — | `73` / `107 tok/s` | `117` / — |
+
+*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full A100 (`sm_80`), `TP=4`, and head-to-head numbers vs. `vLLM`, `SGLang`, and `llama.cpp` are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
+
+---
+
+## Scope & Limitations
+
+- **Qwen hybrid family only:** Built for Qwen 3.5 / 3.6 / 3.8, `Qwen3.8-Flash-Next` (`qwen4_exp`), and `GLiDE`/`d3` decision models. If you need Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
+- **Hardware & OS:** Linux `x86_64` with NVIDIA `sm_80` (A100), `sm_86` (RTX 30-series), or `sm_89` (RTX 40-series) GPUs. No macOS, Windows, AMD ROCm, or pre-Ampere (`sm_75` and older) support.
+- **Single-node scaling:** Supports `TP=1`, `TP=2`, and `TP=4` on one machine; multi-node distributed inference is out of scope.
+
+---
+
+## Documentation
+
+| Guide | Topic |
+|---|---|
+| [`docs/MODELS.md`](docs/MODELS.md) | Model downloads, `--revision` / `--offline`, supported quantizations, and KV cache policies |
+| [`docs/HGPTQ.md`](docs/HGPTQ.md) | Hadamard-rotated `W4A16` / `W2.6-RCO` quantization format and parity benchmarks |
+| [`docs/SERVING.md`](docs/SERVING.md) | Server flags, auth (`--api-key-env`), concurrency limits, and security |
+| [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) | Wire contracts for OpenAI Chat/Responses/Completions and Anthropic Messages |
+| [`docs/STRUCTURED_OUTPUTS.md`](docs/STRUCTURED_OUTPUTS.md) | `<think>`-aware XGrammar JSON Schema, Regex, CFG, and Qwen XML tool constraints |
+| [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) | `Qwen3.8-Flash-Next` (`qwen4_exp`) architecture, `QSA`, `PLE`, and 3-tier MoE offloading |
+| [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) | `/v1/systemone` & `/v1/decisions` schemas, `GLiDE`/`d3`/`CausalLm` profiles, and JevBench |
+| [`docs/METRICS.md`](docs/METRICS.md) | Embedded web dashboard, Prometheus `/metrics`, and `/api/metrics` JSON schema |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Engine internals, donor map (`vLLM` / `SGLang` / `vllm.cpp` / `warp3090`), and invariants |
+| [`docs/HARDWARE.md`](docs/HARDWARE.md) | `sm_80` / `sm_86` / `sm_89` rooflines, PCIe/NVLink collectives, and ISA traps |
+| [`docs/FEATURES.md`](docs/FEATURES.md) | Complete capability inventory |
+| [`benchmarks/perf/README.md`](benchmarks/perf/README.md) | Standalone HTTP benchmark harness and multi-engine campaign configs |
+
+---
+
+## Development & Contributing
 
 ```sh
-export PATH="/opt/cuda/bin:$PATH"
-mise run build           # build dashboard + release binary (--features cuda)
-mise run check-quick     # rustfmt + clippy (with and without cuda) + rustdoc check
-mise run check           # fmt + clippy + rustdoc + full release GPU test suite
-mise run test-cpu        # fast CPU-only unit tests
-mise run coverage        # library line coverage (--lib --features cuda)
-mise run perf-check      # validate the standalone HTTP benchmark suite
+mise run check-quick   # fmt + clippy (cuda & cpu) + rustdoc + SIMD & CUDA binary gates
+mise run test-quick    # fast GPU unit test suite
+mise run check         # full release gate + compute-sanitizer (requires GPUs + mise run test-prep)
 ```
 
-Beyond unit and integration tests, `warp34` has three built-in oracle subcommands used to verify every kernel and subsystem against `vLLM` and `SGLang`:
-- **`warp34 dump-diff`** — Hooks per-layer tensors from `vLLM`/`SGLang` golden dumps and checks `max_abs_err`, `rel_l2`, and cosine similarity layer by layer.
-- **`warp34 greedy-diff`** — Verifies exact greedy token parity, lossless speculative decoding (`--verify-lossless`), and warm radix cache restoration (`--verify-radix-warm`).
-- **`warp34 profile-diff`** — Captures `nsys` SQLite traces of `warp34` vs. `vLLM`/`SGLang` and prints a side-by-side `ms/round` kernel scoreboard by category (`marlin_gemm`, `full_attn`, `gdn_ssm`, `norms_rope_act`, `tp_comm`, `spec_decode`, `host_gap`).
+For kernel and parity work, `warp34` also ships built-in oracle subcommands (`dump-diff`, `greedy-diff`, and `profile-diff`) to verify layer tensors, greedy/speculative parity, and `nsys` kernel timings against `vLLM` and `SGLang`.
 
-For end-to-end HTTP load testing across single-stream decode, concurrent `C=8..16` throughput, prefix reuse, and multi-turn coding-agent replays up to `252K` context, see the standalone benchmark suite in [`benchmarks/perf/README.md`](benchmarks/perf/README.md) and the recorded standings in [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for bug reports, regression-first fixes, and PR verification requirements.
 
----
+## License
 
-## Documentation Map
-
-| Guide | What's Inside |
-|---|---|
-| [`docs/FEATURES.md`](docs/FEATURES.md) | Front-to-back capability inventory |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Reproducible bug reports, regression-first fixes and PR verification requirements |
-| [`docs/MODELS.md`](docs/MODELS.md) | Model downloads, `--revision` / `--offline`, supported architectures, quantizations, and KV policies |
-| [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) | Full architecture & 3-tier offloading reference for `Qwen3.8-Flash-Next` (`qwen4_exp`) |
-| [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) | `/v1/systemone` and `/v1/decisions` schemas, supported profiles (`CodeReadout` `GLiDE` & `d3`, `CausalLm`), and JevBench results |
-| [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) | Wire contracts for `/v1/chat/completions`, `/v1/responses`, and Anthropic `/v1/messages` |
-| [`docs/SERVING.md`](docs/SERVING.md) | Server flags, authentication (`--api-key-env`), concurrency limits, and image security |
-| [`docs/METRICS.md`](docs/METRICS.md) | Live web dashboard, Prometheus `/metrics`, and `/api/metrics` JSON schema |
-| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Subsystem architecture, donor map (`vLLM` / `SGLang` / `vllm.cpp` / `warp3090`), and seam contracts |
-| [`docs/HARDWARE.md`](docs/HARDWARE.md) | NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) rooflines, PCIe/NVLink topology, and ISA traps |
-| [`docs/STATE.md`](docs/STATE.md) | Current verified hardware benchmark matrix and engineering state |
-| [`docs/contracts/`](docs/contracts/) | Frozen precision, KV layout, GDN state-transaction, and multi-GPU collective contracts |
+Licensed under the [Apache License 2.0](LICENSE). See [`NOTICE`](NOTICE) for third-party attributions.
