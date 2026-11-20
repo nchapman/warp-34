@@ -71,8 +71,7 @@ FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libstdc++6 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --home-dir /home/warp34 warp34 \
-    && install -d -o warp34 -g warp34 /home/warp34/.cache/huggingface/hub
+    && mkdir -p /root/.cache/huggingface/hub
 # Keep CUDA libraries in a separate layer so app updates can reuse the download.
 # COPY dereferences SONAME symlinks; also copying versioned files duplicates them.
 COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 \
@@ -82,13 +81,10 @@ COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 \
 RUN echo /usr/local/cuda/lib64 > /etc/ld.so.conf.d/cuda.conf && ldconfig
 COPY --from=build /warp34 /usr/local/bin/warp34
 COPY LICENSE NOTICE /usr/share/doc/warp34/
-ENV HOME=/home/warp34 \
-    HF_HUB_CACHE=/home/warp34/.cache/huggingface/hub \
+ENV WARP34_HOST=0.0.0.0 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_REQUIRE_CUDA="cuda>=13.0"
-USER warp34
-ENV WARP34_HOST=0.0.0.0
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1

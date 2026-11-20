@@ -29,7 +29,7 @@ Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-nat
 
 ```sh
 docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
-  -v warp34-models:/home/warp34/.cache/huggingface/hub \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/nchapman/warp34:latest \
   serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
 ```
@@ -134,7 +134,7 @@ claude --model "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 
 ## Common Recipes
 
-> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all -p 127.0.0.1:8000:8000 -v warp34-models:/home/warp34/.cache/huggingface/hub ghcr.io/nchapman/warp34:latest`). `warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly).
+> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all -p 127.0.0.1:8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface ghcr.io/nchapman/warp34:latest`). `warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly).
 
 <details>
 <summary>8 GB, 12 GB, &amp; 16 GB GPU starter commands</summary>
@@ -261,24 +261,25 @@ Returns calibrated probabilities and confidence scores without generating tokens
 </details>
 
 <details>
-<summary>More Docker options (offline host cache &amp; 2-GPU setup)</summary>
+<summary>More Docker options (non-root, offline cache, &amp; 2-GPU setup)</summary>
 
-**Reuse an existing host Hugging Face cache offline:**
+**Run as your host UID (non-root, keeps downloaded files owned by your user) or read-only offline:**
 
 ```sh
-docker run --rm --gpus all \
-  --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_CACHE=/models \
-  -p 127.0.0.1:8000:8000 \
-  -v "$HOME/.cache/huggingface/hub:/models:ro" \
+docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
+  --user "$(id -u):$(id -g)" -e HF_HOME=/cache \
+  -v ~/.cache/huggingface:/cache \
   ghcr.io/nchapman/warp34:latest \
-  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --offline
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
 ```
+
+*(Append `:ro` to the volume mount and `--offline` to run completely offline against an existing cache.)*
 
 **Run on 2 GPUs** (no `--ipc=host` required):
 
 ```sh
 docker run --rm --gpus all -p 127.0.0.1:8000:8000 \
-  -v warp34-models:/home/warp34/.cache/huggingface/hub \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/nchapman/warp34:latest \
   serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2 --speculative mtp
 ```
