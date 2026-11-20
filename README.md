@@ -91,6 +91,19 @@ Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapma
 
 *Table throughput numbers are single-stream `MTP-3` decode measurements (`Flash-Next` on `1–2× RTX 3090 Ti`); actual speed scales with GPU memory bandwidth. Standard upstream `FP16`/`BF16`, `GPTQ`, `AWQ`, `AutoRound`, and `compressed-tensors` Qwen checkpoints also work out of the box—see [`docs/MODELS.md`](docs/MODELS.md) and [`docs/HGPTQ.md`](docs/HGPTQ.md).*
 
+<details>
+<summary>Browse full <code>nchapman/models</code> catalog (HGPTQ, W2.6-RCO, DFlash2 drafters, &amp; GLiDE/d3 decision models)</summary>
+
+| Family | Checkpoints (`nchapman/...`) | Notes |
+|---|---|---|
+| **Qwen 3.5 Dense** | `Qwen3.5-0.8B-W4A16-HGPTQ`, `Qwen3.5-2B-W4A16-HGPTQ`, `Qwen3.5-4B-W4A16-HGPTQ`, `Qwen3.5-9B-W4A16-HGPTQ`, `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` | Vision + `MTP-3` (`9B-RCO` fits 8 GB @ `128K`) |
+| **Qwen 3.8 Dense** | `Qwen3.8-27B-W4A16-HGPTQ`, `Qwen3.8-27B-W2.6A16-HGPTQ-RCO`, `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` | Flagship 27B (`W4` for 24 GB, `W2.6` for 16 GB, `W2.2` for 12 GB) |
+| **Qwen 3.6 & 3.8 MoE** | `Qwen3.6-35B-A3B-W4A16-HGPTQ`, `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO`, `Qwen3.8-Flash-Next-W4A16-HGPTQ`, `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` | `35B-A3B` 256-expert resident MoE; `Flash-Next` 180B 512-expert tiered MoE |
+| **`DFlash2` Drafters** | `Qwen3.5-4B-DFlash2`, `Qwen3.8-27B-DFlash2-W4A16-HGPTQ`, `Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ` | Pair with `--speculative dflash2 --draft-model ...` |
+| **Decision (`GLiDE` / `d3`)** | `GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ`, `Qwen3.5-{0.8B,2B,9B,27B}-GLiDE-LoRA` | Zero-decode `/v1/systemone` & `/v1/decisions` classifiers |
+
+</details>
+
 ---
 
 ## APIs & Coding Agents
@@ -121,23 +134,59 @@ claude --model "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 
 ## Common Recipes
 
-> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all ... ghcr.io/nchapman/warp34:latest`).
+> The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus all -p 127.0.0.1:8000:8000 -v warp34-models:/home/warp34/.cache/huggingface/hub ghcr.io/nchapman/warp34:latest`). `warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly).
 
-### Speculative decoding & multi-GPU serving
+<details>
+<summary>8 GB, 12 GB, &amp; 16 GB GPU starter commands</summary>
 
-`warp34 serve` defaults to `--kv-format tq4` and auto-fits context length to your VRAM (`-c` overrides it explicitly):
+```sh
+# 8 GB GPU (e.g., RTX 4060): Qwen3.5-9B W2.6-RCO + Vision + MTP-3 @ 128K
+warp34 serve nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO --speculative mtp
+
+# 12 GB GPU (e.g., RTX 3060 / 4070): Qwen3.5-9B W4 + Vision + MTP-3 @ 128K
+warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+
+# 16 GB GPU (e.g., RTX 4060 Ti / 4080): Qwen3.6-35B-A3B MoE W2.6-RCO + MTP-3 @ 128K
+warp34 serve nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO --speculative mtp
+
+# 16 GB GPU (dense alt): Qwen3.8-27B W2.6-RCO + MTP-3 @ 128K
+warp34 serve nchapman/Qwen3.8-27B-W2.6A16-HGPTQ-RCO --speculative mtp
+```
+
+</details>
+
+<details>
+<summary>24 GB GPU: <code>27B + DFlash2</code> block drafting &amp; <code>180B Flash-Next</code> on 1 card</summary>
 
 ```sh
 # Qwen3.8-27B + DFlash2 block drafting on a single 24 GB GPU
 warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
 
+# 180B Qwen3.8-Flash-Next W2.6-RCO + MTP-3 on a single 24 GB GPU (~66 tok/s, auto-fit 128K)
+warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --speculative mtp
+```
+
+</details>
+
+<details>
+<summary>2× 24 GB GPUs (<code>--tp 2</code>): <code>180B Flash-Next</code> &amp; <code>27B</code> multi-GPU</summary>
+
+```sh
 # 180B Qwen3.8-Flash-Next + MTP-3 across 2x 24 GB GPUs (auto-fits 128K-256K ctx + hot experts)
 warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO \
   --speculative mtp --tp 2
+
+# Qwen3.8-27B + DFlash2 across 2x 24 GB GPUs
+warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
+  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
+  --tp 2
 ```
 
-### Hot-swappable Multi-LoRA
+</details>
+
+<details>
+<summary>Hot-swappable Multi-LoRA (up to 62 concurrent adapters)</summary>
 
 Load up to 62 PEFT LoRA adapters alongside the base model and select any adapter per request by passing `"model": "<name>"`:
 
@@ -149,25 +198,34 @@ warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
 
 *(Replace `org/my-lora-adapter` with any compatible Hugging Face repo or local adapter directory.)*
 
-### API authentication & concurrency limits
+</details>
+
+<details>
+<summary>API authentication &amp; concurrency limits</summary>
 
 ```sh
 export WARP34_API_KEY="your-secret-key"
-warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
+warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --api-key-env WARP34_API_KEY \
   --max-num-seqs 8 -c 64k
 ```
 
 Clients authenticate with `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-### Interactive terminal chat
+</details>
+
+<details>
+<summary>Interactive terminal chat</summary>
 
 ```sh
 # Multi-turn terminal REPL (pass -p "..." for a single turn)
-warp34 chat nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+warp34 chat nchapman/Qwen3.8-27B-W4A16-HGPTQ --speculative mtp
 ```
 
-### Zero-decode Decision API (`/v1/systemone`, `/v1/decisions`)
+</details>
+
+<details>
+<summary>Zero-decode Decision API (<code>/v1/systemone</code>, <code>/v1/decisions</code>)</summary>
 
 Evaluate up to 64 boolean (`noul`), categorical (`choice`), or rubric (`score`) questions over shared context (and optional images) in a **single prefill pass with zero decode tokens**. Works on specialized `GLiDE` / `d3` checkpoints (`96.9%` JevBench, `100%` MultiQ) or any standard Qwen model:
 
@@ -191,7 +249,7 @@ Returns calibrated probabilities and confidence scores without generating tokens
 
 ```json
 {
-  "model": "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
+  "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
   "answers": {
     "is_outage": { "type": "noul", "noul": 0.98 },
     "owner": { "type": "choice", "choice": "network", "probabilities": { "network": 0.97, "storage": 0.03 }, "confidence": 0.94 }
@@ -199,6 +257,8 @@ Returns calibrated probabilities and confidence scores without generating tokens
   "usage": { "input_tokens": 62, "output_tokens": 0, "cached_tokens": 0 }
 }
 ```
+
+</details>
 
 <details>
 <summary>More Docker options (offline host cache &amp; 2-GPU setup)</summary>
@@ -211,7 +271,7 @@ docker run --rm --gpus all \
   -p 127.0.0.1:8000:8000 \
   -v "$HOME/.cache/huggingface/hub:/models:ro" \
   ghcr.io/nchapman/warp34:latest \
-  serve nchapman/Qwen3.5-9B-W4A16-HGPTQ --offline
+  serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --offline
 ```
 
 **Run on 2 GPUs** (no `--ipc=host` required):
