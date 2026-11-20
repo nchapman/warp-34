@@ -1,0 +1,155 @@
+# Flagship Qwen3.8-27B head-to-head campaign (1x and 2x 24 GiB consumer GPUs, sm_86 / sm_89):
+# Qwen3.8-27B-W4A16-HGPTQ (ae51987e3339a2a70070702548571e10fe8bcbc2) across:
+#   1. Prompt-processing (pp) scaling curve: cold unique 4K / 16K / 32K / 60K / 115K
+#   2. Steady-state decode & continuous-batching throughput: C1 / C8 (256 output tok)
+#   3. Long-context coding-agent replay: 64K / 120K warm prefix reuse
+# Covers TP=2 FP16 Plain, TP=2 FP16 Native MTP-3 (k=3), TP=2 FP16 DFlash2 (M=8),
+# TP=2 TQ4 262K Plain, and single-card TP=1 TQ4 262K Plain.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1
+warmup_requests = 1
+max_inflight = 16
+timeout_s = 600
+
+[engine_defaults]
+support = "supported"
+cohort = "27b-head-to-head-consumer-24gb"
+gpu_count = 2
+parallelism = "TP=2"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+weight_format = "HGPTQ-W4A16"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+speculation = "none"
+
+[[engines]]
+id = "warp34-27b-tp2-fp16"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "fp16"
+cache_config = "FP16 KV TP=2 8192 pages (131072 tokens), FP32 SSM, max_num_seqs 8, shared-k16 W4A8 prefill, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 8192 --max-num-seqs 8 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp2-fp16-mtp3"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "fp16"
+speculation = "mtp-k3"
+cache_config = "FP16 KV TP=2 8192 pages (131072 tokens), FP32 SSM, max_num_seqs 8, Native MTP-3 (k=3), shared-k16 W4A8 prefill, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 8192 --max-num-seqs 8 --speculative mtp --mtp-k 3 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp2-fp16-dflash2"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "fp16"
+speculation = "dflash2-m8"
+cache_config = "FP16 KV TP=2 8192 pages (131072 tokens), FP32 SSM, max_num_seqs 8, DFlash2 W4A16-HGPTQ (M=8), shared-k16 W4A8 prefill, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 8192 --max-num-seqs 8 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp2-tq4"
+engine = "warp34"
+version = "0.1.0"
+kv_format = "tq4"
+cache_config = "TQ4 (3.07x) KV TP=2 16384 pages (262144 tokens), FP32 SSM, max_num_seqs 8, shared-k16 W4A8 prefill, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format tq4 --kv-pages 16384 --max-num-seqs 8 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp1-tq4-262k"
+engine = "warp34"
+version = "0.1.0"
+gpu_count = 1
+parallelism = "TP=1"
+kv_format = "tq4"
+cache_config = "TQ4 (3.07x) KV TP=1 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB GPU, FP32 SSM, shared-k16 W4A8 prefill, hybrid GDN+KV radix prefix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/warp34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
+
+# --- A. Prompt processing (pp) scaling curve (unique cold prompts) ---
+
+[[cases]]
+id = "pp-4k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 52
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-16k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 210
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "pp-32k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 420
+cache = "unique"
+requests = 2
+concurrency = 1
+max_tokens = 16
+
+[[cases]]
+id = "cold-file-read-60k-c1"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+context_repetitions = 1
+cache = "unique"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "cold-file-read-115k-c1"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+context_repetitions = 2
+cache = "unique"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+# --- B. Steady-state decode & continuous-batching scaling ---
+
+[[cases]]
+id = "decode-c1"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c8"
+fixture = "../fixtures/text.json"
+cache = "unique"
+requests = 16
+concurrency = 8
+max_tokens = 256
+
+# --- C. Long-context coding-agent replay (warm prefix reuse) ---
+
+[[cases]]
+id = "swe-agent-64k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_64k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "swe-agent-120k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_120k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
