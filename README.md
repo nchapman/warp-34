@@ -83,9 +83,9 @@ Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapma
 
 | GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint @ `128K tq4` | Why pick it |
 |---|---|---:|---|
-| **8 GB** *(RTX 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` *(~935 MiB free w/ LoRA)* | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` decode w/ MTP) |
-| **12 GB** *(RTX 3060 / 4070)* | `Qwen3.5-9B-W4A16-HGPTQ` *(4.00 bpw)* | `8.6 GiB` *(~2.4 GiB free w/ LoRA)* | Best quality on 12 GB (`140.5 tok/s` w/ MTP); alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`10.6 GiB` @ `64K tq4_all`) |
-| **16 GB** *(RTX 4060 Ti / 4080)* | `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` *(2.62 bpw)* | `14.6 GiB` *(~221 MiB free w/ LoRA)* | Fast MoE pick (`190.8 tok/s` w/ MTP); dense alt: `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (`14.6 GiB`, `48.5 tok/s` w/ MTP) |
+| **8 GB** *(RTX 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` w/ MTP, ~935 MiB free) |
+| **12 GB** *(RTX 3060 / 4070)* | `Qwen3.5-9B-W4A16-HGPTQ` *(4.00 bpw)* | `8.6 GiB` | Best quality on 12 GB (`140.5 tok/s` w/ MTP); alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`10.6 GiB` @ `64K tq4_all`) |
+| **16 GB** *(RTX 4060 Ti / 4080)* | `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` *(2.62 bpw)* | `14.6 GiB` | Fast MoE pick (`190.8 tok/s` w/ MTP); dense alt: `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (`14.6 GiB`, `48.5 tok/s` w/ MTP) |
 | **1× 24 GB** *(RTX 3090 / 4090)* | `Qwen3.8-27B-W4A16-HGPTQ` or `Qwen3.6-35B-A3B-W4A16-HGPTQ` | `~19–21 GiB` | Full `W4` quality + Vision + `MTP-3`/`DFlash2` (`128K–256K`); or `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`19.0 GiB`, `66 tok/s` w/ `MTP-3`) |
 | **2× 24 GB** *(TP=2)* | `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` | `20.8 GiB/GPU` | Flagship 180B MoE + `128K–256K` ctx + `MTP-3` (`107 tok/s` auto-fit; up to `131.6 tok/s` on a dedicated headless GPU) |
 
@@ -291,44 +291,42 @@ Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes t
 
 ## Performance
 
-### Head-to-head vs. `vLLM`, `SGLang`, and `llama.cpp`
+### Head-to-head: `Qwen3.5-9B` (`MTP-3`) vs. `vLLM`, `SGLang`, and `llama.cpp`
 
-End-to-end HTTP serving p50 (`tok/s`) on `Qwen3.5-9B` with Native `MTP-3` (`FP16` KV). We benchmark `9B` here because `vLLM` and `SGLang` OOM trying to fit `Qwen3.8-27B` with full context, Vision, and `MTP-3` on a single 24 GB GPU.
+End-to-end HTTP serving p50 (`tok/s`, `FP16` KV). We benchmark `9B` here because `vLLM` and `SGLang` OOM trying to fit `Qwen3.8-27B` with full context, Vision, and `MTP-3` on a single 24 GB GPU.
 
-**Single GPU (`1× RTX 3090 Ti`, `11/11` clean sweep):**
-
-| Workload | **`warp34`** | `vLLM 0.34.0` | `SGLang v0.5.23` | `llama.cpp` | `warp34` lead |
-|---|---:|---:|---:|---:|---:|
-| **Cold 4K prefill** | **`8,223`** | `4,801` | `4,539` | `4,892` | **`+68%` to `+81%`** |
-| **Cold 115K prefill** | **`4,097`** | `2,875` | `2,885` | `3,124` | **`+31%` to `+43%`** |
-| **Single-stream decode (`C=1`)** | **`233.5`** | `180.6` | `179.2` | `194.4` | **`+20%` to `+30%`** |
-| **Batched decode (`C=16`)** | **`1,346.4`** | `1,276.8` | `881.5` | *crash* | **`+5%` to `+53%`** |
-| **Coding agent (`64K` ctx)** | **`42.3`** | `22.9` | `27.2` | `31.8` | **`+33%` to `+85%`** |
-| **Coding agent (`120K` ctx)** | **`19.5`** | `11.2` | `13.2` | `15.1` | **`+29%` to `+74%`** |
-
-**Two GPUs (`2× RTX 3090 Ti` PCIe, `11/11` clean sweep):**
+**`Qwen3.5-9B` (`MTP-3`) on `1× RTX 3090 Ti` (`11/11` clean sweep):**
 
 | Workload | **`warp34`** | `vLLM 0.34.0` | `SGLang v0.5.23` | `llama.cpp` | `warp34` lead |
 |---|---:|---:|---:|---:|---:|
-| **Cold 4K prefill** | **`8,408`** | `5,282` | `5,044` | `4,169` | **`+59%` to `+102%`** |
-| **Cold 115K prefill** | **`5,492`** | `3,902` | `3,742` | `3,119` | **`+41%` to `+76%`** |
-| **Single-stream decode (`C=1`)** | **`338.6`** | `232.6` | `251.4` | `217.0` | **`+35%` to `+56%`** |
-| **Batched decode (`C=16`)** | **`1,675.8`** | `1,354.0` | `1,264.5` | *crash* | **`+24%` to `+33%`** |
-| **Coding agent (`64K` ctx)** | **`49.8`** | `27.5` | `34.1` | `30.5` | **`+46%` to `+81%`** |
-| **Coding agent (`120K` ctx)** | **`26.4`** | `14.2` | `17.2` | `15.2` | **`+53%` to `+86%`** |
+| **Cold 4K prefill** | **`8,223`** | `4,801` | `4,539` | `4,892` | **`+68%–81%`** |
+| **Cold 115K prefill** | **`4,097`** | `2,875` | `2,885` | `3,124` | **`+31%–43%`** |
+| **Single-stream decode (`C=1`)** | **`233.5`** | `180.6` | `179.2` | `194.4` | **`+20%–30%`** |
+| **Batched decode (`C=16`)** | **`1,346.4`** | `1,276.8` | `881.5` | *crash* | **`+5%–53%`** |
+| **Coding agent (`64K` ctx)** | **`42.3`** | `22.9` | `27.2` | `31.8` | **`+33%–85%`** |
+| **Coding agent (`120K` ctx)** | **`19.5`** | `11.2` | `13.2` | `15.1` | **`+29%–74%`** |
 
-### Throughput across models (`HGPTQ` / `W2.6-RCO`, lossless verification)
+**`Qwen3.5-9B` (`MTP-3`) on `2× RTX 3090 Ti` PCIe (`11/11` clean sweep):**
 
-| Model | Mode | 1× RTX 3090 Ti (`sm_86`) | 1× RTX 4090 (`sm_89`) | 2× RTX 3090 Ti (PCIe) | 2× RTX 4090 (PCIe) |
-|---|---|---:|---:|---:|---:|
-| **Qwen3.5-9B** | Cold 4K prefill (`Plain`, `W4A8`) | `8,632 tok/s` | `15,939 tok/s` | `8,905 tok/s` | `16,104 tok/s` |
-| **Qwen3.5-9B** | Decode `MTP-3` (`C=1` / `C=16`) | `234` / `1,346` | `253` / `1,553` | `339` / `1,676` | `369` / `2,319` |
-| **Qwen3.8-27B** | Cold 4K prefill (`Plain`, `W4A8`) | `2,350 tok/s` | `4,283 tok/s` | `3,094 tok/s` | `5,926 tok/s` |
-| **Qwen3.8-27B** | Decode Plain / `MTP-3` / `DFlash2` | `52` / `150` / `248` | — | `85` / `252` / `365` | `97` / `246` / `328` |
-| **Qwen3.6-35B-A3B** | Decode Plain / `MTP-3` | `205` / `429` | — | `262` / `553` | `315` / `672` |
-| **Qwen3.8-Flash-Next** | Serving `MTP-3` (`W4` / `W2.6-RCO`) | `45` / `66 tok/s` | `58` / — | `73` / `107 tok/s` | `117` / — |
+| Workload | **`warp34`** | `vLLM 0.34.0` | `SGLang v0.5.23` | `llama.cpp` | `warp34` lead |
+|---|---:|---:|---:|---:|---:|
+| **Cold 4K prefill** | **`8,408`** | `5,282` | `5,044` | `4,169` | **`+59%–102%`** |
+| **Cold 115K prefill** | **`5,492`** | `3,902` | `3,742` | `3,119` | **`+41%–76%`** |
+| **Single-stream decode (`C=1`)** | **`338.6`** | `232.6` | `251.4` | `217.0` | **`+35%–56%`** |
+| **Batched decode (`C=16`)** | **`1,675.8`** | `1,354.0` | `1,264.5` | *crash* | **`+24%–33%`** |
+| **Coding agent (`64K` ctx)** | **`49.8`** | `27.5` | `34.1` | `30.5` | **`+46%–81%`** |
+| **Coding agent (`120K` ctx)** | **`26.4`** | `14.2` | `17.2` | `15.2` | **`+53%–86%`** |
 
-*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full `27B`, `Flash-Next`, and `Plain` (non-MTP) head-to-head campaigns are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
+### Single-stream decode across Q4 models (`W4A16-HGPTQ` + `MTP-3`)
+
+| Model | 1× RTX 3090 Ti | 1× RTX 4090 | 2× RTX 3090 Ti | 2× RTX 4090 |
+|---|---:|---:|---:|---:|
+| **`Qwen3.5-9B`** | `234 tok/s` | `253 tok/s` | `339 tok/s` | `369 tok/s` |
+| **`Qwen3.8-27B`** | `150 tok/s` | `162 tok/s` | `252 tok/s` | `246 tok/s` |
+| **`Qwen3.6-35B-A3B`** | `429 tok/s` | `512 tok/s` | `553 tok/s` | `672 tok/s` |
+| **`Qwen3.8-Flash-Next`** *(180B MoE)* | `45 tok/s` | `58 tok/s` | `73 tok/s` | `117 tok/s` |
+
+*All rows use lossless `MTP-3` on `W4A16-HGPTQ` (Q4) checkpoints (`9B` and `Flash-Next` are end-to-end HTTP serving p50s; `27B` and `35B-A3B` are `warp34 bench` peak acceptance—realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full `27B`, `Flash-Next`, `DFlash2`, prefill, and `Plain` (non-MTP) campaigns are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
 
 ---
 
