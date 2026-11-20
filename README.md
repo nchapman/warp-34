@@ -1,47 +1,21 @@
 # warp34
 
-A single-binary Rust and CUDA inference engine built specifically for **Qwen 3.5, 3.6, 3.8, and Flash-Next** models on NVIDIA A100, RTX 30-series, and RTX 40-series GPUs.
+The fastest single-binary inference engine for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%20sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 [![Models on HF](https://img.shields.io/badge/Hugging%20Face-nchapman%2Fmodels-ffd21e.svg)](https://huggingface.co/nchapman/models)
 
-No Python, no NCCL, and no runtime dependencies. `warp34` is built from the ground up for Qwen's hybrid Gated DeltaNet + full-attention architecture—combining custom Hadamard quants, 4-bit KV cache compression, lossless speculation, and automatic VRAM planning so you can run bigger models, longer contexts, Vision, and LoRAs simultaneously on consumer GPUs, faster than general-purpose engines like `vLLM` and `SGLang` on supported Qwen workloads.
-
-## What Makes `warp34` Different
-
-- **Fit the whole stack on one GPU (`HGPTQ`/`RCO` + `TQ4` KV + Smart Planner)** — Most engines force you to trade off model size, context length, vision, or speculation. Pairing our [optimized `HGPTQ` & `W2.6-RCO` checkpoints](https://huggingface.co/nchapman/models) with 4-bit TurboQuant KV (`tq4`, 3.07× compression) and automatic VRAM sizing fits **Vision + `MTP-3` + `128K` context + LoRA** at the same time—from `9B` on an **8 GB** card to `27B`/`35B-A3B` on **16–24 GB**.
-- **Zero-flag smart VRAM planner** — Just run `warp34 serve <model>`. It measures free VRAM, picks `tq4`/`tq4_all`, maximizes context up to `256K` (`262,144` tokens), offloads embeddings when needed, and on tiered MoE models automatically balances hot experts against context length (protecting a `64K–128K` coding floor and `>= 512 MiB` headroom for `MTP-3`).
-- **180B `Qwen3.8-Flash-Next` on 1–2 consumer GPUs** — Streams the multi-GB n-gram table via `mmap` (`51 GB` FP8 / `~14 GB` `lut4-gptq`), caches hot experts in VRAM, prefetches cold experts over PCIe, and evaluates misses on a 0-ULP AVX-512/AVX2 CPU bridge—reaching **`66 tok/s`** on `1× 24 GB` and **`107 tok/s`** on `2× 24 GB` (`W2.6-RCO` + `MTP-3`).
-- **Drop-in coding-agent APIs & embedded UI** — One binary speaks **OpenAI Chat Completions**, **OpenAI Responses**, and **Anthropic Messages** (with streaming `<think>` reasoning, tool calls, and `<think>`-aware XGrammar JSON/Regex/CFG outputs), plus a terminal `chat` REPL and a built-in web dashboard (`/`), API Playground (`/playground`), and setup guide (`/connect`).
-- **Zero-decode Decision Engine (`/v1/systemone`, `/v1/decisions`)** — Score up to 64 boolean (`noul`), categorical (`choice`), or rubric (`score`) questions over text or images in a **single prefill pass (`0` generated tokens)** with calibrated probabilities. Supports dedicated `GLiDE` / `d3` classifiers (`96.9%` JevBench, `100%` MultiQ) or any standard Qwen model.
-- **Hot-swappable Multi-LoRA & NCCL-free multi-GPU** — Serve up to **62 concurrent LoRA adapters** (`--lora-modules`) across dense, MoE, and decision models; scale across `2–4×` GPUs (`--tp 2` / `--tp 4`) via NVLink P2P or 2-hop pinned PCIe inside CUDA Graphs (no NCCL, no `--ipc=host`), plus shared-weight `W4A8` prefill on RTX 30/40-series.
-
----
-
-## Pick a Model for Your GPU
-
-Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapman/models) hosts Hadamard-rotated `W4A16-HGPTQ` and mixed-precision `W2.6A16-HGPTQ-RCO` checkpoints tuned specifically for `warp34`. Every row below runs with zero manual KV/memory flags—just pass the model ID to `warp34 serve` (add `--speculative mtp` to enable `MTP-3`):
-
-| GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint @ `128K tq4` | Why pick it |
-|---|---|---:|---|
-| **8 GB** *(RTX 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` *(~935 MiB free w/ LoRA)* | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` decode w/ MTP) |
-| **12 GB** *(RTX 3060 / 4070)* | `Qwen3.5-9B-W4A16-HGPTQ` *(4.00 bpw)* | `8.6 GiB` *(~2.4 GiB free w/ LoRA)* | Best quality on 12 GB (`140.5 tok/s` w/ MTP); alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`10.6 GiB` @ `64K tq4_all`) |
-| **16 GB** *(RTX 4060 Ti / 4080)* | `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` *(2.62 bpw)* | `14.6 GiB` *(~221 MiB free w/ LoRA)* | Fast MoE pick (`190.8 tok/s` w/ MTP); dense alt: `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (`14.6 GiB`, `48.5 tok/s` w/ MTP) |
-| **1× 24 GB** *(RTX 3090 / 4090)* | `Qwen3.8-27B-W4A16-HGPTQ` or `Qwen3.6-35B-A3B-W4A16-HGPTQ` | `~19–21 GiB` | Full `W4` quality + Vision + `MTP-3`/`DFlash2` (`128K–256K`); or `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`19.0 GiB`, `66 tok/s` w/ `MTP-3`) |
-| **2× 24 GB** *(TP=2)* | `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` | `20.8 GiB/GPU` | Flagship 180B MoE + `128K–256K` ctx + `MTP-3` (`107 tok/s` auto-fit; up to `131.6 tok/s` on a dedicated headless GPU) |
-| **48–80 GB** *(A6000 / L40S / A100 80 GB)* | `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` *(48 GB)* or `W4A16-HGPTQ` *(80 GB)* | `44.9 GiB` / `~80 GiB` trunk *(PLE mmap'd)* | 100% VRAM-resident experts + full `256K` context (zero CPU expert offload) |
-
-*Table throughput numbers are single-stream `MTP-3` decode measurements (`Flash-Next` on `1–2× RTX 3090 Ti`); actual speed scales with GPU memory bandwidth. Standard upstream `FP16`/`BF16`, `GPTQ`, `AWQ`, `AutoRound`, and `compressed-tensors` Qwen checkpoints also work out of the box—see [`docs/MODELS.md`](docs/MODELS.md) and [`docs/HGPTQ.md`](docs/HGPTQ.md).*
+Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), and A100 (`sm_80`) GPUs.
 
 ---
 
 ## Quickstart
 
-**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPU, and a CUDA 13-capable driver (R580+).
+**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30-series, RTX 40-series, or A100 GPU, and a CUDA 13-capable driver (R580+).
 
-> **VRAM note:** The commands below run `nchapman/Qwen3.5-9B-W4A16-HGPTQ` (`~8.6 GiB`, 12 GB+ GPUs). On an **8 GB GPU**, swap in `nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO` (`6.0 GiB`)—or any checkpoint from the table above.
+> **VRAM note:** The commands below run `nchapman/Qwen3.5-9B-W4A16-HGPTQ` (`~8.6 GiB`, 12 GB+ GPUs). On an **8 GB GPU**, swap in `nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO` (`6.0 GiB`)—or pick any checkpoint from [Pick a Model for Your GPU](#pick-a-model-for-your-gpu).
 
 ### Option A: Docker (fastest — no build tools or host CUDA toolkit needed)
 
@@ -82,28 +56,66 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Open **`http://127.0.0.1:8000/`** in your browser for live telemetry, **`/playground`** for an interactive multi-API tester, and **`/connect`** for coding-agent setup snippets (Claude Code, Codex, OpenCode, etc.). Pass `--no-webui` for an API-only server.
+Open **`http://127.0.0.1:8000/`** in your browser for live telemetry, **`/playground`** to test every API interactively, and **`/connect`** for ready-to-paste coding-agent configs. Pass `--no-webui` for an API-only server.
+
+---
+
+## What Makes `warp34` Great
+
+- **Fastest Qwen hybrid inference on consumer GPUs** — Beats `vLLM`, `SGLang`, and `llama.cpp` via purpose-built CUDA kernels, shared-weight `W4A8` prefill on RTX 30/40-series (zero extra weight VRAM), and lossless `MTP-3` / `DFlash2` speculation that composes cleanly with prefix caching and multi-GPU.
+- **Fit Vision, `MTP-3`, `128K` context, and LoRA on one card** — Pair our [optimized `HGPTQ` & `W2.6-RCO` checkpoints](https://huggingface.co/nchapman/models) with built-in 4-bit TurboQuant KV (`tq4`, 3.07× compression) so you never have to trade off context length, vision, or model size.
+- **Zero-config VRAM tuning** — Just run `warp34 serve <model>`. The planner automatically maximizes context (up to `256K` / `262,144` tokens), selects the right KV format, and balances hot experts against context on tiered MoE models while preserving safe headroom.
+- **Run 180B `Qwen3.8-Flash-Next` on 1–2 consumer GPUs** — Streams n-gram tables from disk via `mmap` (`51 GB` FP8 / `~14 GB` `lut4-gptq`), caches hot experts in VRAM, prefetches cold experts over PCIe, and evaluates misses on a 0-ULP AVX-512/AVX2 CPU bridge—reaching **`66 tok/s`** on `1× 24 GB` and **`107 tok/s`** on `2× 24 GB` (`W2.6-RCO` + `MTP-3`).
+- **One server for every API & coding agent** — Drop-in OpenAI Chat, OpenAI Responses, and Anthropic Messages APIs (with streaming `<think>` reasoning, tool calls, and `<think>`-aware XGrammar structured outputs), plus an embedded web dashboard, API Playground, and `/connect` agent setup guide.
+- **Single-pass classification & hot-swappable LoRAs** — Score up to 64 structured questions in one prefill (`0` decode tokens) via `/v1/systemone` & `/v1/decisions`, route up to **62 concurrent LoRA adapters** (`--lora-modules`), and scale across `2–4×` GPUs (`--tp 2` / `--tp 4`) without NCCL or `--ipc=host`.
+
+---
+
+## Pick a Model for Your GPU
+
+Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapman/models) hosts Hadamard-rotated `W4A16-HGPTQ` and mixed-precision `W2.6A16-HGPTQ-RCO` checkpoints tuned specifically for `warp34`. Every row below runs with zero manual KV/memory flags—just pass the model ID to `warp34 serve` (add `--speculative mtp` to enable `MTP-3`):
+
+| GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint @ `128K tq4` | Why pick it |
+|---|---|---:|---|
+| **8 GB** *(RTX 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` *(~935 MiB free w/ LoRA)* | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` decode w/ MTP) |
+| **12 GB** *(RTX 3060 / 4070)* | `Qwen3.5-9B-W4A16-HGPTQ` *(4.00 bpw)* | `8.6 GiB` *(~2.4 GiB free w/ LoRA)* | Best quality on 12 GB (`140.5 tok/s` w/ MTP); alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`10.6 GiB` @ `64K tq4_all`) |
+| **16 GB** *(RTX 4060 Ti / 4080)* | `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` *(2.62 bpw)* | `14.6 GiB` *(~221 MiB free w/ LoRA)* | Fast MoE pick (`190.8 tok/s` w/ MTP); dense alt: `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (`14.6 GiB`, `48.5 tok/s` w/ MTP) |
+| **1× 24 GB** *(RTX 3090 / 4090)* | `Qwen3.8-27B-W4A16-HGPTQ` or `Qwen3.6-35B-A3B-W4A16-HGPTQ` | `~19–21 GiB` | Full `W4` quality + Vision + `MTP-3`/`DFlash2` (`128K–256K`); or `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`19.0 GiB`, `66 tok/s` w/ `MTP-3`) |
+| **2× 24 GB** *(TP=2)* | `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` | `20.8 GiB/GPU` | Flagship 180B MoE + `128K–256K` ctx + `MTP-3` (`107 tok/s` auto-fit; up to `131.6 tok/s` on a dedicated headless GPU) |
+
+*Table throughput numbers are single-stream `MTP-3` decode measurements (`Flash-Next` on `1–2× RTX 3090 Ti`); actual speed scales with GPU memory bandwidth. Standard upstream `FP16`/`BF16`, `GPTQ`, `AWQ`, `AutoRound`, and `compressed-tensors` Qwen checkpoints also work out of the box—see [`docs/MODELS.md`](docs/MODELS.md) and [`docs/HGPTQ.md`](docs/HGPTQ.md).*
+
+---
+
+## APIs & Coding Agents
+
+A single `warp34 serve` instance speaks all four API families simultaneously, with hybrid KV + recurrent-state prefix caching shared across requests:
+
+| Protocol | Endpoints | Highlights |
+|---|---|---|
+| **OpenAI Chat & Completions** | `POST /v1/chat/completions`, `/v1/completions` | Streaming SSE, tool calling, `reasoning_effort`, XGrammar `response_format` (JSON Schema / Regex / CFG), `top_logprobs` |
+| **OpenAI Responses** | `POST /v1/responses`, `GET/POST .../cancel` | Stateful multi-turn chaining, streaming `reasoning_text` & `function_call` deltas, structured outputs |
+| **Anthropic Messages** | `POST /v1/messages`, `/v1/messages/count_tokens` | Native streaming `thinking` + `tool_use` blocks; strips Claude Code billing headers so prefix caches stay warm |
+| **Decision APIs** | `POST /v1/systemone`, `/v1/decisions` | Single-prefill (`0` output tokens) calibrated probabilities for `noul`, `choice`, and `score` questions (`GLiDE`, `d3`, or any Qwen model) |
+| **UI & Observability** | `GET /`, `/playground`, `/connect`, `/metrics` | Embedded dashboard, multi-API Playground, agent config generator, and Prometheus metrics |
+
+### Connect your coding agent
+
+Open **`http://127.0.0.1:8000/connect`** while `warp34 serve` is running for copy-paste configs tailored to your active model and context window (**Claude Code, Codex CLI, OpenCode, Pi, Aider, and Python/TS SDKs**).
+
+For example, to point **Claude Code** directly at your local `warp34` server:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
+ANTHROPIC_AUTH_TOKEN=warp34 \
+claude --model "nchapman/Qwen3.5-9B-W4A16-HGPTQ"
+```
 
 ---
 
 ## Common Recipes
 
 > The examples below assume `warp34` is on your `PATH` (e.g., `export PATH="$PWD/target/release:$PATH"` after building from source, or replace `warp34` with `docker run --rm --gpus '"device=0"' ... ghcr.io/nchapman/warp34:dev`).
-
-### Interactive terminal chat & benchmarking
-
-```sh
-# Multi-turn terminal REPL (omit --prompt for interactive mode)
-warp34 chat nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
-
-# One-off generation
-warp34 generate nchapman/Qwen3.5-4B-W4A16-HGPTQ -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6
-
-# Prefill + decode benchmark with a realistic coding prompt
-warp34 bench nchapman/Qwen3.8-27B-W4A16-HGPTQ \
-  --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ \
-  --prompt-len 512 --gen-len 128 --realistic-prompt
-```
 
 ### Speculative decoding & multi-GPU serving
 
@@ -119,21 +131,39 @@ warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO \
   --speculative mtp --tp 2
 ```
 
-### Multi-LoRA & API authentication
+### Hot-swappable Multi-LoRA
+
+Load up to 62 PEFT LoRA adapters alongside the base model and select any adapter per request by passing `"model": "<name>"`:
+
+```sh
+warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
+  --lora-modules reviewer=org/my-lora-adapter \
+  --speculative mtp
+```
+
+*(Replace `org/my-lora-adapter` with any compatible Hugging Face repo or local adapter directory.)*
+
+### API authentication & concurrency limits
 
 ```sh
 export WARP34_API_KEY="your-secret-key"
 warp34 serve nchapman/Qwen3.5-9B-W4A16-HGPTQ \
-  --lora-modules reviewer=org/my-lora-adapter \
   --api-key-env WARP34_API_KEY \
   --max-num-seqs 8 -c 64k
 ```
 
-Clients authenticate with `Authorization: Bearer <key>` or `x-api-key: <key>`, and select the adapter by passing `"model": "reviewer"` (replace `org/my-lora-adapter` with any compatible Hugging Face repo or local adapter path).
+Clients authenticate with `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+### Interactive terminal chat
+
+```sh
+# Multi-turn terminal REPL (pass -p "..." for a single turn)
+warp34 chat nchapman/Qwen3.5-9B-W4A16-HGPTQ --speculative mtp
+```
 
 ### Zero-decode Decision API (`/v1/systemone`, `/v1/decisions`)
 
-Evaluate up to 64 boolean (`noul`), categorical (`choice`), or rubric (`score`) questions over shared context (and optional images) in a **single prefill pass with zero decode tokens**. Works on specialized `GLiDE` / `d3` checkpoints or any standard Qwen model:
+Evaluate up to 64 boolean (`noul`), categorical (`choice`), or rubric (`score`) questions over shared context (and optional images) in a **single prefill pass with zero decode tokens**. Works on specialized `GLiDE` / `d3` checkpoints (`96.9%` JevBench, `100%` MultiQ) or any standard Qwen model:
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/systemone \
@@ -204,14 +234,14 @@ Images are published to `ghcr.io/nchapman/warp34` on container-relevant pushes t
 | **Qwen3.6-35B-A3B** | Decode Plain / `MTP-3` | `205` / `429` | — | `262` / `553` | `315` / `672` |
 | **Qwen3.8-Flash-Next** | Serving `MTP-3` (`W4` / `W2.6-RCO`) | `45` / `66 tok/s` | `58` / — | `73` / `107 tok/s` | `117` / — |
 
-*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full A100 (`sm_80`), `TP=4`, and head-to-head numbers vs. `vLLM`, `SGLang`, and `llama.cpp` are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
+*Prefill and `9B` decode rows are end-to-end HTTP serving p50s (`benchmarks/perf`; `9B` and `27B` `TP=2` prefill use `FP16` KV, while `27B` `TP=1` prefill, `Flash-Next`, and `warp34 bench` rows use `TQ4` KV). `27B`/`35B` decode rows are `warp34 bench` peak acceptance (realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full head-to-head numbers vs. `vLLM`, `SGLang`, and `llama.cpp` are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
 
 ---
 
 ## Scope & Limitations
 
 - **Qwen hybrid family only:** Built for Qwen 3.5 / 3.6 / 3.8, `Qwen3.8-Flash-Next` (`qwen4_exp`), and `GLiDE`/`d3` decision models. If you need Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
-- **Hardware & OS:** Linux `x86_64` with NVIDIA `sm_80` (A100), `sm_86` (RTX 30-series), or `sm_89` (RTX 40-series) GPUs. No macOS, Windows, AMD ROCm, or pre-Ampere (`sm_75` and older) support.
+- **Hardware & OS:** Linux `x86_64` with NVIDIA RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), or A100 (`sm_80`) GPUs. No macOS, Windows, AMD ROCm, or pre-Ampere (`sm_75` and older) support.
 - **Single-node scaling:** Supports `TP=1`, `TP=2`, and `TP=4` on one machine; multi-node distributed inference is out of scope.
 
 ---
