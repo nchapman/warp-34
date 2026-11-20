@@ -323,9 +323,34 @@ pub(crate) struct Runtime {
 }
 impl Runtime {
     pub fn new(stream: &crate::cuda::CudaStream) -> crate::cuda::Result<Arc<Self>> {
+        Self::new_for_ep(stream, 0, 1)
+    }
+    /// Creates a hybrid CPU+GPU decode+prefill worker pool for `ep_rank` of `ep_size`.
+    /// When `ep_size > 1`, physical worker cores are partitioned disjointly across ranks so
+    /// concurrent `TP=2 / EP=2` decode and prefill ranks never contend on the same CPU cores.
+    pub fn new_for_ep(
+        stream: &crate::cuda::CudaStream,
+        ep_rank: usize,
+        ep_size: usize,
+    ) -> crate::cuda::Result<Arc<Self>> {
         let device = stream.device_id;
         let failure = stream.host_failures.register();
-        let pool = Arc::new(Pool::new()?);
+        let pool = if ep_size <= 1 {
+            Arc::new(Pool::new()?)
+        } else {
+            let all_cpus = detect_worker_cpus();
+            let ep_rank = ep_rank.min(ep_size - 1);
+            let rank_cpus = if all_cpus.len() >= ep_size {
+                let base = all_cpus.len() / ep_size;
+                let rem = all_cpus.len() % ep_size;
+                let start = ep_rank * base + ep_rank.min(rem);
+                let len = base + usize::from(ep_rank < rem);
+                all_cpus[start..start + len].to_vec()
+            } else {
+                vec![all_cpus[ep_rank % all_cpus.len()]]
+            };
+            Arc::new(Pool::new_with_cpus(rank_cpus)?)
+        };
         let layers = Arc::new(Mutex::new(Vec::<Arc<Mailbox>>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let prefill_active = Arc::new(AtomicBool::new(false));
@@ -443,6 +468,7 @@ impl Runtime {
     /// a spinning decode responder thread or allocating mapped decode mailboxes.
     /// Physical worker cores are partitioned disjointly across `ep_size` ranks so
     /// concurrent `TP=2 / EP=2` prefill ranks never contend on the same CPU cores.
+    #[cfg(test)]
     pub fn new_prefill_only(
         device: i32,
         ep_rank: usize,

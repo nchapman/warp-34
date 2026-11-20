@@ -2128,6 +2128,67 @@ impl DFlash2Rank {
         graph.launch(&t.stream)
     }
 
+    /// Truncates a greedy DFlash2 draft path on offloaded (non-fully-resident) tiered MoE models
+    /// at the first position (`j >= 1`) whose top-k softmax probability falls below `min_conf`,
+    /// avoiding paying linear cold-expert verify latency on low-probability tail tokens.
+    fn truncate_path_by_topk_confidence(
+        path: &mut Vec<i32>,
+        topk_ids: &[i32],
+        topk_scores: &[f32],
+        top_k: usize,
+        max_draft: usize,
+        min_conf: f32,
+    ) {
+        if top_k == 0 || path.len() <= 1 {
+            return;
+        }
+        let limit = path.len().min(max_draft);
+        let mut keep = limit;
+        for (j, &chosen_id) in path.iter().take(limit).enumerate() {
+            let row_start = j * top_k;
+            let row_end = row_start + top_k;
+            if row_end > topk_ids.len() || row_end > topk_scores.len() {
+                break;
+            }
+            let ids_row = &topk_ids[row_start..row_end];
+            let scores_row = &topk_scores[row_start..row_end];
+            let max_s = scores_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max_s.is_finite() {
+                keep = j.max(1);
+                break;
+            }
+            let mut denom = 0.0f32;
+            let mut sel_s = f32::NEG_INFINITY;
+            for (&id, &s) in ids_row.iter().zip(scores_row.iter()) {
+                let e = (s - max_s).exp();
+                denom += e;
+                if id == chosen_id {
+                    sel_s = s;
+                }
+            }
+            let conf = if denom > 0.0 && sel_s.is_finite() {
+                (sel_s - max_s).exp() / denom
+            } else {
+                0.0
+            };
+            if j >= 1 && conf < min_conf {
+                keep = j;
+                break;
+            }
+        }
+        path.truncate(keep.max(1));
+    }
+
+    fn offloaded_moe_draft_confidence_gate(t: &Qwen3_5ModelRank) -> Option<(usize, f32)> {
+        t.tiered_moe.as_ref()?;
+        let local_experts = (t.cfg.num_experts / t.tp_size.max(1)).max(1);
+        if t.tiered_moe_hot_per_layer >= local_experts {
+            return None;
+        }
+        let min_conf = if t.tp_size >= 2 { 0.30 } else { 0.50 };
+        Some((6, min_conf))
+    }
+
     pub fn collect_select_greedy_host(
         &mut self,
         t: &Qwen3_5ModelRank,
@@ -2140,6 +2201,25 @@ impl DFlash2Rank {
             .copy_to_host(&mut path, &t.stream)?;
         if path.first().is_some_and(|&id| id < 0) {
             return Err(loader_err("nonfinite DFlash edges"));
+        }
+        if let Some((max_draft, min_conf)) = Self::offloaded_moe_draft_confidence_gate(t) {
+            let topk_elems = k * self.cfg.top_k;
+            let mut topk_ids = vec![0i32; topk_elems];
+            let mut topk_scores = vec![0.0f32; topk_elems];
+            self.graph_io
+                .topk_ids_dev
+                .copy_to_host(&mut topk_ids, &t.stream)?;
+            self.graph_io
+                .topk_scores_dev
+                .copy_to_host(&mut topk_scores, &t.stream)?;
+            Self::truncate_path_by_topk_confidence(
+                &mut path,
+                &topk_ids,
+                &topk_scores,
+                self.cfg.top_k,
+                max_draft,
+                min_conf,
+            );
         }
         self.proposal_anchor = Some(anchor);
         Ok(path)
@@ -2337,6 +2417,44 @@ impl DFlash2Rank {
             t.stream.synchronize()?;
             if path.first().is_some_and(|&id| id < 0) {
                 return Err(loader_err("nonfinite DFlash edges"));
+            }
+            if let Some((max_draft, min_conf)) = Self::offloaded_moe_draft_confidence_gate(t) {
+                let topk_elems = k * n;
+                let mut topk_ids = vec![0i32; topk_elems];
+                let mut topk_scores = vec![0.0f32; topk_elems];
+                check_rc(
+                    // SAFETY: ids and vals are valid device buffers of topk_elems * 4 bytes.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            topk_ids.as_mut_ptr().cast(),
+                            ids as *const c_void,
+                            topk_elems * 4,
+                            t.stream.handle,
+                        )
+                    },
+                    "DFlash greedy topk ids copy",
+                )?;
+                check_rc(
+                    // SAFETY: ids and vals are valid device buffers of topk_elems * 4 bytes.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            topk_scores.as_mut_ptr().cast(),
+                            vals as *const c_void,
+                            topk_elems * 4,
+                            t.stream.handle,
+                        )
+                    },
+                    "DFlash greedy topk scores copy",
+                )?;
+                t.stream.synchronize()?;
+                Self::truncate_path_by_topk_confidence(
+                    &mut path,
+                    &topk_ids,
+                    &topk_scores,
+                    n,
+                    max_draft,
+                    min_conf,
+                );
             }
             return Ok(path);
         }

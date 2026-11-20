@@ -1108,6 +1108,52 @@ mod serving_capacity_tests {
         )
         .expect("TP=2 tiered MoE + DFlash2 M=16 (19 slots) must fit on 40 GiB");
         assert!(slots_tiered_tp2 >= 19);
+        // C2b: TP=1 tiered MoE + DFlash2 (`dflash_min_state_slots = 11`) must reserve at
+        // least `dflash_min_state_slots` ahead of `RankTieredMoe` hot-expert placement even
+        // when `PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS` (8) or `requested_state_slots` is lower.
+        assert_eq!(
+            super::rank_capacity::tiered_moe_min_state_slots_for_budget(
+                1,
+                false,
+                2048,
+                8,
+                2_400 * mib,
+                11
+            ),
+            11
+        );
+        assert_eq!(
+            super::rank_capacity::tiered_moe_min_state_slots_for_budget(
+                1,
+                false,
+                8192,
+                20,
+                2_400 * mib,
+                11
+            ),
+            super::rank_capacity::PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+        );
+        let (slots_tiered_tp1, _, _) = evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            2048,
+            4 * gib,
+            256 * mib,
+            8 * mib,
+            24 * gib,
+            8,
+            false,
+            false,
+            true,
+            2_400 * mib,
+            11,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 (11 slots) must fit on 24 GiB even when requested_state_slots=8");
+        assert!(slots_tiered_tp1 >= 11);
 
         // C3: `plan_host_embed_with_serving_budget` accounts for double-buffered `PinnedUploadRing`
         // (2 * staging_bytes) in boot_need.

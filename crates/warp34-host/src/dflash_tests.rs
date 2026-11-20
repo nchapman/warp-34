@@ -12,6 +12,27 @@ fn bf16_to_f32(bits: u16) -> f32 {
 }
 
 #[test]
+fn dflash_confidence_gate_truncates_low_prob_tail_and_keeps_first_token() {
+    // 4 draft positions, top_k = 2:
+    // pos 0: low prob (0.27) -> kept because j == 0 is always retained
+    // pos 1: high prob (~0.95) -> kept
+    // pos 2: low prob (~0.27) -> truncated here (keeps len = 2)
+    // pos 3: high prob (~0.95) -> never reached
+    let mut path = vec![10, 20, 30, 40];
+    let topk_ids = vec![10, 11, 20, 21, 30, 31, 40, 41];
+    let topk_scores = vec![0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 5.0, 1.0];
+    DFlash2Rank::truncate_path_by_topk_confidence(&mut path, &topk_ids, &topk_scores, 2, 6, 0.45);
+    assert_eq!(path, vec![10, 20]);
+
+    // When all positions are high-confidence, caps at `max_draft`.
+    let mut high = vec![10, 20, 30, 40, 50, 60, 70];
+    let high_ids: Vec<i32> = high.iter().flat_map(|&id| [id, id + 1]).collect();
+    let high_scores: Vec<f32> = (0..7).flat_map(|_| [5.0f32, 0.0f32]).collect();
+    DFlash2Rank::truncate_path_by_topk_confidence(&mut high, &high_ids, &high_scores, 2, 6, 0.45);
+    assert_eq!(high.len(), 6);
+}
+
+#[test]
 fn bf16_marlin_u4b8_and_hadamard_match_reference() {
     let dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();

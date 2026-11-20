@@ -322,11 +322,11 @@ Each row pits `warp34` against a dedicated single-model engine on the exact mode
 | Engine *(upstream HEAD)* | Specialty | Workload | Competitor | **`warp34`** | `warp34` lead |
 |---|---|---|---:|---:|---:|
 | **[`ninfer-3090`](https://github.com/Don-Chad/ninfer-3090)** (`115dee6`) | `27B` on `1× 24 GB` *(MTP)* | `C=1` / `C=8` / agent / primed | `94.1` / `260.3` / `69.2` / `39.8` | **`109.1` / `417.2` / `96.0` / `109.6`** | **`+16%` – `2.75×`** |
-| **[`qwen38-flash-next-3090`](https://github.com/DominikBucko/qwen38-flash-next-3090)** (`10b24c2`) | `180B Flash-Next` W4 on `1× 24 GB` | chat / `6K` code / primed | `30.6` / `21.2` / `10.2` | **`39.3` / `23.2` / `37.1`** | **`+9%` – `3.64×`** |
-| **[`qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** (`4dca58f`) | `180B Flash-Next` W4 on `2× 24 GB` | chat / `6K` code / primed | `55.6` / `28.3` / `20.5` | **`76.3` / `41.5` / `78.5`** | **`+37%` – `3.83×`** |
-| **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` on `1× 24 GB` | chat / `6K` code / primed / agent | `52.0` / `15.3` / `51.2` / `47.9` | **`61.1` / `33.2` / `60.4` / `55.2`** | **`+15%` – `2.17×`** |
+| **[`qwen38-flash-next-3090`](https://github.com/DominikBucko/qwen38-flash-next-3090)** (`10b24c2`) | `180B Flash-Next` W4 on `1× 24 GB` | chat / `6K` code / primed | `30.6` / `21.2` / `10.2` | **`47.6` / `24.5` / `47.0`** | **`+16%` – `4.61×`** |
+| **[`qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** (`4dca58f`) | `180B Flash-Next` W4 on `2× 24 GB` | chat / `6K` code / primed | `55.6` / `28.3` / `20.5` | **`88.2` / `45.8` / `93.5`** | **`+59%` – `4.56×`** |
+| **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `2× 24 GB` *(OOTB)* | chat / prefill / `6K` code / agent | **`120.9`** / `37.1` / **`54.7`** / **`96.1`** | `88.2` / **`40.4`** / `45.8` / `85.0` | **`+9%` prefill; `-12%`–`-27%` decode** |
 
-*`ninfer-3090` runs its mixed Q4/Q5 `.ninfer` (`MTP-2`, `32K` KV) vs `warp34` `W4A16-HGPTQ` (`MTP-3`, `32K` `TQ4` KV); `qwen38-flash-next-{3090,2x3090}` compare W4 `Flash-Next` + `MTP-3` (`warp34` also passes strict agent replay at `33.7` / `57.5 tok/s`); `Strata` runs Unsloth `UD-IQ4_XS` GGUF (`lookup4`) vs `warp34` `W2.6A16-HGPTQ-RCO` (`MTP-3`).*
+*`ninfer-3090` runs its mixed Q4/Q5 `.ninfer` (`MTP-2`, `32K` KV) vs `warp34` `W4A16-HGPTQ` (`MTP-3`, `32K` `TQ4` KV); `qwen38-flash-next-{3090,2x3090}` compare W4 `Flash-Next` + `MTP-3` (`warp34` also passes strict agent replay at `43.1` / `85.0 tok/s`); `Strata v0.2.17` runs its out-of-the-box 2-GPU layer-split `UD-IQ4_XS` + `DFlash2` + `32K` resident KV streaming vs `warp34` fair 4-bit `W4A16-HGPTQ` (`TP=2`, `128K` resident `TQ4` KV, `MTP-3`).*
 
 ### Single-stream decode across Q4 models (`W4A16-HGPTQ` + `MTP-3`)
 
@@ -335,7 +335,7 @@ Each row pits `warp34` against a dedicated single-model engine on the exact mode
 | **`Qwen3.5-9B`** | `234 tok/s` | `253 tok/s` | `339 tok/s` | `369 tok/s` |
 | **`Qwen3.8-27B`** | `150 tok/s` | `162 tok/s` | `252 tok/s` | `246 tok/s` |
 | **`Qwen3.6-35B-A3B`** | `429 tok/s` | `512 tok/s` | `553 tok/s` | `672 tok/s` |
-| **`Qwen3.8-Flash-Next`** *(180B MoE)* | `45 tok/s` | `58 tok/s` | `73 tok/s` | `117 tok/s` |
+| **`Qwen3.8-Flash-Next`** *(180B MoE)* | `48 tok/s` | `58 tok/s` | `88 tok/s` | `117 tok/s` |
 
 *All rows use lossless `MTP-3` on `W4A16-HGPTQ` (Q4) checkpoints (`9B` and `Flash-Next` are end-to-end HTTP serving p50s; `27B` and `35B-A3B` are `warp34 bench` peak acceptance—realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full `27B`, `Flash-Next`, `DFlash2`, prefill, and `Plain` (non-MTP) campaigns are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
 

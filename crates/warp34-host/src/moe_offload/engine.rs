@@ -91,6 +91,7 @@ impl TieredMoeEngine {
         if let Some(ref mailbox) = cache.bridge_mailbox
             && num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
             && top_k <= TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
+            && (cache.ep_size <= 1 || num_tokens >= 2)
         {
             if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
                 cache.device_lru_dirty = true;
@@ -1317,7 +1318,7 @@ impl RankTieredMoe {
         {
             let mut bridge_runtime = None;
             let k_static = if k_hot >= crate::model::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
-                k_hot - 16
+                1
             } else {
                 k_hot
             };
@@ -1325,20 +1326,14 @@ impl RankTieredMoe {
                 if !store.layout().supports_cpu_bridge() {
                     continue;
                 }
-                if ep_size == 1 {
-                    if bridge_runtime.is_none() {
-                        bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
-                    }
-                    cache.bridge_runtime.clone_from(&bridge_runtime);
-                    cache.register_cpu_bridge_async(store, k_static, stream)?;
-                } else {
-                    if bridge_runtime.is_none() {
-                        bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_prefill_only(
-                            device_id, ep_rank, ep_size,
-                        )?);
-                    }
-                    cache.bridge_runtime.clone_from(&bridge_runtime);
+                if bridge_runtime.is_none() {
+                    bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_for_ep(
+                        stream, ep_rank, ep_size,
+                    )?);
                 }
+                cache.ep_size = ep_size;
+                cache.bridge_runtime.clone_from(&bridge_runtime);
+                cache.register_cpu_bridge_async(store, k_static, stream)?;
             }
         }
         stream.synchronize()?;

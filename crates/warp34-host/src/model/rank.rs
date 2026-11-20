@@ -1870,22 +1870,20 @@ impl PrePoolModelRank {
             0
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
-            let cap = if tp_size >= 2 {
-                if capacity.dflash_reserve_bytes > 0 {
-                    capacity.dflash_min_state_slots.max(14)
-                } else if capacity.native_mtp && default_pages.unwrap_or(0) < 2048 {
-                    16
-                } else {
-                    18
-                }
-            } else {
-                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
-            };
-            requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
+            tiered_moe_min_state_slots_for_budget(
+                tp_size,
+                capacity.native_mtp,
+                default_pages.unwrap_or(0),
+                requested_state_slots,
+                capacity.dflash_reserve_bytes,
+                capacity.dflash_min_state_slots,
+            )
         } else if tp_size >= 2 {
             requested_state_slots
         } else {
-            requested_state_slots.min(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
+            requested_state_slots
+                .min(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
+                .max(capacity.dflash_min_state_slots)
         };
 
         // 2. Plan and allocate `RankTieredMoe` (GPU `HotExpertCache` + double-buffered H2D
@@ -1994,9 +1992,11 @@ impl PrePoolModelRank {
                     20
                 }
                 .max(capacity.dflash_min_state_slots);
-                requested_state_slots.min(max_tiered_serving_slots)
-            } else {
                 requested_state_slots
+                    .min(max_tiered_serving_slots)
+                    .max(capacity.dflash_min_state_slots)
+            } else {
+                requested_state_slots.max(capacity.dflash_min_state_slots)
             };
         let (state_budget_free, state_budget_fixed, vision_reserve) =
             if capacity.state_slots.is_some() {
@@ -2051,8 +2051,14 @@ impl PrePoolModelRank {
         );
         if total_state_slots < capacity.dflash_min_state_slots {
             return Err(loader_err_msg(format!(
-                "insufficient memory for DFlash2: requires at least {} target state slots plus draft resident reserve; reduce KV capacity",
+                "insufficient memory for DFlash2: got {} target state slots (requires at least {} plus {:.2} GiB draft reserve; pool_free={:.2} GiB, fixed={:.2} GiB, kv={:.2} GiB, hot_per_layer={}); reduce KV capacity",
+                total_state_slots,
                 capacity.dflash_min_state_slots,
+                capacity.dflash_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                state_budget_free as f64 / (1024.0 * 1024.0 * 1024.0),
+                state_budget_fixed as f64 / (1024.0 * 1024.0 * 1024.0),
+                req_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                tiered_moe_hot_per_layer,
             )));
         }
         if rank == 0

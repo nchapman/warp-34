@@ -204,6 +204,11 @@ pub const TIERED_MOE_TP4_STAGE_RESERVE_SLOTS: usize = 256;
 pub const TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES: usize = 896 * 1024 * 1024;
 
 /// Fixed post-target VRAM cushion (`128 MiB`) on `TP=1` / `TP=2` in Plain mode (no `MTP`/`DFlash2`)
+/// Metadata + CUDA allocator rounding reserve for `RankTieredMoe` when `DFlash2` is active
+/// (where `dflash_reserve_bytes` replaces `post_pool_moe_reserve` and `StateBundlePool` enforces
+/// a hard `dflash_min_state_slots` floor immediately after `RankTieredMoe::load_for_rank`).
+pub const TIERED_MOE_DFLASH_METADATA_RESERVE_BYTES: usize = 384 * 1024 * 1024;
+
 /// for tiered-MoE slot-table metadata and graph capture slack beyond `base_headroom`.
 pub const TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES: usize = 128 * 1024 * 1024;
 
@@ -522,7 +527,9 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
         (TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes)
             .saturating_add(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES.max(dflash_reserve_bytes))
     } else if dflash_reserve_bytes > 0 {
-        (stage_slots_default * exp_bytes).saturating_add(dflash_reserve_bytes)
+        (stage_slots_default * exp_bytes)
+            .saturating_add(TIERED_MOE_DFLASH_METADATA_RESERVE_BYTES)
+            .saturating_add(dflash_reserve_bytes)
     } else {
         (stage_slots_default * exp_bytes).saturating_add(TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES)
     };
@@ -961,6 +968,32 @@ fn serving_live_overhead_bytes(cfg: &ModelConfig, tp_size: usize, marlin_ws_byte
         .saturating_add(AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES)
 }
 
+/// Shared state-slot floor reserved ahead of `RankTieredMoe` hot-expert placement so
+/// `rank.rs` allocation and `evaluate_serving_kv_candidate_budget` stay in lockstep.
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn tiered_moe_min_state_slots_for_budget(
+    tp_size: usize,
+    native_mtp: bool,
+    pages: usize,
+    requested_state_slots: usize,
+    dflash_reserve_bytes: usize,
+    dflash_min_state_slots: usize,
+) -> usize {
+    let cap = if tp_size >= 2 {
+        if dflash_reserve_bytes > 0 {
+            dflash_min_state_slots.max(14)
+        } else if native_mtp && pages < 2048 {
+            16
+        } else {
+            18
+        }
+    } else {
+        PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS.max(dflash_min_state_slots)
+    };
+    let floor = MIN_ACTIVE_STATE_SLOTS.max(dflash_min_state_slots);
+    requested_state_slots.clamp(floor, cap.max(floor))
+}
+
 #[cfg(any(test, feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_serving_kv_candidate_budget(
@@ -1066,20 +1099,14 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
             .saturating_add(live_overhead),
     )?;
     let req_kv_bytes = page_bytes.saturating_mul(pages);
-    let min_state_slots_for_moe = {
-        let cap = if tp_size >= 2 {
-            if dflash_reserve_bytes > 0 {
-                dflash_min_state_slots.max(14)
-            } else if native_mtp && pages < 2048 {
-                16
-            } else {
-                18
-            }
-        } else {
-            PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS.max(dflash_min_state_slots)
-        };
-        requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
-    };
+    let min_state_slots_for_moe = tiered_moe_min_state_slots_for_budget(
+        tp_size,
+        native_mtp,
+        pages,
+        requested_state_slots,
+        dflash_reserve_bytes,
+        dflash_min_state_slots,
+    );
     let (allocated_moe_bytes, post_pool_spec_or_moe_reserve, planned_hot_per_layer) =
         if cfg.uses_tiered_moe() {
             let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_options(
@@ -1123,9 +1150,11 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
             20
         }
         .max(dflash_min_state_slots);
-        requested_state_slots.min(max_tiered_serving_slots)
-    } else {
         requested_state_slots
+            .min(max_tiered_serving_slots)
+            .max(dflash_min_state_slots)
+    } else {
+        requested_state_slots.max(dflash_min_state_slots)
     };
     let base_reserved = required_headroom.saturating_add(req_kv_bytes);
     let target_min_slots = if !auto_fit_mode {
