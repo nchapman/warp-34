@@ -11,6 +11,10 @@ The [fastest](#performance) single-binary inference engine for **Qwen 3.5, 3.6, 
 
 Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), and A100 (`sm_80`) GPUs.
 
+![warp34 embedded web dashboard running Qwen3.8-27B-W4A16-HGPTQ with MTP-3 and 256K context on a single RTX 3090 Ti](docs/assets/dashboard.png)
+
+*Live telemetry from the embedded web dashboard (`http://127.0.0.1:8000/`): `Qwen3.8-27B-W4A16-HGPTQ` with `MTP-3` and `256K` `TQ4_ALL` context on a single 24 GB RTX 3090 Ti.*
+
 ---
 
 ## Quickstart
