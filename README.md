@@ -256,7 +256,6 @@ Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for bug r
 - **[`localai-org/vllm.cpp`](https://github.com/localai-org/vllm.cpp)** — Native CUDA C++ Gated DeltaNet (GDN) recurrence and chunked WY prefill kernel reference.
 - **[TurboQuant (`arXiv:2504.19874`)](https://arxiv.org/abs/2504.19874)** & **[`TheTom/llama-cpp-turboquant`](https://github.com/TheTom/llama-cpp-turboquant)** — Walsh-Hadamard + Beta Lloyd-Max 4-bit KV quantization method, block format, and fused attention kernels behind `TQ4`.
 - **[`DominikBucko/qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** & **[`Niko1221/Strata`](https://github.com/Niko1221/Strata)** — Tiered MoE offloading, hot/cold expert caching, and `Qwen3.8-Flash-Next` consumer-GPU serving reference designs.
-- **[DFlash (`arXiv:2602.06036`)](https://arxiv.org/abs/2602.06036)** — Block-parallel speculative drafting architecture behind `DFlash2`.
 
 ## License
 
