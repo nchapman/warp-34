@@ -1030,3 +1030,450 @@ fn linear_epilogue_crop_bias_in_place_and_validation() {
         }
     }
 }
+
+fn round_half_away_i8(v: f32) -> i8 {
+    let r = if v >= 0.0 {
+        (v + 0.5).floor()
+    } else {
+        (v - 0.5).ceil()
+    };
+    r.clamp(-127.0, 127.0) as i8
+}
+
+fn host_per_token_quant_i8(a_f16: &[u16], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut q = vec![0i8; m * k];
+    let mut scales = vec![0.0f32; m];
+    for row in 0..m {
+        let xr = &a_f16[row * k..(row + 1) * k];
+        let absmax = xr
+            .iter()
+            .map(|&bits| f16_to_f32(bits).abs())
+            .fold(0.0f32, f32::max)
+            .max(1e-10);
+        let inv = 127.0f32 / absmax;
+        scales[row] = absmax / 127.0f32;
+        for col in 0..k {
+            q[row * k + col] = round_half_away_i8(f16_to_f32(xr[col]) * inv);
+        }
+    }
+    (q, scales)
+}
+
+#[test]
+fn per_token_quant_i8_matches_ieee_round_half_away_and_zero_floor() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    for (m, k) in [(5usize, 256usize), (3usize, 37usize)] {
+        let mut x_f16 = vec![0u16; m * k];
+        for row in 0..m {
+            if row == 1 {
+                // All-zero row exercises 1e-10f absmax floor.
+                continue;
+            }
+            for col in 0..k {
+                let raw = if row == 2 && col < 4 {
+                    // Exact half-way tie values when absmax = 127.0 (`inv = 1.0`).
+                    match col {
+                        0 => 127.0,
+                        1 => -127.0,
+                        2 => 0.5,
+                        _ => -0.5,
+                    }
+                } else {
+                    let s = ((row * 31 + col * 17) % 113) as f32 - 56.0;
+                    s * 0.03125
+                };
+                x_f16[row * k + col] = f32_to_f16(raw);
+            }
+        }
+        let (exp_q, exp_s) = host_per_token_quant_i8(&x_f16, m, k);
+        let d_x = upload(&x_f16, &stream);
+        let d_q = DeviceBuffer::alloc(0, m * k).unwrap();
+        let d_s = DeviceBuffer::alloc(0, m * 4).unwrap();
+        // SAFETY: buffers match (m, k) extents.
+        let rc = unsafe {
+            ffi::warp34_per_token_quant_i8(
+                &ex,
+                d_x.addr() as *const c_void,
+                d_q.addr() as *mut c_void,
+                d_s.addr() as *mut f32,
+                m as i64,
+                k as i64,
+            )
+        };
+        assert_eq!(rc, 0, "per_token_quant_i8 m={m} k={k}");
+        let mut got_q = vec![0i8; m * k];
+        let mut got_s = vec![0.0f32; m];
+        d_q.copy_to_host(&mut got_q, &stream).unwrap();
+        d_s.copy_to_host(&mut got_s, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(got_q, exp_q, "quantized int8 mismatch for m={m} k={k}");
+        for r in 0..m {
+            let ds = (got_s[r] - exp_s[r]).abs();
+            assert!(
+                ds <= exp_s[r].abs() * 1e-6 + 1e-16,
+                "scale mismatch at row {r}: got {}, expected {}",
+                got_s[r],
+                exp_s[r]
+            );
+        }
+    }
+}
+
+#[test]
+fn marlin_w4a8_shared_k16_matches_exact_s8_reference_and_mixed_sign_scales() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    let scratch = DeviceBuffer::alloc(0, 8 * 1024 * 1024).unwrap();
+    let ex_s8 = stream.exec(scratch.addr(), scratch.len_bytes);
+    let ex_f16 = stream.exec(0, 0);
+
+    // Cover `{64, 256, 256}`, `{64, 128, 128}`, and Split-K `{128, 64, 128}` across
+    // g32, g64, g128, and channelwise (-1) with mixed positive & negative FP16 scales
+    // and full nibble extremes `q = 0 (-8)` .. `q = 15 (+7)`.
+    for (n, k, groups) in [
+        (256usize, 256usize, &[32usize, 64, 128, 256][..]),
+        (128usize, 256usize, &[32usize, 128][..]),
+        (64usize, 1024usize, &[32usize, 64, 128, 1024][..]),
+    ] {
+        for &group in groups {
+            let num_groups = k / group;
+            let mut packed = vec![0u32; n * (k / 8)];
+            let mut scales_nm = vec![0u16; n * num_groups];
+            let mut w_q = vec![0i8; n * k];
+            let mut w_s = vec![0.0f32; n * num_groups];
+            for row in 0..n {
+                for g in 0..num_groups {
+                    let sign = if (row * 5 + g * 3) % 2 == 0 {
+                        1.0f32
+                    } else {
+                        -1.0f32
+                    };
+                    let mag = (1 + (row * 7 + g * 11) % 5) as f32 / 128.0;
+                    let s_bits = f32_to_f16(sign * mag);
+                    scales_nm[row * num_groups + g] = s_bits;
+                    w_s[row * num_groups + g] = f16_to_f32(s_bits);
+                    for col in g * group..(g + 1) * group {
+                        let q = ((row * 73 + col * 31 + (row ^ col) * 13) ^ (col >> 2)) & 0xF;
+                        packed[row * (k / 8) + col / 8] |= (q as u32) << ((col % 8) * 4);
+                        w_q[row * k + col] = (q as i32 - 8) as i8;
+                    }
+                }
+            }
+            let d_packed = upload(&packed, &stream);
+            let d_repacked = DeviceBuffer::alloc(0, packed.len() * 4).unwrap();
+            let perm_group = if group == k && group > 128 { 0 } else { group };
+            let d_scales = upload(
+                &marlin_permute_scales_from_n_major(&scales_nm, k, n, perm_group),
+                &stream,
+            );
+            // SAFETY: packed and repacked buffers match `(k, n)`.
+            let rc = unsafe {
+                ffi::warp34_marlin_repack_int4(
+                    &ex_f16,
+                    d_packed.addr() as *const u32,
+                    d_repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            };
+            assert_eq!(rc, 0);
+
+            let gb = if group == k && group > 128 {
+                -1
+            } else {
+                (group / 16) as i32
+            };
+            for m in [16usize, 20, 48, 64, 100] {
+                let label = format!("s8u4_shared N={n} K={k} group={group} M={m}");
+                let a: Vec<u16> = (0..m * k)
+                    .map(|i| f32_to_f16(((i * 19 + (i / k) * 11) % 83) as f32 / 64.0 - 0.64))
+                    .collect();
+                let (a_q, a_s) = host_per_token_quant_i8(&a, m, k);
+                let mut exact_s8_ref = vec![0.0f32; m * n];
+                let mut fp16_ref = vec![0.0f32; m * n];
+                for r in 0..m {
+                    for c in 0..n {
+                        let mut acc_s8 = 0.0f32;
+                        let mut acc_f16 = 0.0f32;
+                        for g in 0..num_groups {
+                            let mut grp_i32 = 0i32;
+                            let ws = w_s[c * num_groups + g];
+                            for j in g * group..(g + 1) * group {
+                                grp_i32 += i32::from(a_q[r * k + j]) * i32::from(w_q[c * k + j]);
+                                acc_f16 +=
+                                    f16_to_f32(a[r * k + j]) * (f32::from(w_q[c * k + j]) * ws);
+                            }
+                            acc_s8 += (grp_i32 as f32) * ws;
+                        }
+                        exact_s8_ref[r * n + c] = acc_s8 * a_s[r];
+                        fp16_ref[r * n + c] = acc_f16;
+                    }
+                }
+
+                let d_a = upload(&a, &stream);
+                let d_out = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+                workspace.zero_async(&stream).unwrap();
+                // SAFETY: all device buffers and scratch workspace match `(m, n, k)`.
+                let rc = unsafe {
+                    ffi::warp34_marlin_gemm_s8u4_shared(
+                        &ex_s8,
+                        d_a.addr() as *const c_void,
+                        d_repacked.addr() as *const c_void,
+                        d_scales.addr() as *const c_void,
+                        d_out.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        gb,
+                    )
+                };
+                assert_eq!(rc, 0, "{label}");
+                let mut got = vec![0u16; m * n];
+                d_out.copy_to_host(&mut got, &stream).unwrap();
+                stream.synchronize().unwrap();
+                assert_close(&got, &exact_s8_ref, &label);
+
+                let mut err_vs_f16 = 0.0f64;
+                let mut nrg_f16 = 0.0f64;
+                for (&g_bits, &ref_v) in got.iter().zip(fp16_ref.iter()) {
+                    let dv = f64::from(f16_to_f32(g_bits) - ref_v);
+                    err_vs_f16 += dv * dv;
+                    nrg_f16 += f64::from(ref_v) * f64::from(ref_v);
+                }
+                let rel_vs_f16 = (err_vs_f16 / nrg_f16.max(1e-30)).sqrt();
+                assert!(
+                    rel_vs_f16 < 0.012,
+                    "{label}: W4A8 vs W4A16 rel_l2={rel_vs_f16} exceeded 1.2%"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn marlin_w4a8_prefill_flag_gates_m64_and_protects_overlapping_scratch() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).unwrap();
+    let props = dev.props().unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let (n, k, group) = (128usize, 256usize, 128usize);
+    let w = weights(n, k, group, 4, false, 7);
+    let d_packed = upload(&w.packed, &stream);
+    let d_repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+    let d_scales = upload(
+        &marlin_permute_scales_from_n_major(&w.scales, k, n, group),
+        &stream,
+    );
+    let ex0 = stream.exec(0, 0);
+    assert_eq!(
+        // SAFETY: valid device buffers.
+        unsafe {
+            ffi::warp34_marlin_repack_int4(
+                &ex0,
+                d_packed.addr() as *const u32,
+                d_repacked.addr() as *mut u32,
+                k as i64,
+                n as i64,
+            )
+        },
+        0
+    );
+
+    let arena = DeviceBuffer::alloc(0, 4 * 1024 * 1024).unwrap();
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+
+    // 1. M = 64 with ALLOW_W4A8_PREFILL must remain 0-ULP identical to W4A16 (decode/verify/micro-chunk invariant).
+    let m_small = 64usize;
+    let a_small: Vec<u16> = (0..m_small * k)
+        .map(|i| f32_to_f16(((i * 23 + 5) % 67) as f32 / 64.0 - 0.5))
+        .collect();
+    let d_a_small = upload(&a_small, &stream);
+    let d_ref_small = DeviceBuffer::alloc(0, m_small * n * 2).unwrap();
+    let d_got_small = DeviceBuffer::alloc(0, m_small * n * 2).unwrap();
+    let mut ex_allow = stream.exec(arena.addr(), arena.len_bytes);
+    ex_allow.flags = ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL;
+    workspace.zero_async(&stream).unwrap();
+    assert_eq!(
+        // SAFETY: valid device buffers.
+        unsafe {
+            ffi::warp34_marlin_gemm_f16u4(
+                &ex0,
+                d_a_small.addr() as *const c_void,
+                d_repacked.addr() as *const c_void,
+                d_scales.addr() as *const c_void,
+                d_ref_small.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m_small as i64,
+                n as i64,
+                k as i64,
+                65536,
+                8,
+            )
+        },
+        0
+    );
+    workspace.zero_async(&stream).unwrap();
+    assert_eq!(
+        // SAFETY: valid device buffers.
+        unsafe {
+            ffi::warp34_marlin_gemm_f16u4(
+                &ex_allow,
+                d_a_small.addr() as *const c_void,
+                d_repacked.addr() as *const c_void,
+                d_scales.addr() as *const c_void,
+                d_got_small.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m_small as i64,
+                n as i64,
+                k as i64,
+                65536,
+                8,
+            )
+        },
+        0
+    );
+    let mut ref_small = vec![0u16; m_small * n];
+    let mut got_small = vec![0u16; m_small * n];
+    d_ref_small.copy_to_host(&mut ref_small, &stream).unwrap();
+    d_got_small.copy_to_host(&mut got_small, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        got_small, ref_small,
+        "M=64 must stay 0-ULP W4A16 even when ALLOW_W4A8_PREFILL is set"
+    );
+
+    // 2. M = 164 (128 W4A8 + 36 W4A16 tail on sm_86/sm_89) with `A` placed AT `arena.addr()`
+    //    (exercising in-scratch overlap protection) and `flags = 0` staying 0-ULP W4A16.
+    let m_mixed = 164usize;
+    let a_mixed: Vec<u16> = (0..m_mixed * k)
+        .map(|i| f32_to_f16(((i * 29 + 3) % 71) as f32 / 64.0 - 0.55))
+        .collect();
+    arena.copy_from_host(&a_mixed, &stream).unwrap();
+    let d_ref_mixed = DeviceBuffer::alloc(0, m_mixed * n * 2).unwrap();
+    let d_noflag_mixed = DeviceBuffer::alloc(0, m_mixed * n * 2).unwrap();
+    let d_flag_mixed = DeviceBuffer::alloc(0, m_mixed * n * 2).unwrap();
+    let ex_noflag = stream.exec(arena.addr(), arena.len_bytes);
+    workspace.zero_async(&stream).unwrap();
+    assert_eq!(
+        // SAFETY: valid device buffers.
+        unsafe {
+            ffi::warp34_marlin_gemm_f16u4(
+                &ex0,
+                arena.addr() as *const c_void,
+                d_repacked.addr() as *const c_void,
+                d_scales.addr() as *const c_void,
+                d_ref_mixed.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m_mixed as i64,
+                n as i64,
+                k as i64,
+                65536,
+                8,
+            )
+        },
+        0
+    );
+    workspace.zero_async(&stream).unwrap();
+    assert_eq!(
+        // SAFETY: valid device buffers.
+        unsafe {
+            ffi::warp34_marlin_gemm_f16u4(
+                &ex_noflag,
+                arena.addr() as *const c_void,
+                d_repacked.addr() as *const c_void,
+                d_scales.addr() as *const c_void,
+                d_noflag_mixed.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m_mixed as i64,
+                n as i64,
+                k as i64,
+                65536,
+                8,
+            )
+        },
+        0
+    );
+    workspace.zero_async(&stream).unwrap();
+    assert_eq!(
+        // SAFETY: valid device buffers; `arena.addr()` overlaps `ex_allow.scratch_ptr`.
+        unsafe {
+            ffi::warp34_marlin_gemm_f16u4(
+                &ex_allow,
+                arena.addr() as *const c_void,
+                d_repacked.addr() as *const c_void,
+                d_scales.addr() as *const c_void,
+                d_flag_mixed.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m_mixed as i64,
+                n as i64,
+                k as i64,
+                65536,
+                8,
+            )
+        },
+        0
+    );
+    let mut a_after = vec![0u16; m_mixed * k];
+    let mut ref_mixed = vec![0u16; m_mixed * n];
+    let mut noflag_mixed = vec![0u16; m_mixed * n];
+    let mut flag_mixed = vec![0u16; m_mixed * n];
+    arena.copy_to_host(&mut a_after, &stream).unwrap();
+    d_ref_mixed.copy_to_host(&mut ref_mixed, &stream).unwrap();
+    d_noflag_mixed
+        .copy_to_host(&mut noflag_mixed, &stream)
+        .unwrap();
+    d_flag_mixed.copy_to_host(&mut flag_mixed, &stream).unwrap();
+    stream.synchronize().unwrap();
+
+    assert_eq!(
+        a_after, a_mixed,
+        "A inside scratch_ptr must never be clobbered"
+    );
+    assert_eq!(noflag_mixed, ref_mixed, "flags=0 must stay 0-ULP W4A16");
+    // Tail rows 128..164 must remain 0-ULP W4A16 on all architectures.
+    assert_eq!(&flag_mixed[128 * n..], &ref_mixed[128 * n..]);
+    if props.compute_major == 8 && props.compute_minor >= 6 {
+        let d_s8_128 = DeviceBuffer::alloc(0, 128 * n * 2).unwrap();
+        workspace.zero_async(&stream).unwrap();
+        assert_eq!(
+            // SAFETY: valid device buffers.
+            unsafe {
+                ffi::warp34_marlin_gemm_s8u4_shared(
+                    &ex_allow,
+                    arena.addr() as *const c_void,
+                    d_repacked.addr() as *const c_void,
+                    d_scales.addr() as *const c_void,
+                    d_s8_128.addr() as *mut c_void,
+                    workspace.addr() as *mut i32,
+                    128,
+                    n as i64,
+                    k as i64,
+                    65536,
+                    8,
+                )
+            },
+            0
+        );
+        let mut s8_128 = vec![0u16; 128 * n];
+        d_s8_128.copy_to_host(&mut s8_128, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            &flag_mixed[..128 * n],
+            &s8_128[..],
+            "sm_86/sm_89 prefill bulk rows 0..128 must execute shared W4A8"
+        );
+    } else {
+        assert_eq!(
+            flag_mixed, ref_mixed,
+            "sm_80 must auto-bypass W4A8 and stay 0-ULP W4A16"
+        );
+    }
+}

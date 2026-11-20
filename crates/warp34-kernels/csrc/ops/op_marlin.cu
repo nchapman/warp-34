@@ -14,6 +14,7 @@
 namespace marlin {
 static constexpr int kF16 = vllm::ST_ID_F16;
 static constexpr int kBF16 = vllm::ST_ID_BF16;
+static constexpr int kS8 = vllm::ST_ID_S8;
 static constexpr int kU2B2 = vllm::ST_ID_U2B2;
 static constexpr int kU4 = vllm::ST_ID_U4;
 static constexpr int kU4B8 = vllm::ST_ID_U4B8;
@@ -296,6 +297,105 @@ __global__ void marlin_quantize_f16_u4b8_kernel(
     }
 }
 
+__device__ __forceinline__ uint32_t quant_f32_to_u8_bits(float x, float inv) {
+    float v = x * inv;
+    float r = v >= 0.0f ? floorf(v + 0.5f) : ceilf(v - 0.5f);
+    r = fminf(fmaxf(r, -127.0f), 127.0f);
+    return static_cast<uint32_t>(static_cast<int32_t>(r)) & 0xFFu;
+}
+
+// Dynamic per-token FP16 -> INT8 symmetric activation quantizer (`[-127, 127]`):
+//   absmax      = max(max_j |x[row, j]|, 1e-10f)
+//   scales[row] = __fdiv_rn(absmax, 127.0f)
+//   q[row, j]   = round_half_away(x[row, j] * __fdiv_rn(127.0f, absmax))
+__global__ __launch_bounds__(256) void per_token_quant_i8_kernel(
+    const __half* __restrict__ x, int8_t* __restrict__ q,
+    float* __restrict__ scales, int k, bool vec8) {
+    const int row = blockIdx.x;
+    const __half* xr = x + (size_t)row * (size_t)k;
+    int8_t* qr = q + (size_t)row * (size_t)k;
+
+    float absmax = 0.0f;
+    if (vec8) {
+        const int vec_k = k >> 3;
+        const int4* xr4 = reinterpret_cast<const int4*>(xr);
+        for (int idx = threadIdx.x; idx < vec_k; idx += blockDim.x) {
+            int4 raw = xr4[idx];
+            const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                float2 f2 = __half22float2(h2[u]);
+                absmax = fmaxf(absmax, fmaxf(fabsf(f2.x), fabsf(f2.y)));
+            }
+        }
+    } else {
+        for (int idx = threadIdx.x; idx < k; idx += blockDim.x) {
+            absmax = fmaxf(absmax, fabsf(__half2float(xr[idx])));
+        }
+    }
+
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        absmax = fmaxf(absmax, __shfl_xor_sync(0xffffffffu, absmax, mask));
+    }
+    __shared__ float warp_max[8];
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (lane == 0) {
+        warp_max[warp_id] = absmax;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane < (blockDim.x >> 5)) ? warp_max[lane] : 0.0f;
+        #pragma unroll
+        for (int mask = 4; mask > 0; mask >>= 1) {
+            v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, mask));
+        }
+        if (lane == 0) {
+            float safe_max = fmaxf(v, 1e-10f);
+            warp_max[0] = safe_max;
+            scales[row] = __fdiv_rn(safe_max, 127.0f);
+        }
+    }
+    __syncthreads();
+
+    const float inv = __fdiv_rn(127.0f, warp_max[0]);
+    if (vec8) {
+        const int vec_k = k >> 3;
+        const int4* xr4 = reinterpret_cast<const int4*>(xr);
+        uint2* qr2 = reinterpret_cast<uint2*>(qr);
+        for (int idx = threadIdx.x; idx < vec_k; idx += blockDim.x) {
+            int4 raw = xr4[idx];
+            const __half2* h2 = reinterpret_cast<const __half2*>(&raw);
+            float2 f0 = __half22float2(h2[0]);
+            float2 f1 = __half22float2(h2[1]);
+            float2 f2 = __half22float2(h2[2]);
+            float2 f3 = __half22float2(h2[3]);
+            uint32_t lo = quant_f32_to_u8_bits(f0.x, inv) |
+                          (quant_f32_to_u8_bits(f0.y, inv) << 8) |
+                          (quant_f32_to_u8_bits(f1.x, inv) << 16) |
+                          (quant_f32_to_u8_bits(f1.y, inv) << 24);
+            uint32_t hi = quant_f32_to_u8_bits(f2.x, inv) |
+                          (quant_f32_to_u8_bits(f2.y, inv) << 8) |
+                          (quant_f32_to_u8_bits(f3.x, inv) << 16) |
+                          (quant_f32_to_u8_bits(f3.y, inv) << 24);
+            qr2[idx] = make_uint2(lo, hi);
+        }
+    } else {
+        for (int idx = threadIdx.x; idx < k; idx += blockDim.x) {
+            qr[idx] = static_cast<int8_t>(quant_f32_to_u8_bits(__half2float(xr[idx]), inv));
+        }
+    }
+}
+
+static inline size_t align_up_256(size_t v) {
+    return (v + 255u) & ~size_t(255u);
+}
+
+static inline uintptr_t align_ptr_256(uintptr_t p) {
+    return (p + 255u) & ~uintptr_t(255u);
+}
+
 typedef struct {
     int thread_k;
     int thread_n;
@@ -326,12 +426,14 @@ static int get_zp_cache_size(thread_config_t const& th_config, int group_size,
 }
 
 static int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_blocks,
-                                 int num_bits, int group_size, bool has_zp, int stages) {
+                                 int num_bits, int group_size, bool has_zp, int stages,
+                                 bool is_a_8bit = false) {
     int pack_factor = 32 / num_bits;
     int tb_k = th_config.thread_k;
     int tb_n = th_config.thread_n;
     int tb_m = thread_m_blocks * 16;
-    int sh_a_size = stages * (tb_m * tb_k) * 2;
+    int sh_a_s_size = is_a_8bit ? (64 * thread_m_blocks) : 0;
+    int sh_a_size = stages * (tb_m * tb_k) * (is_a_8bit ? 1 : 2);
     int sh_b_size = stages * (tb_k * tb_n / pack_factor) * 4;
     int sh_red_size = tb_m * (tb_n + 8) * 2;
     int sh_bias_size = tb_n * 2;
@@ -339,12 +441,13 @@ static int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_
     tmp_size = std::max(std::max(sh_b_size, sh_red_size), tmp_size);
     int sh_s_size = get_scales_cache_size(th_config, group_size, stages);
     int sh_zp_size = get_zp_cache_size(th_config, group_size, num_bits, has_zp, stages);
-    return tmp_size + sh_a_size + sh_s_size + sh_zp_size;
+    return sh_a_s_size + tmp_size + sh_a_size + sh_s_size + sh_zp_size;
 }
 
 static bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
                             int prob_m, int prob_n, int prob_k, int num_bits,
-                            int group_size, bool has_zp, int stages, int max_shared_mem) {
+                            int group_size, bool has_zp, int stages, int max_shared_mem,
+                            bool is_a_8bit = false) {
     (void)prob_m;
     if (th_config.thread_k == -1 || th_config.thread_n == -1 || th_config.num_threads == -1) {
         return false;
@@ -359,7 +462,7 @@ static bool is_valid_config(thread_config_t const& th_config, int thread_m_block
         return false;
     }
     int cache_size = get_kernel_cache_size(
-        th_config, thread_m_blocks, num_bits, group_size, has_zp, stages);
+        th_config, thread_m_blocks, num_bits, group_size, has_zp, stages, is_a_8bit);
     return cache_size <= max_shared_mem;
 }
 
@@ -395,6 +498,52 @@ static int warmup_all_specializations_impl(int max_shared_mem);
     MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 4, false, GBX)
 
 #define MARLIN_CASES_15(BTYPE, GBX) MARLIN_CASES_15_ATYPE(marlin::kF16, BTYPE, GBX)
+
+#define MARLIN_CASE_S8U4_SHARED(T_K, T_N, THR, M_BLOCKS, GBX)                   \
+    if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&           \
+        th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&      \
+        !m_block_size_8) {                                                      \
+        return &Marlin<marlin::kS8, marlin::kU4B8, marlin::kF16, marlin::kF16,  \
+                       (THR), (M_BLOCKS), (T_N) / 16, (T_K) / 16, false, 4,     \
+                       (GBX), false, true>;                                     \
+    }
+
+#define MARLIN_CASES_12_S8U4_SHARED(GBX)                                        \
+    MARLIN_CASE_S8U4_SHARED(128, 128, 256, 1, GBX)                              \
+    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 1, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 1, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 2, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 2, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 2, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 3, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 3, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 3, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 4, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 4, GBX)                               \
+    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 4, GBX)
+
+static MarlinFuncPtr get_marlin_kernel_s8u4_shared(thread_config_t const& th_config,
+                                                   int thread_m_blocks,
+                                                   bool m_block_size_8,
+                                                   int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_12_S8U4_SHARED(-1)
+        return nullptr;
+    }
+    if (group_blocks == 2) {
+        MARLIN_CASES_12_S8U4_SHARED(2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_12_S8U4_SHARED(4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_12_S8U4_SHARED(8)
+        return nullptr;
+    }
+    return nullptr;
+}
 
 static MarlinFuncPtr get_marlin_kernel_bf16u4(thread_config_t const& th_config,
                                               int thread_m_blocks,
@@ -531,10 +680,14 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
                                             int thread_m_blocks, bool m_block_size_8,
                                             int group_blocks, int num_bits, bool has_zp,
                                             int stages, int max_shared_mem,
-                                            int sms, bool is_bf16 = false) {
+                                            int sms, bool is_bf16 = false,
+                                            bool is_s8_shared = false) {
     thread_config_t* table = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
     int groupsize = (group_blocks == -1) ? -1 : (group_blocks * 16);
     auto has_kernel = [&](const thread_config_t& cfg) {
+        if (is_s8_shared) {
+            return get_marlin_kernel_s8u4_shared(cfg, thread_m_blocks, m_block_size_8, group_blocks) != nullptr;
+        }
         return is_bf16 ? (get_marlin_kernel_bf16u4(cfg, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
                        : (get_marlin_kernel_f16(cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr);
     };
@@ -551,14 +704,16 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
         }
         if (want >= 0 &&
             is_valid_config(table[want], thread_m_blocks, prob_m, prob_n, prob_k,
-                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
+                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512,
+                            is_s8_shared) &&
             has_kernel(table[want])) {
             return table[want];
         }
     }
     for (int i = 0; i < 3; i++) {
         if (is_valid_config(table[i], thread_m_blocks, prob_m, prob_n, prob_k,
-                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
+                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512,
+                            is_s8_shared) &&
             has_kernel(table[i])) {
             return table[i];
         }
@@ -566,11 +721,29 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
     return {-1, -1, -1};
 }
 
+static int launch_per_token_quant_i8(cudaStream_t stream, const void* x_f16,
+                                     void* q_i8, float* scales_f32,
+                                     int m, int k) {
+    if (m <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
+    const bool vec8 = ((k & 7) == 0) && (((uintptr_t)x_f16 & 15u) == 0u) &&
+                      (((uintptr_t)q_i8 & 7u) == 0u);
+    int threads = 256;
+    if (!vec8 && k < 256) {
+        threads = std::max(32, ((k + 31) / 32) * 32);
+    }
+    per_token_quant_i8_kernel<<<(unsigned)m, (unsigned)threads, 0, stream>>>(
+        reinterpret_cast<const __half*>(x_f16),
+        reinterpret_cast<int8_t*>(q_i8),
+        scales_f32, k, vec8);
+    return (int)cudaGetLastError();
+}
+
 static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
                             const void* S, const void* ZP, void* C, int32_t* workspace,
                             int64_t m, int64_t n, int64_t k,
                             int64_t workspace_ints, int group_blocks, int num_bits,
-                            bool has_zp, bool is_bf16 = false) {
+                            bool has_zp, bool is_bf16 = false,
+                            bool force_s8_shared = false) {
     if (ex == nullptr || A == nullptr || B == nullptr || S == nullptr ||
         C == nullptr || workspace == nullptr || (has_zp && ZP == nullptr)) {
         return (int)cudaErrorInvalidValue;
@@ -618,19 +791,79 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
     // across 84-SM (3090 Ti) and 128-SM (4090) GPUs while unlocking `N = 3072, K >= 2560`
     // (e.g. 9B TP=2 `qkv` / `in_z` on 128 SMs).
     const bool keep_2560_1slice = !is_bf16 && (prob_n == 2560 && prob_k <= 4096);
-    const bool enable_m_invariant_split_k =
-        (prob_m <= 16) && (group_blocks > 0) && !keep_2560_1slice &&
+    const bool shape_wants_m_invariant_split_k =
+        (group_blocks > 0) && !keep_2560_1slice &&
         ((is_bf16 && ((prob_n / 64) * 2 <= sms) && (prob_k >= 1024)) ||
          ((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
          ((prob_n == 3072) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 2560)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
+    const bool enable_m_invariant_split_k = (prob_m <= 16) && shape_wants_m_invariant_split_k;
     // Scale wide-N (N > 4096) M-parallelism directly from the card's reported L2 cache size:
     // 16 (= 1024 M-rows) per 6 MiB of L2 cache so activations stay L2-resident across wide N
     // tiles (e.g. 3 MiB -> 8, 6 MiB -> 16, 24 MiB -> 64, 72 MiB -> 128).
     const int wide_n_max_par =
         std::min(128, std::max(8, dev_props.l2_cache_bytes / (384 * 1024)));
     int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : wide_n_max_par);
+
+    // Shared-k16-layout W4A8 IMMA prefill: active when explicitly requested via
+    // `warp34_marlin_gemm_s8u4_shared` (`force_s8_shared`, M >= 9) or on sm_86/sm_89
+    // GeForce Ampere/Ada GPUs (where FP16-mma FP32-acc is half-rate and INT8 IMMA is 4x)
+    // when the caller marks a pure prefill batch (`WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL`, M >= 128).
+    // Auto-bypasses sm_80 (A100, full-rate FP16-mma FP32-acc) and gracefully falls back to
+    // W4A16 when transient workspace is absent or too small.
+    const bool arch_wants_s8_prefill =
+        (dev_props.compute_major == 8 && dev_props.compute_minor >= 6);
+    const bool want_auto_s8 =
+        !force_s8_shared && !is_bf16 && num_bits == 4 && !has_zp &&
+        ((ex->flags & WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL) != 0u) &&
+        arch_wants_s8_prefill && (prob_m >= 128);
+    if (force_s8_shared && (is_bf16 || num_bits != 4 || has_zp || prob_m <= 8)) {
+        return (int)cudaErrorInvalidValue;
+    }
+
+    const int4* A_s8_ptr = nullptr;
+    const float* a_scales_ptr = nullptr;
+    int s8_rows_ready = 0;
+    if (force_s8_shared || want_auto_s8) {
+        const int target_s8_rows = force_s8_shared ? prob_m : ((prob_m / 64) * 64);
+        if (target_s8_rows > 8 && ex->scratch_ptr != 0 && ex->scratch_size > 0) {
+            const uintptr_t ws_raw = (uintptr_t)ex->scratch_ptr;
+            const uintptr_t ws_end = ws_raw + ex->scratch_size;
+            uintptr_t ws_cur = align_ptr_256(ws_raw);
+            const uintptr_t a_beg = (uintptr_t)A;
+            const uintptr_t a_end = a_beg + (size_t)prob_m * (size_t)prob_k * 2u;
+            if (a_end > ws_raw && a_beg < ws_end) {
+                ws_cur = std::max(ws_cur, align_ptr_256(a_end));
+            }
+            const uintptr_t c_beg = (uintptr_t)C;
+            const uintptr_t c_end = c_beg + (size_t)prob_m * (size_t)prob_n * 2u;
+            if (c_end > ws_raw && c_beg < ws_end) {
+                ws_cur = std::max(ws_cur, align_ptr_256(c_end));
+            }
+            const uintptr_t lock_beg = (uintptr_t)workspace;
+            const uintptr_t lock_end = lock_beg + (size_t)workspace_ints * sizeof(int32_t);
+            if (lock_end > ws_raw && lock_beg < ws_end) {
+                ws_cur = std::max(ws_cur, align_ptr_256(lock_end));
+            }
+            const size_t q_bytes = align_up_256((size_t)target_s8_rows * (size_t)prob_k);
+            const size_t s_bytes = align_up_256((size_t)target_s8_rows * sizeof(float));
+            if (ws_cur < ws_end && (ws_end - ws_cur) >= q_bytes + s_bytes) {
+                void* q_buf = reinterpret_cast<void*>(ws_cur);
+                float* s_buf = reinterpret_cast<float*>(ws_cur + q_bytes);
+                int q_rc = launch_per_token_quant_i8(stream, A, q_buf, s_buf, target_s8_rows, prob_k);
+                if (q_rc != 0) return q_rc;
+                A_s8_ptr = reinterpret_cast<const int4*>(q_buf);
+                a_scales_ptr = s_buf;
+                s8_rows_ready = target_s8_rows;
+            }
+        }
+        if (force_s8_shared && s8_rows_ready != prob_m) {
+            return (int)cudaErrorInvalidValue;
+        }
+    }
+
     int rest_m = prob_m;
+    int done_m = 0;
 
     while (rest_m > 0) {
         int par_count = rest_m / 64;
@@ -638,22 +871,29 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         int prob_m_split = par_count > 0 ? (par_count * 64) : rest_m;
         int thread_m_blocks = std::min(div_ceil(prob_m_split, 16), 4);
         bool m_block_size_8 = prob_m_split <= 8;
+        const bool chunk_s8 =
+            !m_block_size_8 && (done_m + prob_m_split <= s8_rows_ready);
+
+        const bool split_m_invariant_split_k =
+            (prob_m_split <= 16) && shape_wants_m_invariant_split_k;
 
         thread_config_t th_cfg = choose_thread_config(
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms, is_bf16);
+            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms, is_bf16, chunk_s8);
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
-            if (enable_m_invariant_split_k || keep_2560_1slice ||
+            if (split_m_invariant_split_k || keep_2560_1slice ||
                 (prob_m_split <= 64 && cur_mn_tiles < sms && (prob_n / 64) * 2 > sms) ||
                 cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
-                const bool cfg128_has_kernel =
-                    is_bf16 ? (get_marlin_kernel_bf16u4(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
-                            : (get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr);
+                const bool cfg128_has_kernel = chunk_s8
+                    ? (get_marlin_kernel_s8u4_shared(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
+                    : (is_bf16
+                        ? (get_marlin_kernel_bf16u4(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
+                        : (get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr));
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
-                                    num_bits, groupsize, has_zp, stages, max_shared_mem) &&
+                                    num_bits, groupsize, has_zp, stages, max_shared_mem, chunk_s8) &&
                     cfg128_has_kernel) {
                     th_cfg = cfg128;
                 }
@@ -670,13 +910,13 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         // serialize reuse on one stream (aux GEMMs have separate locks), and the donor's
         // final slice resets each lock. A failed CUDA execution invalidates that context.
         int blocks = sms;
-        if (enable_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
+        if (split_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
             int cap_splits = (mn_tiles <= 20) ? 4 : 2;
             int max_k_splits = std::min(sms / mn_tiles, k_tiles / 4);
             if (max_k_splits > cap_splits) max_k_splits = cap_splits;
             if (max_k_splits < 1) max_k_splits = 1;
             blocks = mn_tiles * max_k_splits;
-        } else if (prob_m <= 16) {
+        } else if (prob_m_split <= 16) {
             // Preserve 1-slice M=1..16 decode/verify invariance outside explicit Split-K shapes,
             // including on GPUs where `mn_tiles > sms` (1-slice CTAs have `slice_count == 1` and
             // never touch `locks`).
@@ -696,14 +936,16 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         }
         if (blocks < 1) blocks = 1;
 
-        auto kernel = is_bf16
-            ? get_marlin_kernel_bf16u4(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
-            : get_marlin_kernel_f16(
-                  th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks);
+        auto kernel = chunk_s8
+            ? get_marlin_kernel_s8u4_shared(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
+            : (is_bf16
+                ? get_marlin_kernel_bf16u4(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
+                : get_marlin_kernel_f16(
+                      th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks));
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
         const int tile_smem = get_kernel_cache_size(
-            th_cfg, thread_m_blocks, num_bits, groupsize, has_zp, stages);
+            th_cfg, thread_m_blocks, num_bits, groupsize, has_zp, stages, chunk_s8);
         if (tile_smem > 48 * 1024) {
             int cur_dev = -1;
             const bool already_warm =
@@ -720,15 +962,27 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         bool part_use_atomic_add = (blocks <= mn_tiles) && !enable_m_invariant_split_k &&
                                    (div_ceil(prob_m_split, 64) * prob_n <= 2048);
 
-        kernel<<<blocks, th_cfg.num_threads, tile_smem, stream>>>(
-            A_ptr, B_ptr, C_ptr, nullptr,
-            nullptr, S_ptr, nullptr, ZP_ptr, nullptr,
-            num_groups, prob_m_split, prob_n,
-            prob_k, prob_k, workspace,
-            false, part_use_atomic_add, tile_smem);
+        if (chunk_s8) {
+            kernel<<<blocks, th_cfg.num_threads, tile_smem, stream>>>(
+                A_s8_ptr, B_ptr, C_ptr, nullptr,
+                a_scales_ptr, S_ptr, nullptr, nullptr, nullptr,
+                num_groups, prob_m_split, prob_n,
+                prob_k, prob_k, workspace,
+                false, part_use_atomic_add, tile_smem);
+            A_s8_ptr += (size_t)prob_m_split * (size_t)(prob_k / 16);
+            a_scales_ptr += prob_m_split;
+        } else {
+            kernel<<<blocks, th_cfg.num_threads, tile_smem, stream>>>(
+                A_ptr, B_ptr, C_ptr, nullptr,
+                nullptr, S_ptr, nullptr, ZP_ptr, nullptr,
+                num_groups, prob_m_split, prob_n,
+                prob_k, prob_k, workspace,
+                false, part_use_atomic_add, tile_smem);
+        }
 
         A_ptr += (size_t)prob_m_split * (size_t)(prob_k / 8);
         C_ptr += (size_t)prob_m_split * (size_t)(prob_n / 8);
+        done_m += prob_m_split;
         rest_m -= prob_m_split;
     }
     return (int)cudaGetLastError();
@@ -750,12 +1004,13 @@ static int warmup_all_specializations_impl(int max_shared_mem) {
     static constexpr int kGroups[4] = {-1, 2, 4, 8};
     for (int gb : kGroups) {
         for (const auto& sc : kCases) {
-            MarlinFuncPtr fns[5] = {
+            MarlinFuncPtr fns[6] = {
                 get_marlin_kernel_bf16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u2(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u4_zp(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u8(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_s8u4_shared(sc.cfg, sc.m_blocks, sc.m8, gb),
             };
             for (MarlinFuncPtr fn : fns) {
                 if (fn == nullptr) continue;
@@ -916,4 +1171,24 @@ extern "C" int warp34_marlin_gemm_f16u8(const warp34_exec* ex, const void* a, co
                                      int64_t workspace_ints, int group_blocks) {
     return warp34_marlin::marlin_gemm_impl(
         ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 8, false);
+}
+
+extern "C" int warp34_per_token_quant_i8(const warp34_exec* ex, const void* x_f16,
+                                         void* q_i8, float* scales_f32,
+                                         int64_t m, int64_t k) {
+    if (ex == nullptr || x_f16 == nullptr || q_i8 == nullptr || scales_f32 == nullptr ||
+        m <= 0 || k <= 0 || m > INT32_MAX || k > INT32_MAX) {
+        return (int)cudaErrorInvalidValue;
+    }
+    return warp34_marlin::launch_per_token_quant_i8(
+        (cudaStream_t)ex->stream, x_f16, q_i8, scales_f32, (int)m, (int)k);
+}
+
+extern "C" int warp34_marlin_gemm_s8u4_shared(const warp34_exec* ex, const void* a, const void* b,
+                                              const void* scales, void* c, int32_t* workspace,
+                                              int64_t m, int64_t n, int64_t k,
+                                              int64_t workspace_ints, int group_blocks) {
+    return warp34_marlin::marlin_gemm_impl(
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 4, false,
+        false, true);
 }

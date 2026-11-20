@@ -9,9 +9,12 @@ pub struct Warp34Exec {
     pub stream: usize,
     pub scratch_ptr: u64,
     pub scratch_size: usize,
+    pub flags: u64,
 }
 
-const _: [(); 24] = [(); core::mem::size_of::<Warp34Exec>()];
+const _: [(); 32] = [(); core::mem::size_of::<Warp34Exec>()];
+
+pub const WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL: u64 = 1 << 0;
 
 pub const WARP34_DTYPE_F16: i32 = 0;
 pub const WARP34_DTYPE_BF16: i32 = 1;
@@ -652,6 +655,27 @@ unsafe extern "C" {
         b: *const c_void,
         scales: *const c_void,
         zeros: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
+    pub fn warp34_per_token_quant_i8(
+        ex: *const Warp34Exec,
+        x_f16: *const c_void,
+        q_i8: *mut c_void,
+        scales_f32: *mut f32,
+        m: i64,
+        k: i64,
+    ) -> i32;
+    pub fn warp34_marlin_gemm_s8u4_shared(
+        ex: *const Warp34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
         c: *mut c_void,
         workspace: *mut i32,
         m: i64,

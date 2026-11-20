@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn test_ffi_struct_sizes_and_alignments() {
-        assert_eq!(size_of::<Warp34Exec>(), 24);
+        assert_eq!(size_of::<Warp34Exec>(), 32);
         assert_eq!(align_of::<Warp34Exec>(), 8);
 
         assert_eq!(size_of::<Warp34KvLayerLayout>(), 104);
@@ -86,6 +86,7 @@ mod tests {
         assert_eq!(exec.stream, 0);
         assert_eq!(exec.scratch_ptr, 0);
         assert_eq!(exec.scratch_size, 0);
+        assert_eq!(exec.flags, 0);
 
         let layout = Warp34KvLayerLayout::default();
         assert_eq!(layout.k_base, 0);

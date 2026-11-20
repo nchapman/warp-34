@@ -209,6 +209,7 @@ impl FfnBlockWeights {
                 stream: ex.stream,
                 scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
                 scratch_size: ex.scratch_size - reserved_prerot,
+                flags: ex.flags,
             }
         } else {
             *ex

@@ -46,7 +46,12 @@ class SanitizerCase:
 
 
 SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
-    # 1. Quantized Linear (Marlin W4A16/W2A16/BF16, small_n_gemm, fused LoRA)
+    # 1. Quantized Linear (Marlin W4A16/W4A8-shared/W2A16/BF16, small_n_gemm, fused LoRA)
+    SanitizerCase(
+        subsystem="linear",
+        target="quant_formats",
+        test_name="marlin_w4a8_shared_k16_matches_exact_s8_reference_and_mixed_sign_scales",
+    ),
     SanitizerCase(
         subsystem="linear",
         target="lib",

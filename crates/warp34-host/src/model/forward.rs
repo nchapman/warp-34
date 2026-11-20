@@ -611,6 +611,21 @@ impl Qwen3_5ModelRank {
         mut dump_out: Option<&mut ForwardDump>,
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
+        let allow_w4a8_prefill = !self.is_capturing_graph
+            && dump_out.is_none()
+            && rows >= 128
+            && attn.max_q_len >= 128
+            && gdn_batch.max_verify_tokens == 0
+            && gdn_batch.spec_state_indices.is_null();
+        let layer_ex = Warp34Exec {
+            flags: if allow_w4a8_prefill {
+                ex.flags | ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL
+            } else {
+                ex.flags
+            },
+            ..*ex
+        };
+        let ex = &layer_ex;
         let hc = self.final_residual.is_hyper_connection();
         let streams = if hc { self.cfg.hc_count.max(1) } else { 1 };
         let lowrank = self.cfg.hc_lowrank;

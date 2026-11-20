@@ -473,6 +473,7 @@ fn test_cuda_lora_shrink_expand_and_hadamard_fusion() {
         stream: stream.handle,
         scratch_ptr: 0,
         scratch_size: 0,
+        flags: 0,
     };
 
     // 1. Base model (default_lora_id = -1): must be 0-ULP identical to y0_f16!
@@ -586,6 +587,7 @@ fn test_cublas_multi_slice_lora_shrink_expand_parity() {
         stream: stream.handle,
         scratch_ptr: 0,
         scratch_size: 0,
+        flags: 0,
     };
     let k = 128usize;
     let n = 64usize;

@@ -616,6 +616,7 @@ impl CudaStream {
             stream: self.handle,
             scratch_ptr,
             scratch_size,
+            flags: 0,
         }
     }
 

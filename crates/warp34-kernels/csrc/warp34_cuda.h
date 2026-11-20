@@ -43,13 +43,18 @@ enum {
     WARP34_ATTN_MASK_NONCAUSAL_WINDOW = 1,
 };
 
+enum {
+    WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL = 1u << 0,
+};
+
 typedef struct {
     uintptr_t stream;       // cudaStream_t
     uint64_t  scratch_ptr;  // device workspace pointer
     size_t    scratch_size; // workspace capacity in bytes
+    uint64_t  flags;        // WARP34_EXEC_FLAG_* bitmask
 } warp34_exec;
 
-static_assert(sizeof(warp34_exec) == 24, "warp34_exec ABI size mismatch");
+static_assert(sizeof(warp34_exec) == 32, "warp34_exec ABI size mismatch");
 
 typedef struct {
     uint64_t k_base;
@@ -337,6 +342,13 @@ int warp34_marlin_gemm_f16u8(const warp34_exec* ex, const void* a, const void* b
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int warp34_per_token_quant_i8(const warp34_exec* ex, const void* x_f16,
+                              void* q_i8, float* scales_f32,
+                              int64_t m, int64_t k);
+int warp34_marlin_gemm_s8u4_shared(const warp34_exec* ex, const void* a, const void* b,
+                                   const void* scales, void* c, int32_t* workspace,
+                                   int64_t m, int64_t n, int64_t k,
+                                   int64_t workspace_ints, int group_blocks);
 
 // --- Descriptor-Driven KV Cache Write & Paged Attention (op_kv_cache.cu, op_paged_attn.cu) ---
 int warp34_kv_cache_write(const warp34_exec* ex, const warp34_kv_layer_layout* layout,

@@ -290,15 +290,31 @@ impl LinearProj {
                 size_n,
                 size_k,
                 block_size: HADAMARD_BLOCK_64,
-            } if *size_k == inner.size_k() && *size_n == inner.size_n() => inner.forward(
-                ex,
-                cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                input,
-                output,
-                rows,
-            ),
+            } if *size_k == inner.size_k() && *size_n == inner.size_n() => {
+                let input_bytes = rows
+                    .saturating_mul(*size_k)
+                    .saturating_mul(2)
+                    .next_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES);
+                let sub_ex = if input == ex.scratch_ptr && ex.scratch_size >= input_bytes {
+                    Warp34Exec {
+                        stream: ex.stream,
+                        scratch_ptr: ex.scratch_ptr + input_bytes as u64,
+                        scratch_size: ex.scratch_size - input_bytes,
+                        flags: ex.flags,
+                    }
+                } else {
+                    *ex
+                };
+                inner.forward(
+                    &sub_ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    input,
+                    output,
+                    rows,
+                )
+            }
             _ => self.forward(
                 ex,
                 cublas,
@@ -396,6 +412,7 @@ impl LinearProj {
             stream: ex.stream,
             scratch_ptr: ex.scratch_ptr + bytes as u64,
             scratch_size: ex.scratch_size - bytes,
+            flags: ex.flags,
         };
         inner.forward(
             &inner_ex,

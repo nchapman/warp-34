@@ -245,7 +245,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool shared_k16_layout
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -342,6 +343,10 @@ __global__ void Marlin(
   }
 
   constexpr bool is_a_8bit = a_type.size_bits() == 8;
+  static_assert(!shared_k16_layout ||
+                (a_type == vllm::kS8 && b_type == vllm::kU4B8 &&
+                 s_type == vllm::kFloat16 && !m_block_size_8));
+  constexpr bool is_b_a8 = is_a_8bit && !shared_k16_layout;
   constexpr bool is_8bit_scale = s_type.size_bits() == 8;
   if constexpr (!is_a_8bit) {
     static_assert(std::is_same<scalar_t, c_scalar_t>::value);
@@ -494,9 +499,14 @@ __global__ void Marlin(
     }
     if (is_a_8bit && (first_init || slice_col == 0)) {
       __syncthreads();
-      int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
-      cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
-                        threadIdx.x < prob_m);
+      if (threadIdx.x < 16 * thread_m_blocks) {
+        if (threadIdx.x < prob_m) {
+          int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
+          cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd], true);
+        } else {
+          sh_a_s[threadIdx.x] = 0.0f;
+        }
+      }
     }
   };
 
@@ -510,9 +520,14 @@ __global__ void Marlin(
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
       if (is_a_8bit) {
         __syncthreads();
-        int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
-        cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
-                          threadIdx.x < prob_m);
+        if (threadIdx.x < 16 * thread_m_blocks) {
+          if (threadIdx.x < prob_m) {
+            int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
+            cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd], true);
+          } else {
+            sh_a_s[threadIdx.x] = 0.0f;
+          }
+        }
       }
     }
   };
@@ -557,18 +572,22 @@ __global__ void Marlin(
   constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
   // B sizes/strides
-  int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
+  int b_gl_stride = 16 * prob_n / (pack_factor * (is_b_a8 ? 2 : 4));
   constexpr int b_sh_stride =
-      ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
+      ((thread_n_blocks * 16) * 16 / pack_factor) / (is_b_a8 ? 2 : 4);
   constexpr int b_thread_vecs = b_type.size_bits() == 8 ? 2 : 1;
   constexpr int b_sh_stride_threads =
       b_type.size_bits() == 2 ? (b_sh_stride * 2) : (b_sh_stride / b_thread_vecs);
 
-  int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
+  int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_b_a8 ? 2 : 1);
   constexpr int b_sh_stage =
-      b_sh_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
+      b_sh_stride * thread_k_blocks / (is_b_a8 ? 2 : 1);
   constexpr int b_sh_wr_iters =
-      (b_sh_stride_threads * thread_k_blocks / (is_a_8bit ? 2 : 1)) / threads;
+      is_a_8bit
+          ? (((thread_n_blocks * 16) * 16 / pack_factor) / 2 * thread_k_blocks /
+             2) /
+                threads
+          : (b_sh_stride_threads * thread_k_blocks) / threads;
   constexpr int b_g2s_iters = b_sh_stage / threads;
 
   // Scale sizes/strides without act_order
@@ -815,7 +834,7 @@ __global__ void Marlin(
   // Zero accumulators.
   auto zero_accums = [&]() {
   #pragma unroll
-    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
+    for (int i = 0; i < thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4; i++)
       reinterpret_cast<float*>(frag_c)[i] = 0;
   };
 
@@ -982,7 +1001,23 @@ __global__ void Marlin(
       }
     }
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-    if constexpr (b_type.size_bits() == 2) {
+    if constexpr (shared_k16_layout) {
+      int warp_id = threadIdx.x >> 5;
+      int th_id = threadIdx.x & 31;
+      int warp_col = warp_id % tb_n_warps;
+      int warp_row = warp_id / tb_n_warps;
+      int n_tile = warp_col >> 1;
+      int w_odd = warp_col & 1;
+      int kt0 = 2 * (warp_row * b_sh_wr_iters + (k % b_sh_wr_iters));
+      int kt1 = kt0 + 1;
+      int2 const* sh_b_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
+      int2 q0 = sh_b_i2[(kt0 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
+      int2 q1 = sh_b_i2[(kt1 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
+      frag_b_quant[k % 2][0][0] = q0.x;
+      frag_b_quant[k % 2][0][1] = q0.y;
+      frag_b_quant[k % 2][0][2] = q1.x;
+      frag_b_quant[k % 2][0][3] = q1.y;
+    } else if constexpr (b_type.size_bits() == 2) {
       int2 const* sh_b_stage_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
       int2 v = sh_b_stage_i2[b_sh_stride_threads * (k % b_sh_wr_iters) + b_sh_rd];
       frag_b_quant[k % 2][0][0] = v.x;
@@ -1027,6 +1062,40 @@ __global__ void Marlin(
         if (k == 0 && full_pipe == 0 && dequant_skip_flop) {
           reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd];
           reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
+        }
+      } else if constexpr (group_blocks != -1 && shared_k16_layout) {
+        int warp_id = threadIdx.x >> 5;
+        int warp_col = warp_id % tb_n_warps;
+        int n_tile = warp_col >> 1;
+        int w_odd = warp_col & 1;
+        int tg = threadIdx.x & 3;
+        int s_i2_even = n_tile * 16 + 4 * tg + w_odd;
+        int s_i2_odd = s_i2_even + 2;
+        if constexpr (group_blocks >= thread_k_blocks) {
+          constexpr int g = group_blocks / thread_k_blocks;
+          if (pipe % g == 0) {
+            if (k % b_sh_wr_iters == 0) {
+              int2 const* sh_s_i2 = reinterpret_cast<int2 const*>(
+                  sh_s + s_sh_stage * (g * (pipe / g)));
+              reinterpret_cast<int2*>(&frag_s[k % 2])[0] = sh_s_i2[s_i2_even];
+              reinterpret_cast<int2*>(&frag_s[k % 2])[1] = sh_s_i2[s_i2_odd];
+            } else {
+              reinterpret_cast<int4*>(&frag_s[1])[0] =
+                  reinterpret_cast<int4*>(&frag_s[0])[0];
+            }
+          }
+        } else if (group_blocks2 < b_sh_wr_iters || k % b_sh_wr_iters == 0) {
+          int warp_row = warp_id / tb_n_warps;
+          int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
+          int cur_group_id = k_blocks / group_blocks2;
+          int2 const* sh_s_i2 =
+              reinterpret_cast<int2 const*>(sh_s + s_sh_stage * pipe) +
+              cur_group_id * (2 * s_sh_stride);
+          reinterpret_cast<int2*>(&frag_s[k % 2])[0] = sh_s_i2[s_i2_even];
+          reinterpret_cast<int2*>(&frag_s[k % 2])[1] = sh_s_i2[s_i2_odd];
+        } else if (group_blocks >= b_sh_wr_iters) {
+          reinterpret_cast<int4*>(&frag_s[1])[0] =
+              reinterpret_cast<int4*>(&frag_s[0])[0];
         }
       } else if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
@@ -1351,7 +1420,31 @@ __global__ void Marlin(
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
 
-      if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
+      if constexpr (shared_k16_layout) {
+        int tg = threadIdx.x & 3;
+        int pair_base = (tg & 1) * 2;
+        uint32_t shift = (tg & 2) << 1;
+        uint32_t w_kt0 = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
+        uint32_t w_kt1 = static_cast<uint32_t>(frag_b_quant[k2][0][2 + j]);
+        uint32_t v0 = __shfl_sync(0xffffffffu, w_kt0, pair_base, 4) >> shift;
+        uint32_t v1 = __shfl_sync(0xffffffffu, w_kt0, pair_base + 1, 4) >> shift;
+        uint32_t u0 = __shfl_sync(0xffffffffu, w_kt1, pair_base, 4) >> shift;
+        uint32_t u1 = __shfl_sync(0xffffffffu, w_kt1, pair_base + 1, 4) >> shift;
+        uint32_t p_lo0 = __byte_perm(v0, v1, 0x6420);
+        uint32_t p_hi0 = __byte_perm(v0, v1, 0x7531);
+        uint32_t p_lo1 = __byte_perm(u0, u1, 0x6420);
+        uint32_t p_hi1 = __byte_perm(u0, u1, 0x7531);
+        auto deq_u4b8 = [](uint32_t p) -> uint32_t {
+          uint32_t masked = static_cast<uint32_t>(
+              lop3<(0xf0 & 0xcc) | 0xaa>(static_cast<int>(p), 0x0F0F0F0F, 0x80808080));
+          return (masked - 0x08080808u) ^ 0x80808080u;
+        };
+        uint32_t* fb = reinterpret_cast<uint32_t*>(&frag_b);
+        fb[0] = deq_u4b8(p_lo0);
+        fb[1] = deq_u4b8(p_lo1);
+        fb[2] = deq_u4b8(p_hi0);
+        fb[3] = deq_u4b8(p_hi1);
+      } else if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
         dequant_data(frag_b_quant[k2][0][j * 2],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b));
         dequant_data(frag_b_quant[k2][0][j * 2 + 1],
@@ -1400,7 +1493,34 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
-          if constexpr (a_type == vllm::kS8) {
+          if constexpr (shared_k16_layout) {
+            half const* s_h = reinterpret_cast<half const*>(&frag_s[k2]);
+            float s0_g0 = __half2float(s_h[2 * j + 0]);
+            float s0_g1 = __half2float(s_h[4 + 2 * j + 0]);
+            float s1_g0 = __half2float(s_h[2 * j + 1]);
+            float s1_g1 = __half2float(s_h[4 + 2 * j + 1]);
+  #pragma unroll
+            for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float s = (g & 1) ? s0_g1 : s0_g0;
+                frag_c[i][j][0][g] +=
+                    __int2float_rn(
+                        *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g])) *
+                    s;
+                frag_c_tmp[i][j][0][g] = 0.0f;
+              }
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float s = (g & 1) ? s1_g1 : s1_g0;
+                frag_c[i][j][1][g] +=
+                    __int2float_rn(
+                        *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g])) *
+                    s;
+                frag_c_tmp[i][j][1][g] = 0.0f;
+              }
+            }
+          } else if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
                 (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1529,14 +1649,15 @@ __global__ void Marlin(
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
   auto thread_block_reduce = [&]() {
-    constexpr int red_off = threads / b_sh_stride_threads / 2;
+    constexpr int red_row_threads = 32 * tb_n_warps;
+    constexpr int red_off = threads / red_row_threads / 2;
     if (red_off >= 1) {
-      auto red_idx = threadIdx.x / b_sh_stride_threads;
+      auto red_idx = threadIdx.x / red_row_threads;
       constexpr int red_sh_stride =
-          b_sh_stride_threads * (is_a_8bit ? 2 : 4) * 2;
-      constexpr int red_sh_delta = b_sh_stride_threads;
-      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
-                      (threadIdx.x % b_sh_stride_threads);
+          red_row_threads * (is_a_8bit ? 2 : 4) * 2;
+      constexpr int red_sh_delta = red_row_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / red_row_threads) +
+                      (threadIdx.x % red_row_threads);
 
       // Parallel logarithmic shared memory reduction. We make sure to avoid any
       // unnecessary read or write iterations, e.g., for two warps we write only
@@ -1979,7 +2100,8 @@ __global__ void Marlin(
               for (int g = 0; g < 4; g++) {
                 float c_val = frag_c[i][j][0][g];
 
-                if constexpr (a_type == vllm::kS8) {
+                if constexpr (a_type == vllm::kS8 &&
+                              (!shared_k16_layout || group_blocks == -1)) {
                   c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                 }
                 float s_val = frag_a_s[i * 2 + g / 2];
@@ -1989,7 +2111,8 @@ __global__ void Marlin(
               for (int g = 0; g < 4; g++) {
                 float c_val = frag_c[i][j][1][g];
 
-                if constexpr (a_type == vllm::kS8) {
+                if constexpr (a_type == vllm::kS8 &&
+                              (!shared_k16_layout || group_blocks == -1)) {
                   c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                 }
                 float s_val = frag_a_s[i * 2 + g / 2];

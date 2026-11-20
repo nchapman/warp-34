@@ -40,7 +40,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool shared_k16_layout = false  // unpack k16 U4B8 + FP16 scales in kS8 path
           >
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
