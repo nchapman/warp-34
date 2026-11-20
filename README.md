@@ -315,6 +315,19 @@ End-to-end HTTP serving p50 (`tok/s`, `FP16` KV). We benchmark `9B` here because
 | **Coding agent (`64K` ctx)** | **`49.8`** | `27.5` | `34.1` | `30.5` | **`+46%–81%`** |
 | **Coding agent (`120K` ctx)** | **`26.4`** | `14.2` | `17.2` | `15.2` | **`+53%–86%`** |
 
+### Head-to-head vs. specialized consumer-GPU engines (`1–2× RTX 3090 Ti`)
+
+Each row pits `warp34` against a dedicated single-model engine on the exact model, GPU count, and speculative mode it was built for (end-to-end HTTP serving p50, `tok/s`):
+
+| Engine *(upstream HEAD)* | Specialty | Workload | Competitor | **`warp34`** | `warp34` lead |
+|---|---|---|---:|---:|---:|
+| **[`ninfer-3090`](https://github.com/Don-Chad/ninfer-3090)** (`115dee6`) | `27B` on `1× 24 GB` *(MTP)* | `C=1` / `C=8` / agent / primed | `94.1` / `260.3` / `69.2` / `39.8` | **`109.1` / `417.2` / `96.0` / `109.6`** | **`+16%` – `2.75×`** |
+| **[`qwen38-flash-next-3090`](https://github.com/DominikBucko/qwen38-flash-next-3090)** (`10b24c2`) | `180B Flash-Next` W4 on `1× 24 GB` | chat / `6K` code / primed | `30.6` / `21.2` / `10.2` | **`39.3` / `23.2` / `37.1`** | **`+9%` – `3.64×`** |
+| **[`qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** (`4dca58f`) | `180B Flash-Next` W4 on `2× 24 GB` | chat / `6K` code / primed | `55.6` / `28.3` / `20.5` | **`76.3` / `41.5` / `78.5`** | **`+37%` – `3.83×`** |
+| **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` on `1× 24 GB` | chat / `6K` code / primed / agent | `52.0` / `15.3` / `51.2` / `47.9` | **`61.1` / `33.2` / `60.4` / `55.2`** | **`+15%` – `2.17×`** |
+
+*`ninfer-3090` runs its mixed Q4/Q5 `.ninfer` (`MTP-2`, `32K` KV) vs `warp34` `W4A16-HGPTQ` (`MTP-3`, `32K` `TQ4` KV); `qwen38-flash-next-{3090,2x3090}` compare W4 `Flash-Next` + `MTP-3` (`warp34` also passes strict agent replay at `33.7` / `57.5 tok/s`); `Strata` runs Unsloth `UD-IQ4_XS` GGUF (`lookup4`) vs `warp34` `W2.6A16-HGPTQ-RCO` (`MTP-3`).*
+
 ### Single-stream decode across Q4 models (`W4A16-HGPTQ` + `MTP-3`)
 
 | Model | 1× RTX 3090 Ti | 1× RTX 4090 | 2× RTX 3090 Ti | 2× RTX 4090 |

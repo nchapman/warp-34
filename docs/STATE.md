@@ -1,5 +1,13 @@
 # warp34 — Session Orientation & Current State
 
+## Specialized Consumer-GPU Engine Head-to-Head (`1–2× RTX 3090 Ti`, `benchmarks/perf/results/specialized-head-to-head-2026-11-20/`)
+
+- Benchmarked `warp34` (`3544345`) against exact upstream `HEAD` of all four dedicated single-model consumer-GPU engines on the same frozen `warp34perf --preset full` (3 reps + warmup) fixtures:
+  - **`Don-Chad/ninfer-3090` (`115dee6`, `Qwen3.8-27B` on `1× RTX 3090 Ti`, `32K` KV, MTP):** `warp34` (`TQ4` KV, `MTP-3`) swept `4/4`: `decode-c1` **`109.1`** vs `94.1` (`+16%`), `throughput-c8` **`417.2`** vs `260.3` (`+60%`), `agent-c1` **`96.0`** vs `69.2` (`+39%`), `prefill-primed-c1` **`109.6`** vs `39.8` (`2.75×`).
+  - **`DominikBucko/qwen38-flash-next-3090` (`10b24c2`, `Flash-Next` W4 `1× 3090 Ti`, `MTP-3`):** `warp34` (`W4A16-HGPTQ`, post-`k_static` fix) swept `5/5`: `short-chat` **`39.3`** vs `30.6` (`+28%`), `prefill-context-r16` **`19.3`** vs `10.2` (`+89%`), `code-context-r64` **`23.2`** vs `21.2` (`+9%`), `prefix-primed-r16` **`37.1`** vs `10.2` (`3.64×`), `coding-agent-replay` **`33.7`** vs *failed*.
+  - **`DominikBucko/qwen38-flash-next-2x3090` (`4dca58f`, `Flash-Next` W4 `2× 3090 Ti`, `MTP-3`):** `warp34` swept `5/5`: `short-chat` **`76.3`** vs `55.6` (`+37%`), `prefill-context-r16` **`31.0`** vs `21.3` (`+46%`), `code-context-r64` **`41.5`** vs `28.3` (`+47%`), `prefix-primed-r16` **`78.5`** vs `20.5` (`3.83×`), `coding-agent-replay` **`57.5`** vs *failed*.
+  - **`Niko1221/Strata v0.2.17` / engine `0.1.63` (`3142b66`, `Flash-Next` `UD-IQ4_XS` GGUF + `lookup4` on `1× 3090 Ti`):** `warp34` (`W2.6A16-HGPTQ-RCO` + `MTP-3`) swept `5/5`: `short-chat` **`61.1`** vs `52.0` (`+18%`), `prefill-context-r16` **`30.0`** vs `15.9` (`+89%`), `code-context-r64` **`33.2`** vs `15.3` (`2.17×`), `prefix-primed-r16` **`60.4`** vs `51.2` (`+18%`), `coding-agent-replay` **`55.2`** vs `47.9` (`+15%`).
+
 ## Data-Informed Tiered-MoE Pareto Auto-Fit Planner & `TP=1` Dynamic-LRU Fix
 
 - **Empirical Pareto Sweep & `k_static` Dynamic-LRU Fix (`crates/warp34-host/src/moe_offload/engine.rs`, `crates/warp34-host/src/model/{rank_capacity.rs,rank.rs,tests.rs}`):**
